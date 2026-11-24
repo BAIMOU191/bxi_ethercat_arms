@@ -20,6 +20,7 @@
 #include "arms/arms.h"
 #include "joint_select.h"
 #include "power.h"
+#include "runtime_env.h"
 
 static volatile sig_atomic_t g_interrupted;
 static arms_t *g_arms;
@@ -406,7 +407,9 @@ static void usage(FILE *out)
 {
     fprintf(out,
             "用法: arms_test [选项]\n"
-            "BXI 双臂 EtherCAT 测试工具（KGU 驱动器，MIT 模式）。启动后扫描、预热，全部关节保持伺服失能。\n"
+            "BXI 双臂 EtherCAT 测试工具（KGU 驱动器，MIT 模式）。\n"
+            "启动时依次: 获取 root 权限 -> 启动 EtherLab 主站 -> 配置实时运行环境 -> 电机上电 -> 扫描、预热，\n"
+            "全部关节保持伺服失能。退出时停止通信、断电并还原实时运行环境。\n"
             "\n"
             "选项:\n"
             "  -f, --freq HZ        周期频率 2000|1000|500|250|200|125（默认取配置）\n"
@@ -414,20 +417,20 @@ static void usage(FILE *out)
             "  -r, --rt-cpu N       实时线程 CPU，-1 表示不绑定（默认取配置 realtime.rt_cpu）\n"
             "  -c, --config FILE    配置文件（默认 $ARMS_CONFIG、/etc/bxi/arms.json、./config/arms.json）\n"
             "  -e, --exec CMD       执行命令后退出，例如 -e \"commtest 300\"（可重复，按顺序执行）\n"
-            "      --mock           使用模拟后端，不访问硬件\n"
-            "      --power          启动前请求电机总电源上电，退出时断电（默认不操作电源）\n"
+            "      --mock           使用模拟后端，不访问硬件，不需要 root\n"
+            "      --no-power       不操作电机电源（电源已由其他程序打开时使用）\n"
+            "      --keep-power     退出时不断电\n"
             "      --power-wait MS  上电后等待驱动器启动的时间（默认 3000）\n"
-            "      --keep-power     配合 --power：退出时不断电\n"
+            "      --no-rt-setup    不配置实时运行环境（中断绑定、CPU 隔离）\n"
             "  -h, --help           显示本帮助\n"
             "  -V, --version        显示版本\n"
             "\n"
             "关节编号: 15-21 左臂（肩y/x/z、肘y、腕x/y/z），22-28 右臂，顺序相同。\n"
             "示例:\n"
-            "  sudo arms_test --power                    上电、扫描两臂、预热，进入交互终端\n"
-            "  sudo arms_test                            电源已打开时直接扫描\n"
-            "  sudo arms_test -f 2000 -j left            只打开左臂，2 kHz\n"
-            "  sudo arms_test --power -e \"commtest 300\"  通信测试 300 秒后退出\n"
-            "  arms_test --mock                          使用模拟后端\n"
+            "  arms_test                           上电、扫描两臂、预热，进入交互终端\n"
+            "  arms_test -f 2000 -j left           只打开左臂，2 kHz\n"
+            "  arms_test -e \"commtest 300\"         通信测试 300 秒后退出\n"
+            "  arms_test --mock                    使用模拟后端\n"
             "进入终端后输入 help 查看命令，任一命令加 -h 查看详细用法。\n");
 }
 
@@ -439,12 +442,13 @@ int main(int argc, char **argv)
         {"mock", no_argument, NULL, 'm'},         {"rt-cpu", required_argument, NULL, 'r'},
         {"power", no_argument, NULL, 'p'},        {"help", no_argument, NULL, 'h'},
         {"version", no_argument, NULL, 'V'},      {"power-wait", required_argument, NULL, 'w'},
-        {"keep-power", no_argument, NULL, 'k'},   {NULL, 0, NULL, 0},
+        {"keep-power", no_argument, NULL, 'k'},   {"no-power", no_argument, NULL, 'P'},
+        {"no-rt-setup", no_argument, NULL, 'R'},  {NULL, 0, NULL, 0},
     };
     arms_options opt;
     const char *execs[16];
     int nexec = 0, ch, rc = 0, i;
-    bool power = false, keep_power = false, powered = false;
+    bool power = true, keep_power = false, powered = false, rt_setup = true;
     unsigned int power_wait = 3000;
     char err[256];
     struct sigaction sa;
@@ -491,6 +495,8 @@ int main(int argc, char **argv)
             break;
         }
         case 'p': power = true; break;
+        case 'P': power = false; break;
+        case 'R': rt_setup = false; break;
         case 'k': keep_power = true; break;
         case 'w': {
             char *end;
@@ -512,6 +518,8 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    if (opt.backend != ARMS_BACKEND_MOCK && arms_env_ensure_root(argc, argv) != 0) return 1;
+
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_sigint;
     sigemptyset(&sa.sa_mask);
@@ -519,20 +527,27 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
 
     printf("arms_test %s\n", arms_version());
-    if (power && opt.backend == ARMS_BACKEND_MOCK) {
-        printf("提示: 模拟后端忽略 --power\n");
+    if (opt.backend == ARMS_BACKEND_MOCK) {
         power = false;
-    }
-    if (power) {
-        if (arms_power_on(power_wait) != 0) return 1;
-        powered = true;
-        opt.scan_timeout_ms = 20000;
+        rt_setup = false;
+    } else {
+        if (arms_env_start_master() != 0) return 1;
+        if (rt_setup && arms_env_rt_apply(opt.config_path, opt.rt_cpu >= 0 ? opt.rt_cpu : -2) < 0) return 1;
+        if (power) {
+            if (arms_power_on(power_wait) != 0) {
+                arms_env_rt_revert();
+                return 1;
+            }
+            powered = true;
+            opt.scan_timeout_ms = 20000;
+        }
     }
     printf("启动: %s后端，扫描并预热，全部关节保持伺服失能\n", opt.backend == ARMS_BACKEND_MOCK ? "模拟" : "EtherLab ");
     st = arms_open(&opt, &g_arms);
     if (st != ARMS_OK) {
         fprintf(stderr, "启动失败: %s\n  原因: %s\n", arms_strerror(st), arms_last_error());
         if (powered && !keep_power) arms_power_off();
+        arms_env_rt_revert();
         return 1;
     }
     {
@@ -574,9 +589,10 @@ int main(int argc, char **argv)
     printf("退出: 停止通信并释放主站\n");
     arms_close(g_arms);
     if (powered) {
-        if (keep_power) printf("电源: 按 --keep-power 保持上电\n");
+        if (keep_power) printf("电源: 保持上电（--keep-power）\n");
         else arms_power_off();
     }
+    arms_env_rt_revert();
     printf("已退出\n");
     return rc;
 }

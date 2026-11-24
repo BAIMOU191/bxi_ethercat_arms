@@ -17,29 +17,35 @@ BXI 双臂 EtherCAT 驱动。RK3588 主控，左右臂共 14 个 KGU 执行器�
 
 `slave` 为 EtherLab 链上位置，从 0 开始。关节与网口、链上位置的对应关系在 `arms_driver/config/arms.json` 中配置。
 
-## 编译
-
-```bash
-cd arms_driver
-cmake -S . -B build
-cmake --build build -j4
-ctest --test-dir build --output-on-failure
-```
-
-依赖：EtherLab 1.6（`/usr/local/etherlab`）。aarch64 下链接 `third_party/bxi_pci_drv` 以支持 `--power`。
-
 ## 运行
 
 ```bash
-./build/arms_test -h                           # 启动参数
-./build/arms_test --mock                       # 模拟后端
-sudo scripts/rt_setup.sh apply                 # 实时运行环境（参数取自配置文件）
-sudo ./build/arms_test --power                 # 上电、扫描、预热，进入交互终端
-sudo scripts/rt_setup.sh revert
-sudo scripts/comm_test.sh -j all -t 300        # 通信质量测试，1000/2000 Hz 各一轮
+cd arms_driver
+./arms_test
+```
+
+`./arms_test` 先增量编译，再启动程序；程序在需要时通过 sudo 获取 root 权限，依次启动 EtherLab 主站、
+配置实时运行环境、电机上电、扫描并预热，然后进入交互终端（全部关节保持伺服失能）。
+`quit` 退出时停止通信、断电并还原实时运行环境。
+
+```bash
+./arms_test -h                     # 启动参数
+./arms_test --mock                 # 模拟后端，不访问硬件
+./arms_test -f 2000 -j left        # 2 kHz，只打开左臂
+./arms_test -e "commtest 300"      # 执行命令后退出
+scripts/comm_test.sh -j all -t 300 # 通信质量测试，1000/2000 Hz 各一轮
 ```
 
 交互终端中输入 `help` 查看命令，`<命令> -h` 查看详细用法。
+
+## 编译与测试
+
+```bash
+cmake -S . -B build && cmake --build build -j4
+ctest --test-dir build --output-on-failure
+```
+
+依赖：EtherLab 1.6（`/usr/local/etherlab`）。aarch64 下链接 `third_party/bxi_pci_drv` 用于电机电源控制。
 
 不要与 `motor_console`、`hw_lib_test_*` 或其他占用同一主站的程序同时运行。
 
@@ -51,7 +57,7 @@ sudo scripts/comm_test.sh -j all -t 300        # 通信质量测试，1000/2000 
 |---|---|
 | `mode` | `standalone`：驱动自建实时线程；`external`：由调用方实时循环调用 `arms_rx()`/`arms_tx()` |
 | `rt_cpu` | 实时线程 CPU，-1 表示不绑定 |
-| `irq_cpu` | EtherCAT 网口中断 CPU，由 `rt_setup.sh` 使用 |
+| `irq_cpu` | EtherCAT 网口中断 CPU，由 `scripts/rt_setup.sh` 使用（`arms_test` 启动时自动调用） |
 | `priority` | 实时线程 SCHED_FIFO 优先级 |
 | `softirq_priority` | `ksoftirqd/<irq_cpu>` 的 SCHED_FIFO 优先级，须低于 `priority` |
 

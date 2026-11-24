@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# arms_test - 增量编译后启动 build/arms_test，参数原样传递（./arms_test -h 查看用法）
+set -eo pipefail
+
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+BUILD="$ROOT/build"
+
+as_user() {
+  if [[ $EUID -eq 0 && -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+    sudo -u "$SUDO_USER" -- "$@"
+  else
+    "$@"
+  fi
+}
+
+if [[ ! -f $BUILD/CMakeCache.txt ]]; then
+  as_user cmake -S "$ROOT" -B "$BUILD" > /dev/null
+fi
+if ! as_user cmake --build "$BUILD" --target arms_test -j4 > "$BUILD/last_build.log" 2>&1; then
+  cat "$BUILD/last_build.log" >&2
+  echo "编译失败" >&2
+  exit 1
+fi
+exec "$BUILD/arms_test" "$@"
