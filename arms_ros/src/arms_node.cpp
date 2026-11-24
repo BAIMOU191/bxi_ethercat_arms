@@ -226,7 +226,15 @@ class ArmsNode final : public rclcpp::Node
         msg.header.stamp = now();
         arms_bus_stats b{};
         arms_get_stats(dev.driver, &b);
-        for (int i = 0; i < 2; i++) {
+        arms_joint_state states[ARMS_JOINT_COUNT];
+        size_t n = 0;
+        arms_mask faults[ARMS_ARM_COUNT]{};
+        arms_read(dev.driver, states, ARMS_JOINT_COUNT, &n);
+        for (size_t k = 0; k < n; ++k) {
+            const auto &s = states[k];
+            if (s.mode == ARMS_JS_FAULT || s.error_code) faults[s.arm] |= ARMS_MASK_JOINT(s.joint);
+        }
+        for (int i = 0; i < ARMS_ARM_COUNT; i++) {
             auto &a = b.arm[i];
             if (!a.present)
                 continue;
@@ -234,12 +242,13 @@ class ArmsNode final : public rclcpp::Node
             d.name = std::string("arms/") + arms_arm_name(i);
             d.hardware_id = a.interface;
             const bool prot = b.protect.reason != ARMS_PROTECT_NONE;
-            d.level = (dev.cut || b.tripped || prot || a.comm_failed || !a.link_up ||
+            d.level = (dev.cut || b.tripped || prot || faults[i] || a.slaves_op != a.slaves_expected || a.comm_failed || !a.link_up ||
                        a.wkc_last != a.wkc_expected)
                           ? 2
                           : 0;
             d.message = prot ? (b.protect.reason == ARMS_PROTECT_OVERSPEED ? "overspeed protection latched"
                                                                            : "overtorque protection latched")
+                        : faults[i] ? "drive fault"
                         : d.level ? "communication fault or trip"
                                   : "online";
             auto add = [&](const char *k, auto value) {
@@ -248,6 +257,7 @@ class ArmsNode final : public rclcpp::Node
                 kv.value = std::to_string(value);
                 d.values.push_back(kv);
             };
+            add("fault_joints", faults[i]);
             add("wkc", a.wkc_last);
             add("expected", a.wkc_expected);
             add("trip_joints", b.trip_joints);

@@ -353,7 +353,7 @@ arms_status arms_hold(arms_t *arms, arms_mask joints);
  * @brief 零力矩拖动：使能关节（已使能的保持使能），下发 kp = 0、速度 0、前馈 0、阻尼 kd
  * @param kd 阻尼，0 表示完全自由，须不超过 gain_max.kd
  *
- * 关节没有保持力，会受重力下落。退出拖动用 arms_disable()、arms_hold() 或新的指令。
+ * 关节没有保持力，会受重力下落。先支撑关节再失能；arms_hold() 保留 kp=0，不会恢复位置保持力。
  * 有关节的抱闸不是正常控制模式时拒绝执行。
  */
 arms_status arms_free(arms_t *arms, arms_mask joints, double kd);
@@ -377,9 +377,9 @@ const char *arms_brake_mode_name(arms_brake_mode mode);
 /**
  * @brief 临时设置抱闸模式（写 Pn075 并回读，不保存到驱动器）
  *
- * RELEASE / HOLD 要求该关节失能；NORMAL 任何状态都可执行。
- * 任一关节不是 NORMAL 时，arms_enable()、arms_free() 和 ARMS_SAVE 被拒绝。
- * arms_close() 会把本次会话改动过的关节恢复为 NORMAL。
+ * RELEASE / HOLD 要求该关节失能；NORMAL 不要求失能，但仍要求有效通信和明确确认。
+ * 任一已打开关节不是 NORMAL 或无法确认模式时，arms_enable()、arms_free() 和 ARMS_SAVE 被拒绝。
+ * arms_close() 尝试将本次会话改动过的关节恢复为 NORMAL，不保证机械抱闸已闭合。
  */
 arms_status arms_set_brake(arms_t *arms, int joint, arms_brake_mode mode, bool confirmed);
 

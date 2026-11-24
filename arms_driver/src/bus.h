@@ -40,13 +40,16 @@ typedef struct {
 
 typedef struct bus bus_t;
 
+/* 扫描失败原因不依赖诊断文本；仅空链可由 --no-check 跳过。 */
+enum { BUS_SCAN_MASTER = -1, BUS_SCAN_LINK = -2, BUS_SCAN_EMPTY = -3, BUS_SCAN_UNSTABLE = -4 };
+
 typedef struct {
     const char *name;
     int (*open)(bus_t **out, const bus_open_params *params, char *err, size_t err_size);
     /*
      * 等待总线稳定后返回从站身份，写入 infos[0..*count-1]。
      * 稳定：从站数不少于 expected，身份可读，且从站数持续 BUS_SETTLE_MS 不变。
-     * 到 timeout_ms 仍未稳定时，有从站则返回当前结果（由调用方判断缺失），一个都没有则失败。
+     * 超时时可返回数量不足但已稳定的拓扑，由调用方判断缺失；不使用仍在变化的扫描结果。
      */
     int (*scan)(bus_t *bus, bus_slave_info *infos, int max, int expected, int *count, unsigned int timeout_ms,
                 char *err, size_t err_size);

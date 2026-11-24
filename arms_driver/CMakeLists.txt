@@ -73,6 +73,11 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  # Only the test supplies PCI symbols; this executable cannot issue hardware requests.
+  add_executable(test_power tests/test_power.c tools/arms_test/power.c)
+  target_compile_definitions(test_power PRIVATE ARMS_HAVE_PCI_POWER=1)
+  target_include_directories(test_power PRIVATE tools/arms_test ${BXI_PCI_DIR})
+  add_test(NAME power_retry_stub COMMAND test_power)
   add_executable(test_config tests/test_config.c tools/arms_test/joint_select.c)
   target_include_directories(test_config PRIVATE src tools/arms_test third_party/cjson)
   target_link_libraries(test_config PRIVATE arms_driver)

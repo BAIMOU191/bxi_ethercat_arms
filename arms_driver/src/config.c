@@ -156,7 +156,10 @@ static bool parse_arm(const cJSON *node, arms_arm_config *arm, const char *label
         fail(error, size, "arms.%s.interface 缺失或无效", label);
         return false;
     }
-    if (!get_str(node, "mac", arm->mac, sizeof(arm->mac))) arm->mac[0] = '\0';
+    if (cJSON_GetObjectItemCaseSensitive(node, "mac") && !get_str(node, "mac", arm->mac, sizeof(arm->mac))) {
+        fail(error, size, "arms.%s.mac 必须为字符串", label);
+        return false;
+    }
     m = cJSON_GetObjectItemCaseSensitive(node, "master");
     if (m && !cJSON_IsNull(m)) {
         if (!get_int(node, "master", 0, 7, &master)) {
@@ -166,6 +169,12 @@ static bool parse_arm(const cJSON *node, arms_arm_config *arm, const char *label
         arm->master = (int)master;
     }
     return true;
+}
+
+/* 允许省略使用默认值，但不把已填写的错误类型静默当作未配置。 */
+static bool optional_number(const cJSON *object, const char *key, double *out)
+{
+    return !cJSON_GetObjectItemCaseSensitive(object, key) || get_num(object, key, out);
 }
 
 static bool parse_pair(const cJSON *arr, double *a, double *b)
@@ -186,7 +195,6 @@ static bool parse_joint(const cJSON *node, arms_config *c, int idx, char *error,
     char arm_name[16], name[ARMS_NAME_LEN];
     arms_joint_config *j;
     const cJSON *limit, *gmax, *gdef;
-    double v;
 
     if (!cJSON_IsObject(node)) {
         fail(error, size, "joints[%d] 不是对象", idx);
@@ -239,43 +247,57 @@ static bool parse_joint(const cJSON *node, arms_config *c, int idx, char *error,
     snprintf(j->name, sizeof(j->name), "%s", name);
     j->slave = (int)slave;
     j->direction = (int)direction;
-    j->offset_rad = get_num(node, "offset_rad", &v) ? v : 0.0;
+    if (!optional_number(node, "offset_rad", &j->offset_rad) || !optional_number(node, "home", &j->home)) {
+        fail(error, size, "关节 %ld 的 offset_rad 和 home 必须是有限数值", joint);
+        return false;
+    }
 
     j->pos_min = -0.5; j->pos_max = 0.5; j->vel_max = 0.5; j->tff_max = 1.0;
     j->vel_fault = 3.0; j->tor_fault = 30.0;
     j->kp_max = 5; j->kd_max = 1; j->kp_default = 5; j->kd_default = 0;
-    limit = obj(node, "limit");
+    limit = cJSON_GetObjectItemCaseSensitive(node, "limit");
     if (limit) {
         const cJSON *pos = cJSON_GetObjectItemCaseSensitive(limit, "pos");
         if (pos && !parse_pair(pos, &j->pos_min, &j->pos_max)) {
             fail(error, size, "关节 %ld 的 limit.pos 必须是 [min, max] 且 min<max", joint);
             return false;
         }
-        if (get_num(limit, "vel", &v)) j->vel_max = v;
-        if (get_num(limit, "tff", &v)) j->tff_max = v;
-        if (get_num(limit, "vel_fault", &v)) j->vel_fault = v;
-        if (get_num(limit, "torque_fault", &v)) j->tor_fault = v;
+        if (!cJSON_IsObject(limit) ||
+            !optional_number(limit, "vel", &j->vel_max) ||
+            !optional_number(limit, "tff", &j->tff_max) ||
+            !optional_number(limit, "vel_fault", &j->vel_fault) ||
+            !optional_number(limit, "torque_fault", &j->tor_fault)) {
+            fail(error, size, "关节 %ld 的 limit 必须是对象，数值必须有限", joint);
+            return false;
+        }
     }
     if (j->vel_fault <= 0 || j->tor_fault <= 0) {
         fail(error, size, "关节 %ld 的 limit.vel_fault / limit.torque_fault 必须大于 0", joint);
         return false;
     }
-    gmax = obj(node, "gain_max");
+    gmax = cJSON_GetObjectItemCaseSensitive(node, "gain_max");
     if (gmax) {
-        if (get_num(gmax, "kp", &v)) j->kp_max = v;
-        if (get_num(gmax, "kd", &v)) j->kd_max = v;
+        if (!cJSON_IsObject(gmax) ||
+            !optional_number(gmax, "kp", &j->kp_max) ||
+            !optional_number(gmax, "kd", &j->kd_max)) {
+            fail(error, size, "关节 %ld 的 gain_max 必须是对象，数值必须有限", joint);
+            return false;
+        }
     }
-    gdef = obj(node, "gain_default");
+    gdef = cJSON_GetObjectItemCaseSensitive(node, "gain_default");
     if (gdef) {
-        if (get_num(gdef, "kp", &v)) j->kp_default = v;
-        if (get_num(gdef, "kd", &v)) j->kd_default = v;
+        if (!cJSON_IsObject(gdef) ||
+            !optional_number(gdef, "kp", &j->kp_default) ||
+            !optional_number(gdef, "kd", &j->kd_default)) {
+            fail(error, size, "关节 %ld 的 gain_default 必须是对象，数值必须有限", joint);
+            return false;
+        }
     }
     if (j->vel_max < 0 || j->tff_max < 0 || j->kp_max < 0 || j->kd_max < 0 ||
         j->kp_default < 0 || j->kd_default < 0 || j->kp_default > j->kp_max || j->kd_default > j->kd_max) {
         fail(error, size, "关节 %ld 的限位/增益无效（不能为负，默认值不能超过上限）", joint);
         return false;
     }
-    j->home = get_num(node, "home", &v) ? v : 0.0;
     if (j->home < j->pos_min || j->home > j->pos_max) {
         fail(error, size, "关节 %ld 的 home %.3f 超出 limit.pos [%.3f, %.3f]", joint, j->home, j->pos_min, j->pos_max);
         return false;
@@ -296,7 +318,7 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
     snprintf(c->path, sizeof(c->path), "%s", path);
     text = read_file(path, error, size);
     if (!text) return false;
-    root = cJSON_Parse(text);
+    root = cJSON_ParseWithOpts(text, NULL, 1);
     if (!root) {
         const char *where = cJSON_GetErrorPtr();
         int line = 1;
@@ -309,6 +331,14 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
     if (!cJSON_IsObject(root)) {
         fail(error, size, "%s 顶层必须是对象", path);
         goto out;
+    }
+    const char *sections[] = {"arms", "safety", "realtime", "drive"};
+    for (size_t k = 0; k < sizeof(sections) / sizeof(sections[0]); ++k) {
+        const cJSON *section = cJSON_GetObjectItemCaseSensitive(root, sections[k]);
+        if (section && !cJSON_IsObject(section)) {
+            fail(error, size, "%s 必须是对象", sections[k]);
+            goto out;
+        }
     }
     if (cJSON_GetObjectItemCaseSensitive(root, "version") && !get_int(root, "version", 1, 1, &v)) {
         fail(error, size, "version 只支持 1");

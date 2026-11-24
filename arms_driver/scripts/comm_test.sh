@@ -5,7 +5,7 @@
 #   comm_test.sh [-c arms.json] [-j left|right|all] [-t 秒] [-f "1000 2000"] [-r CPU]
 #
 # 按各频率依次运行 arms_test -e "commtest <秒>"，最后输出结论。
-# 日志: /tmp/arms_comm_<时间>.log
+# 日志: /tmp/arms_comm_<时间>_<随机后缀>.log；任一频率测试失败时返回非零
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -34,13 +34,14 @@ if pgrep -x motor_console >/dev/null || pgrep -f 'hw_lib_test_' >/dev/null || pg
   exit 1
 fi
 
-LOG=/tmp/arms_comm_$(date +%Y%m%d_%H%M%S).log
+LOG=$(mktemp --suffix=.log "/tmp/arms_comm_$(date +%Y%m%d_%H%M%S)_XXXXXX") || exit 1
 exec > >(tee -a "$LOG") 2>&1
 echo "== 通信测试 $(date '+%F %T')  关节 $JOINTS  每轮 ${DURATION}s  频率 $FREQS"
 
 ARGS=(-c "$CONFIG" -j "$JOINTS")
 [[ -n $RT_CPU ]] && ARGS+=(-r "$RT_CPU")
 
+rc=0
 declare -A RESULT
 for f in $FREQS; do
   echo
@@ -48,6 +49,7 @@ for f in $FREQS; do
   if "$ROOT/arms_test" "${ARGS[@]}" -T -f "$f" -e "info" -e "commtest $DURATION" -e "bus"; then
     RESULT[$f]=通过
   else
+    rc=1
     RESULT[$f]=未通过
   fi
   sleep 3
@@ -57,3 +59,4 @@ echo
 echo "== 结论"
 for f in $FREQS; do echo "  ${f} Hz: ${RESULT[$f]}"; done
 echo "日志: $LOG"
+exit "$rc"

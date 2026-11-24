@@ -19,14 +19,14 @@ def until(predicate):
     while not predicate():
         assert time.monotonic()<end,'ROS condition timed out'
         rclpy.spin_once(test,timeout_sec=.04)
-def call(name,confirm=False):
+def call(name,confirm=False,joint=21):
     cli=test.create_client(JointOperation,ns+'/arms/'+name)
     assert cli.wait_for_service(timeout_sec=12),name
-    q=JointOperation.Request();q.joints=1<<21;q.confirm=confirm
+    q=JointOperation.Request();q.joints=1<<joint;q.confirm=confirm
     f=cli.call_async(q);until(f.done);r=f.result();test.destroy_client(cli);return r
 try:
     cmd=['ros2','run','arms_ros','arms_node','--ros-args','-r','__ns:='+ns,'-p','mock:=true','-p','config:='+str(Path(sys.argv[1]).resolve())]
-    proc=subprocess.Popen(cmd,start_new_session=True)
+    proc=subprocess.Popen(cmd,start_new_session=True, env=dict(os.environ, ARMS_MOCK_FAULT_CYCLE="1"))
     try:
         until(lambda:len(seen)==3);assert len(seen['joint_states'].name)==14
         assert seen['arms/diagnostics'].status[0].level in (0,b'\x00'),seen['arms/diagnostics']
@@ -50,6 +50,11 @@ try:
         m.pos=[];pub.publish(m)
         until(lambda:any(k.key=='rejected_commands' and int(k.value)>0 for k in seen['arms/diagnostics'].status[0].values))
         assert call('disable').success
+        # 注入 15 号驱动器故障：WKC 正常也不能把这条臂报告为 online。
+        call('enable', True, joint=15)
+        until(lambda: any(d.message == 'drive fault' and any(
+            kv.key == 'fault_joints' and int(kv.value) & (1 << 15) for kv in d.values
+        ) for d in seen['arms/diagnostics'].status))
     finally:
         if proc.poll() is None: os.killpg(proc.pid,signal.SIGINT)
         proc.wait(timeout=15)

@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
@@ -36,7 +37,7 @@ typedef struct {
 } snapshot;
 
 static snapshot previous;
-static volatile bool power_off;
+static atomic_bool power_off;
 
 void motion_set_power_off(bool off) { power_off = off; }
 
@@ -98,7 +99,7 @@ static void check_trip(void)
         if (st.trip_joints & ARMS_MASK_JOINT(j))
             len += (size_t)snprintf(list + len, sizeof(list) - len, " %d(%s)", j, arms_joint_name(bus, j));
     if (power_off) {
-        tlog("电机已断电，以下关节离线:%s", list);
+        tlog("已请求断电，以下关节离线:%s", list);
         return;
     }
     tlog_err("离线保护触发: 以下关节不在线:%s；全部关节已失能", list);

@@ -45,6 +45,8 @@ int main(int argc, char **argv)
     CHECK(arms_mode(arms) == ARMS_MODE_EXTERNAL, "mode");
     CHECK(arms_period_ns(arms) == 1000000ull, "period");
     CHECK(!arms_ready(arms), "ready before cycling");
+    CHECK(arms_read_joint(arms, 21, &s) == ARMS_OK && s.joint == 21 && s.name &&
+          s.mode == ARMS_JS_OFFLINE, "configured identity before first cycle");
 
     deadline = mono_ns() + 3000000000ull;
     while (!arms_ready(arms) && mono_ns() < deadline) {

@@ -1,6 +1,8 @@
 #include "joint_select.h"
 
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,8 +12,9 @@ static int parse_number(const char *s, int *out)
     char *end;
     long v;
     if (!s || !*s || !isdigit((unsigned char)*s)) return -1;
+    errno = 0;
     v = strtol(s, &end, 10);
-    if (*end != '\0') return -1;
+    if (errno || *end != '\0' || v > INT_MAX) return -1;
     *out = (int)v;
     return 0;
 }
@@ -72,6 +75,10 @@ int arms_parse_joints(const char *text, arms_mask allowed, arms_mask *out, char 
     arms_mask mask = 0;
     if (!text || !*text) {
         snprintf(err, err_size, "未指定关节");
+        return -1;
+    }
+    if (text[0] == ',' || text[strlen(text) - 1] == ',' || strstr(text, ",,")) {
+        snprintf(err, err_size, "关节列表含空项");
         return -1;
     }
     if (strlen(text) >= sizeof(buf)) {

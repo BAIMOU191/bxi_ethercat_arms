@@ -8,5 +8,4 @@ install -m644 arms-node.service /etc/systemd/system/arms-node.service
 [[ -e /etc/bxi/arms-node.env ]] || install -m640 arms-node.env /etc/bxi/arms-node.env
 [[ -e /etc/bxi/arms.json ]] || install -m640 ../arms_driver/config/arms.json /etc/bxi/arms.json
 systemctl daemon-reload
-printf '%s
-' 'Installed only; review /etc/bxi/arms-node.env, master ownership, wiring and site approval before enabling.'
+printf '%s\n' 'Installed only; review /etc/bxi/arms-node.env, master ownership, wiring and site approval before enabling.'

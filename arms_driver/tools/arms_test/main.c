@@ -6,10 +6,13 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
 #include <math.h>
 #include <signal.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,16 +33,24 @@
 #include "runtime_env.h"
 #include "tlog.h"
 
-static volatile sig_atomic_t g_interrupted;
+static volatile sig_atomic_t g_interrupted, g_terminate;
+static int stop_pipe[2];
 static arms_t *g_arms;
-static bool powered, power_known, mock_backend;
+static atomic_bool powered, power_known;
+static bool mock_backend;
+static pthread_mutex_t power_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_stamp_all; /* -T：每行加时间戳，输出经过管道 */
 static unsigned int power_wait = 15000; /* 上电后等待总线稳定的最长时间 [ms] */
 
 static void on_sigint(int sig)
 {
-    (void)sig;
+    int saved_errno = errno;
+    if (sig == SIGTERM) {
+        g_terminate = 1;
+        (void)write(stop_pipe[1], "!", 1);
+    }
     g_interrupted = 1;
+    errno = saved_errno;
 }
 
 static void log_line(void *user, const char *line)
@@ -413,6 +424,22 @@ static int wait_bus_online(unsigned int timeout_ms)
     return -1;
 }
 
+/* 命令线程与掉线监视线程共用 PCI 句柄；锁仅覆盖 SDK 调用，不覆盖总线恢复等待。 */
+static int request_power(bool on)
+{
+    int rc;
+    pthread_mutex_lock(&power_lock);
+    if (on && powered && power_known) rc = 0;
+    else rc = on ? arms_power_on(0) : arms_power_off();
+    if (rc == 0) {
+        powered = on;
+        motion_set_power_off(!on);
+    }
+    power_known = rc == 0;
+    pthread_mutex_unlock(&power_lock);
+    return rc;
+}
+
 static int cmd_power(int argc, char **argv)
 {
     const char *op = argv[1];
@@ -423,38 +450,28 @@ static int cmd_power(int argc, char **argv)
     if (!strcmp(op, "status")) {
         printf("电源: %s（以现场指示为准）\n", !power_known ? "状态未知" : powered ? "已请求上电" : "已请求断电");
     } else if (!strcmp(op, "on")) {
-        if (!powered && arms_power_on(0) != 0) {
-            power_known = false;
+        if (request_power(true) != 0) {
             return failed("上电失败");
         }
-        powered = power_known = true;
-        motion_set_power_off(false);
         if (wait_bus_online(30000) != 0 || arms_check_online(g_arms, NULL) != ARMS_OK) {
             /* 在线检查未通过：重新下电保护 */
             char why[512];
             arms_mask off = 0;
             arms_check_online(g_arms, &off);
             snprintf(why, sizeof(why), "%s", off ? arms_last_error() : "通信在 30 秒内未恢复");
-            motion_set_power_off(true);
-            if (arms_power_off() == 0) {
-                powered = false;
+            if (request_power(false) == 0) {
                 return failed("上电后在线检查未通过，已重新下电。%s", why);
             }
-            power_known = false;
             return failed("上电后在线检查未通过，下电失败，请立即手动断电。%s", why);
         }
         if (arms_clear_trip(g_arms) != ARMS_OK) return failed("离线保护未能清除: %s", arms_last_error());
-        tlog("在线检查通过，通信已恢复，全部关节处于失能");
+        tlog("在线检查通过，通信正常；未请求使能");
     } else {
         if (!powered && !power_known) return failed("未接管电源，无法确认或切断外部供电");
         if (motion_enabled() && disable_joints(arms_opened_joints(g_arms), 50)) return -1;
-        motion_set_power_off(true);
-        if (arms_power_off() != 0) {
-            powered = power_known = false;
+        if (request_power(false) != 0) {
             return failed("断电失败，请核对现场电源状态");
         }
-        powered = false;
-        power_known = true;
     }
     return ok();
 }
@@ -570,24 +587,27 @@ static int cmd_watch(int argc, char **argv)
     {
         /* 每个关节一行，原地刷新：第二次起先把光标移回表格首行。-T 模式输出经过时间戳管道，改为逐次打印 */
         bool in_place = !g_stamp_all && isatty(STDOUT_FILENO);
+        const char *clear = in_place ? "\r\x1b[2K" : "";
         int rows = 0;
         for (;;) {
-            int j;
+            arms_joint_state states[ARMS_JOINT_COUNT];
+            size_t count = 0;
+            if (arms_read(g_arms, states, ARMS_JOINT_COUNT, &count) != ARMS_OK)
+                return failed("读取关节快照失败");
             if (in_place && rows > 0) printf("\x1b[%dA", rows);
             rows = 0;
-            printf("\r\x1b[2K%-4s %-20s %-8s %10s %10s %9s %10s\n", "关节", "名称", "状态", "pos[rad]", "vel[rad/s]",
+            printf("%s%-4s %-20s %-8s %10s %10s %9s %10s\n", clear, "关节", "名称", "状态", "pos[rad]", "vel[rad/s]",
                    "tor[N.m]", "cmd");
             rows++;
-            for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
-                arms_joint_state s;
-                if (!(sel & ARMS_MASK_JOINT(j))) continue;
-                arms_read_joint(g_arms, j, &s);
-                printf("\r\x1b[2K%-4d %-20s %-8s %10.4f %10.4f %9.4f %10.4f\n", j, s.name ? s.name : "-",
+            for (size_t i = 0; i < count; ++i) {
+                arms_joint_state s = states[i];
+                if (!(sel & ARMS_MASK_JOINT(s.joint))) continue;
+                printf("%s%-4d %-20s %-8s %10.4f %10.4f %9.4f %10.4f\n", clear, s.joint, s.name ? s.name : "-",
                        arms_joint_mode_name(s.mode), s.position, s.velocity, s.torque, s.cmd_position);
                 rows++;
             }
             fflush(stdout);
-            if (wait_or_enter((unsigned int)(1000 / hz)) || g_interrupted) break;
+            if (g_terminate || wait_or_enter((unsigned int)(1000 / hz)) || g_interrupted) break;
             if (!in_place) printf("\n");
         }
     }
@@ -785,7 +805,7 @@ static int cmd_free(int argc, char **argv)
     if (argc > 2 && !number(argv[2], &kd)) return bad_args("kd 必须是非负数值");
     motion_cancel_refresh(m);
     if (arms_free(g_arms, m, kd) != ARMS_OK) return failed("%s", arms_last_error());
-    tlog("零力矩拖动:%s，kd=%.3f。关节没有保持力，注意托住；结束用 disable 或 hold", mask_list(m, list, sizeof(list)),
+    tlog("零力矩拖动:%s，kd=%.3f。关节没有保持力，请先托住再 disable；hold 不恢复刚度", mask_list(m, list, sizeof(list)),
          kd);
     return ok();
 }
@@ -966,7 +986,7 @@ static const command commands[] = {
     {"free", "控制", "<关节> [kd]", 1, 2, "零力矩拖动：使能后 kp=0，可用手转动关节",
      "  关节写法同 status：21 | 15-18 | left | right | all。kd 为阻尼，默认 0（最轻），不超过 gain_max.kd。\n"
      "  关节没有保持力，肩、肘会因重力下落，执行前先托住。超过 vel_fault 会触发超速保护。\n"
-     "  结束拖动: disable（失能，抱闸锁住）或 hold（保持当前位置）。抱闸不是 normal 模式时拒绝执行。",
+     "  先支撑关节再 disable；hold 保留 kp=0，不会恢复位置保持力。抱闸不是 normal 模式时拒绝执行。",
      "  free 21\n  free left 0.2", cmd_free},
     {"brake", "维护", "<关节> [normal|release|hold --confirm]", 1, 3, "查看或临时设置抱闸模式（Pn075）",
      "  不带模式: 读取并显示 Pn075。\n"
@@ -1096,13 +1116,9 @@ static void on_trip(void)
         tlog_err("离线保护: 电源不由本程序控制，请立即手动断电");
         return;
     }
-    motion_set_power_off(true);
-    if (arms_power_off() == 0) {
-        powered = false;
-        power_known = true;
+    if (request_power(false) == 0) {
         tlog_err("离线保护: 已请求断电，请以现场回读为准。排除问题后执行 power on 重新上电并检查");
     } else {
-        power_known = false;
         tlog_err("离线保护: 下电失败，请立即手动断电");
     }
 }
@@ -1219,7 +1235,7 @@ int main(int argc, char **argv)
         case 'f': {
             char *end;
             long v = strtol(optarg, &end, 10);
-            if (*end || v <= 0) {
+            if (*end || v <= 0 || (unsigned long)v > UINT_MAX) {
                 fprintf(stderr, "错误: --freq 需要整数，例如 1000 或 2000\n");
                 return 2;
             }
@@ -1306,6 +1322,7 @@ int main(int argc, char **argv)
     }
 
     memset(&sa, 0, sizeof(sa));
+    if (pipe2(stop_pipe, O_NONBLOCK | O_CLOEXEC) < 0) { perror("pipe2"); return 1; }
     sa.sa_handler = on_sigint;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
@@ -1325,6 +1342,7 @@ int main(int argc, char **argv)
         if (rt_setup && arms_env_rt_apply(opt.config_path, opt.rt_cpu >= 0 ? opt.rt_cpu : -2) < 0) return 1;
         if (power) {
             if (arms_power_on(0) != 0) {
+                arms_power_off(); /* 请求失败不等于已断电 */
                 arms_env_rt_revert();
                 return 1;
             }
@@ -1338,7 +1356,7 @@ int main(int argc, char **argv)
     if (st != ARMS_OK) {
         tlog_err("启动失败: %s", arms_strerror(st));
         tlog_err("  原因: %s", arms_last_error());
-        if (powered && st == ARMS_E_TOPOLOGY) {
+        if (powered && (st == ARMS_E_TOPOLOGY || st == ARMS_E_LINK)) {
             if (arms_power_off() == 0)
                 tlog_err("启动在线检查未通过，已请求断电保护");
             else tlog_err("启动在线检查未通过，下电失败，请立即手动断电");
@@ -1353,6 +1371,7 @@ int main(int argc, char **argv)
         arms_get_stats(g_arms, &bs);
         print_stats(&bs);
     }
+    if (g_terminate) goto close_session;
     startup_selftest();
     motion_set_trip_handler(on_trip);
     if (motion_start(g_arms, &g_interrupted, nexec > 0) != 0) {
@@ -1363,7 +1382,11 @@ int main(int argc, char **argv)
         for (i = 0; i < nexec && !g_interrupted; ++i) {
             char line[512], *av[16];
             int ac;
-            snprintf(line, sizeof(line), "%s", execs[i]);
+            if (snprintf(line, sizeof(line), "%s", execs[i]) >= (int)sizeof(line)) {
+                tlog_err("命令过长，未执行");
+                rc = 1;
+                break;
+            }
             ac = split(line, av, 16);
             tlog(">> %s", execs[i]);
             if (run_command(ac, av) != 0) {
@@ -1373,13 +1396,14 @@ int main(int argc, char **argv)
         }
     } else {
         tlog("就绪。输入 help 查看命令，quit 退出");
-        while (!g_quit) {
+        while (!g_quit && !g_terminate) {
             char prompt[128], line[512], *av[16];
             int ac;
             int r;
             build_prompt(prompt, sizeof(prompt));
             g_interrupted = 0;
-            r = le_readline(prompt, line, sizeof(line));
+            r = le_readline(prompt, line, sizeof(line), stop_pipe[0]);
+            if (g_terminate) break;
             if (r == LE_INTERRUPTED) {
                 printf("（Ctrl+C：输入 quit 退出）\n");
                 continue;
@@ -1400,7 +1424,7 @@ close_session:
     tlog("退出: 停止通信并释放主站");
     arms_close(g_arms);
     if (powered) {
-        if (keep_power && rc == 0)
+        if (keep_power && !g_terminate && rc == 0)
             tlog("电源: 保持上电（--keep-power）");
         else if (arms_power_off() != 0) rc = 1;
     }

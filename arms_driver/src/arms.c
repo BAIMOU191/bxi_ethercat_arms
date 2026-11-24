@@ -145,11 +145,38 @@ typedef struct {
     arms_bus_stats stats;
 } shared_snapshot;
 
+/* 序列号只保证读到同一代数据；载荷也必须原子传递，避免 memcpy 与并发写产生数据竞争。 */
+#define WORDS_OF(T) (sizeof(T) / sizeof(uintptr_t))
+typedef struct {
+    arms_command cmd;
+    double move_s;
+} cmd_payload;
+_Static_assert(sizeof(shared_snapshot) % sizeof(uintptr_t) == 0, "snapshot word alignment");
+_Static_assert(sizeof(cmd_payload) % sizeof(uintptr_t) == 0, "command word alignment");
+
+static void store_words(atomic_uintptr_t *dst, const void *src, size_t count)
+{
+    const unsigned char *bytes = src;
+    for (size_t i = 0; i < count; ++i) {
+        uintptr_t word;
+        memcpy(&word, bytes + i * sizeof(word), sizeof(word));
+        atomic_store_explicit(&dst[i], word, memory_order_relaxed);
+    }
+}
+
+static void load_words(void *dst, const atomic_uintptr_t *src, size_t count)
+{
+    unsigned char *bytes = dst;
+    for (size_t i = 0; i < count; ++i) {
+        uintptr_t word = atomic_load_explicit(&src[i], memory_order_relaxed);
+        memcpy(bytes + i * sizeof(word), &word, sizeof(word));
+    }
+}
+
 /* 指令槽：非实时线程在 cmd_lock 下写入，周期上下文无锁读取（seqlock，读失败沿用上一周期） */
 typedef struct {
     atomic_uint seq;
-    arms_command cmd;
-    double move_s;
+    atomic_uintptr_t data[WORDS_OF(cmd_payload)];
 } cmd_slot;
 
 /* 关节控制状态，仅在周期上下文中访问 */
@@ -173,6 +200,8 @@ struct arms {
     /* 抱闸模式记录（Pn075），由管理线程更新；掩码用原子量供读取接口显示 */
     atomic_uint brake_released;       /* Pn075 = 1 的关节 */
     atomic_uint brake_held;           /* Pn075 = 2 的关节 */
+    atomic_uint brake_known;          /* 最近一次 Pn075 回读有效的关节 */
+    _Atomic double offset_rad[ARMS_JOINT_LAST + 1]; /* 管理线程更新，周期线程读取 */
     arms_mask brake_touched;          /* 本次会话改动过抱闸模式的关节 */
     arms_config cfg;
     arms_options opt;
@@ -195,7 +224,8 @@ struct arms {
     atomic_bool ready;
     atomic_bool reset_stats;
     atomic_uint seq;
-    shared_snapshot snap;
+    shared_snapshot snap; /* 写端工作区，不与读取线程直接共享 */
+    atomic_uintptr_t published[WORDS_OF(shared_snapshot)];
 
     pthread_mutex_t cmd_lock;
     cmd_slot slot[ARMS_JOINT_LAST + 1];
@@ -215,7 +245,7 @@ struct arms {
     uint64_t recover_cycles;
     arms_joint_state js[ARMS_JOINT_LAST + 1];
     running_stat period;
-    uint64_t cycles, overruns, skipped;
+    uint64_t cycles, stats_origin, overruns, skipped; /* cycles 是单调控制时钟，不随统计清零 */
     double wake_late_max, work_max;
     uint64_t last_start_ns;
     uint64_t cycle_start_ns;
@@ -277,11 +307,9 @@ static arms_joint_mode mode_from(uint8_t al, uint16_t sw)
 static void publish(arms_t *a)
 {
     int i;
-    atomic_fetch_add_explicit(&a->seq, 1, memory_order_acq_rel);
-    atomic_thread_fence(memory_order_release);
     memcpy(a->snap.s, a->js, sizeof(a->js));
     a->snap.stats.cycle_hz = a->cycle_hz;
-    a->snap.stats.cycles = a->cycles;
+    a->snap.stats.cycles = a->cycles - a->stats_origin;
     a->snap.stats.overruns = a->overruns;
     a->snap.stats.skipped = a->skipped;
     if (a->period.n) {
@@ -321,7 +349,9 @@ static void publish(arms_t *a)
         o->recv_us_max = r->recv_us_max;
         o->send_us_max = r->send_us_max;
     }
+    atomic_fetch_add_explicit(&a->seq, 1, memory_order_acq_rel);
     atomic_thread_fence(memory_order_release);
+    store_words(a->published, &a->snap, WORDS_OF(shared_snapshot));
     atomic_fetch_add_explicit(&a->seq, 1, memory_order_acq_rel);
 }
 
@@ -332,7 +362,7 @@ static void read_snapshot(arms_t *a, shared_snapshot *out)
         s1 = atomic_load_explicit(&a->seq, memory_order_acquire);
         if (s1 & 1u) continue;
         atomic_thread_fence(memory_order_acquire);
-        memcpy(out, &a->snap, sizeof(*out));
+        load_words(out, a->published, WORDS_OF(shared_snapshot));
         atomic_thread_fence(memory_order_acquire);
         s2 = atomic_load_explicit(&a->seq, memory_order_acquire);
     } while ((s1 & 1u) || s1 != s2);
@@ -342,7 +372,8 @@ static void do_reset_stats(arms_t *a)
 {
     int i;
     rs_reset(&a->period);
-    a->cycles = a->overruns = a->skipped = 0;
+    a->stats_origin = a->cycles;
+    a->overruns = a->skipped = 0;
     a->wake_late_max = a->work_max = 0;
     a->last_start_ns = 0;
     for (i = 0; i < ARMS_ARM_COUNT; ++i) {
@@ -425,6 +456,8 @@ static void cycle_rx(arms_t *a, uint64_t now)
                 if (r->consecutive > r->consecutive_max) r->consecutive_max = r->consecutive;
                 if (r->consecutive >= a->cfg.wkc_tolerance && !r->comm_failed) {
                     r->comm_failed = true;
+                    for (int k = 0; k < r->count; ++k)
+                        atomic_fetch_and(&a->brake_known, ~ARMS_MASK_JOINT(r->slot_joint[k]));
                     r->drops++;
                 }
             }
@@ -435,14 +468,14 @@ static void cycle_rx(arms_t *a, uint64_t now)
             int j = r->slot_joint[k];
             const arms_joint_config *jc = &a->cfg.joint[j];
             arms_joint_state *s = &a->js[j];
-            if (wkc > 0) {
+            if (r->wkc_ok) {
                 kgu_feedback f;
                 memcpy(s->txpdo, r->ops->inputs(r->bus, k), sizeof(s->txpdo));
                 kgu_decode(s->txpdo, &f);
                 r->slot_pos[k] = f.pos;
                 s->status_word = f.statusword;
                 s->error_code = f.error;
-                s->position = jc->direction * (double)f.pos - jc->offset_rad;
+                s->position = jc->direction * (double)f.pos - atomic_load_explicit(&a->offset_rad[j], memory_order_relaxed);
                 s->velocity = jc->direction * (double)f.vel;
                 s->torque = jc->direction * (double)f.torque;
                 s->sample_ns = t1;
@@ -525,19 +558,17 @@ static bool fetch_command(arms_t *a, int j, arms_command *cmd, double *move_s)
     cmd_slot *sl = &a->slot[j];
     joint_ctl *c = &a->ctl[j];
     unsigned int s1, s2;
-    arms_command tmp;
-    double mv;
+    cmd_payload data;
 
     s1 = atomic_load_explicit(&sl->seq, memory_order_acquire);
     if ((s1 & 1u) || s1 == c->seq_seen) return false;
-    tmp = sl->cmd;
-    mv = sl->move_s;
+    load_words(&data, sl->data, WORDS_OF(cmd_payload));
     atomic_thread_fence(memory_order_acquire);
     s2 = atomic_load_explicit(&sl->seq, memory_order_relaxed);
     if (s1 != s2) return false;
     c->seq_seen = s1;
-    *cmd = tmp;
-    *move_s = mv;
+    *cmd = data.cmd;
+    *move_s = data.move_s;
     return true;
 }
 
@@ -720,7 +751,7 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
         double kp = clampd(c->cur.kp, 0.0, jc->kp_max, &limited);
         double kd = clampd(c->cur.kd, 0.0, jc->kd_max, &limited);
         double d = (double)jc->direction;
-        out->pos = (float)(d * (pos + jc->offset_rad));
+        out->pos = (float)(d * (pos + atomic_load_explicit(&a->offset_rad[j], memory_order_relaxed)));
         out->vel = (float)(d * vel);
         out->tff = (float)(d * tff);
         out->kp = (float)kp;
@@ -871,6 +902,7 @@ static void stop_and_free(arms_t *a)
         pthread_join(a->thread, NULL);
     }
     close_buses(a);
+    pthread_mutex_destroy(&a->cmd_lock);
     free(a);
 }
 
@@ -928,7 +960,6 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     if (a->overtorque_cycles == 0) a->overtorque_cycles = 1;
     a->protect.joint = -1;
     atomic_store(&a->enable_timeout_cycles, DEFAULT_WAIT_MS * a->cycle_hz / 1000u);
-    pthread_mutex_init(&a->cmd_lock, NULL);
     a->mode = options->mode != ARMS_MODE_CONFIG ? options->mode : a->cfg.mode;
     a->rt_cpu = options->rt_cpu >= -1 ? options->rt_cpu : a->cfg.rt_cpu;
     if (a->rt_cpu >= sysconf(_SC_NPROCESSORS_CONF)) {
@@ -956,6 +987,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     check = options->check_motors >= 0 ? options->check_motors != 0 : a->cfg.check_motors;
     a->power_off_action = strcmp(a->cfg.offline_action, "power_off") == 0;
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        atomic_init(&a->offset_rad[j], a->cfg.joint[j].offset_rad);
         if (!a->cfg.joint[j].present) continue;
         if (options->joints && !(options->joints & ARMS_MASK_JOINT(j))) continue;
         if (a->ignored & ARMS_MASK_JOINT(j)) continue;
@@ -988,12 +1020,17 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         a->js[j].mode = ARMS_JS_OFFLINE;
     }
 
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0 && options->backend != ARMS_BACKEND_MOCK) {
+    if (options->backend != ARMS_BACKEND_MOCK && mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         set_error("mlockall 失败: %s，需要 root", strerror(errno));
         free(a);
         return ARMS_E_SYSTEM;
     }
 
+    if (pthread_mutex_init(&a->cmd_lock, NULL) != 0) {
+        set_error("无法初始化指令互斥锁");
+        free(a);
+        return ARMS_E_SYSTEM;
+    }
     logf_(a, "配置: %s", path);
     logf_(a, "启动检查: %s, 屏蔽掩码 0x%08x, 离线处理: %s", check ? "开启" : "关闭", a->ignored,
           a->power_off_action ? "下电保护" : "失能并自动重连");
@@ -1032,15 +1069,15 @@ arms_status arms_open(const arms_options *options, arms_t **out)
                                    options->scan_timeout_ms ? options->scan_timeout_ms : DEFAULT_SCAN_TIMEOUT_MS, err,
                                    sizeof(err));
             if (scan_rc == 0) {
-                logf_(a, "%s 臂: 总线稳定，发现 %d 个从站（预期 %d），用时 %.2f s", arms_arm_name(i), found, expected,
+                logf_(a, "%s 臂: 扫描完成，发现 %d 个从站（预期 %d），用时 %.2f s", arms_arm_name(i), found, expected,
                       (double)(mono_ns() - t0) / 1e9);
-            } else if (strstr(err, "无法占用")) {
+            } else if (scan_rc == BUS_SCAN_MASTER) {
                 set_error("%s 臂: %s", arms_arm_name(i), err);
                 st = ARMS_E_MASTER;
                 goto fail;
-            } else if (check || strstr(err, "DOWN")) {
+            } else if (check || scan_rc != BUS_SCAN_EMPTY) {
                 set_error("%s 臂: %s", arms_arm_name(i), err);
-                st = strstr(err, "DOWN") ? ARMS_E_LINK : ARMS_E_TOPOLOGY;
+                st = scan_rc == BUS_SCAN_LINK ? ARMS_E_LINK : ARMS_E_TOPOLOGY;
                 goto fail;
             } else {
                 logf_(a, "警告: %s 臂: %s", arms_arm_name(i), err);
@@ -1118,6 +1155,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
             goto fail;
         }
     }
+    publish(a); /* 外部周期尚未运行时也能读取已配置的关节、主站和初始状态。 */
     a->activated_ns = mono_ns();
 
     if (a->mode == ARMS_MODE_EXTERNAL) {
@@ -1140,7 +1178,7 @@ fail:
 void arms_close(arms_t *a)
 {
     if (a) {
-        arms_mask abnormal = atomic_load(&a->brake_released) | atomic_load(&a->brake_held);
+        arms_mask abnormal = atomic_load(&a->brake_released) | atomic_load(&a->brake_held) | ~atomic_load(&a->brake_known);
         for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; j++)
             if (a->brake_touched & abnormal & ARMS_MASK_JOINT(j)) {
                 if (arms_set_brake(a, j, ARMS_BRAKE_NORMAL, true) != ARMS_OK)
@@ -1210,7 +1248,7 @@ uint64_t arms_period_ns(const arms_t *a) { return a ? a->period_ns : 0; }
 static void apply_brake_mode(arms_t *a, arms_joint_state *s)
 {
     arms_mask bit = ARMS_MASK_JOINT(s->joint);
-    if (s->mode != ARMS_JS_LOCKED) return;
+    if (s->mode != ARMS_JS_LOCKED || !(atomic_load(&a->brake_known) & bit)) return;
     if (atomic_load(&a->brake_released) & bit) s->mode = ARMS_JS_RELEASED;
     else if (atomic_load(&a->brake_held) & bit) s->mode = ARMS_JS_HELD;
 }
@@ -1467,10 +1505,16 @@ static void wait_snapshot(arms_t *a)
  * 抱闸不是正常控制模式时拒绝使能：强制松闸下失能后抱闸不闭合，关节失去保持；
  * 强制抱闸下电机会顶着抱闸出力。
  */
-static bool brake_abnormal(arms_t *a, const char *what)
+static bool brake_abnormal(arms_t *a, arms_mask mask, const char *what)
 {
-    arms_mask rel = atomic_load(&a->brake_released) & a->joints;
-    arms_mask held = atomic_load(&a->brake_held) & a->joints;
+    /* 库调用方不必先运行 CLI 自检。只在非实时管理上下文补读未知模式。 */
+    arms_mask unknown = mask & ~atomic_load(&a->brake_known);
+    for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        arms_brake_mode mode;
+        if ((unknown & ARMS_MASK_JOINT(j)) && arms_get_brake(a, j, &mode) != ARMS_OK) return true;
+    }
+    arms_mask rel = atomic_load(&a->brake_released) & mask;
+    arms_mask held = atomic_load(&a->brake_held) & mask;
     if (!rel && !held) return false;
     if (rel)
         set_error("%s被拒绝: 关节 %d 处于强制松闸，先执行 brake %d normal --confirm", what, __builtin_ctz(rel),
@@ -1484,7 +1528,7 @@ static bool brake_abnormal(arms_t *a, const char *what)
 arms_status arms_enable(arms_t *a, arms_mask joints, unsigned int timeout_ms)
 {
     if (!a) return ARMS_E_ARG;
-    if (brake_abnormal(a, "使能")) return ARMS_E_STATE;
+    if (brake_abnormal(a, a->joints, "使能")) return ARMS_E_STATE;
     return request_and_wait(a, joints, REQ_ENABLE, timeout_ms, "使能");
 }
 
@@ -1508,7 +1552,7 @@ arms_status arms_free(arms_t *a, arms_mask joints, double kd)
             set_error("零力矩拖动: kd %.3f 超过关节 %d 的 gain_max.kd %.3f", kd, j, a->cfg.joint[j].kd_max);
             return ARMS_E_ARG;
         }
-    if (brake_abnormal(a, "零力矩拖动")) return ARMS_E_STATE;
+    if (brake_abnormal(a, a->joints, "零力矩拖动")) return ARMS_E_STATE;
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_joint_state s;
         if (!(joints & ARMS_MASK_JOINT(j))) continue;
@@ -1579,8 +1623,8 @@ arms_status arms_set_command(arms_t *a, int joint, const arms_command *cmd, doub
     pthread_mutex_lock(&a->cmd_lock);
     atomic_fetch_add_explicit(&sl->seq, 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
-    sl->cmd = *cmd;
-    sl->move_s = move_s;
+    cmd_payload data = {*cmd, move_s};
+    store_words(sl->data, &data, WORDS_OF(cmd_payload));
     atomic_fetch_add_explicit(&sl->seq, 1, memory_order_release);
     pthread_mutex_unlock(&a->cmd_lock);
     return ARMS_OK;
@@ -1593,7 +1637,7 @@ arms_status arms_get_joint_info(const arms_t *a, int j, arms_joint_info *out)
         return ARMS_E_ARG;
     const arms_joint_config *c = &a->cfg.joint[j];
     out->direction = c->direction;
-    out->offset_rad = c->offset_rad;
+    out->offset_rad = atomic_load(&a->offset_rad[j]);
     return ARMS_OK;
 }
 int arms_pn_index(unsigned n)
@@ -1705,6 +1749,7 @@ static void record_brake(arms_t *a, int j, arms_brake_mode m)
     else atomic_fetch_and(&a->brake_released, ~bit);
     if (m == ARMS_BRAKE_HOLD) atomic_fetch_or(&a->brake_held, bit);
     else atomic_fetch_and(&a->brake_held, ~bit);
+    atomic_fetch_or(&a->brake_known, bit);
 }
 
 arms_status arms_get_brake(arms_t *a, int j, arms_brake_mode *mode)
@@ -1713,7 +1758,8 @@ arms_status arms_get_brake(arms_t *a, int j, arms_brake_mode *mode)
     size_t n = 0;
     unsigned v;
     arms_status st;
-    if (!a || !mode) return ARMS_E_ARG;
+    if (!a || !mode || j < ARMS_JOINT_FIRST || j > ARMS_JOINT_LAST) return ARMS_E_ARG;
+    atomic_fetch_and(&a->brake_known, ~ARMS_MASK_JOINT(j));
     *mode = ARMS_BRAKE_UNKNOWN;
     st = arms_sdo_read(a, j, (uint16_t)arms_pn_index(75), 0, data, sizeof(data), &n);
     if (st != ARMS_OK) return st;
@@ -1766,7 +1812,7 @@ arms_status arms_set_brake(arms_t *a, int j, arms_brake_mode mode, bool confirme
     if (st == ARMS_OK) {
         record_brake(a, j, mode);
     } else {
-        /* 写入结果不确定时重新读取，以驱动器实际值为准；读取失败则保留原记录 */
+        /* 写入结果不确定时重新读取，以驱动器实际值为准；读取失败则按未知模式联锁 */
         arms_brake_mode now;
         char saved[sizeof(last_error)];
         snprintf(saved, sizeof(saved), "%s", last_error);
@@ -1801,18 +1847,15 @@ arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
             return ARMS_E_SYSTEM;
         }
         /* 立即生效：周期上下文下一周期按新偏置换算位置（关节已失能，不影响指令） */
-        a->cfg.joint[j].offset_rad = off;
+        atomic_store(&a->offset_rad[j], off);
         wait_snapshot(a);
         return ARMS_OK;
     }
     case ARMS_ZERO_HW:
     case ARMS_SAVE: {
         unsigned pn = op == ARMS_SAVE ? 97 : 101;
-        if (op == ARMS_SAVE ? brake_abnormal(a, "参数保存")
-                            : (atomic_load(&a->brake_released) | atomic_load(&a->brake_held)) & ARMS_MASK_JOINT(j)) {
-            if (op != ARMS_SAVE) set_error("关节 %d 的抱闸不是正常模式，先执行 brake %d normal --confirm", j, j);
-            return ARMS_E_STATE;
-        }
+        if (brake_abnormal(a, op == ARMS_SAVE ? a->joints : ARMS_MASK_JOINT(j),
+                           op == ARMS_SAVE ? "参数保存" : "硬件校零")) return ARMS_E_STATE;
         if (fabs(s.velocity) > 0.01) {
             set_error("关节 %d 未静止（速度 %.4f rad/s）", j, s.velocity);
             return ARMS_E_STATE;

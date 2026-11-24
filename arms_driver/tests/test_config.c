@@ -84,6 +84,9 @@ int main(int argc, char **argv)
     CHECK(arms_parse_joints("foo", 0, &m, err, sizeof(err)) != 0, "foo accepted");
     CHECK(arms_parse_joints("22", ARMS_MASK_LEFT, &m, err, sizeof(err)) != 0, "unopened joint accepted");
 
+    CHECK(arms_parse_joints("4294967311", 0, &m, err, sizeof(err)) != 0, "wrapped joint accepted");
+    CHECK(arms_parse_joints("15,,28", 0, &m, err, sizeof(err)) != 0, "empty joint accepted");
+
     /* KGU 编解码 */
     {
         uint8_t out[KGU_OUT_BYTES], in[KGU_IN_BYTES];

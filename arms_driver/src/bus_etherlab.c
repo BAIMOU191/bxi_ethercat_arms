@@ -147,7 +147,7 @@ static int reserve(bus_t *b, char *err, size_t err_size)
         snprintf(err, err_size,
                  "无法占用主站 %d（%s）：可能已被 motor_console、hw_lib_test_* 或 ROS 节点占用",
                  b->master_index, b->interface);
-        return -1;
+        return BUS_SCAN_MASTER;
     }
     return 0;
 }
@@ -159,14 +159,15 @@ static int el_scan(bus_t *b, bus_slave_info *infos, int max, int expected, int *
     uint64_t stable_since = 0;
     int last = -1;
     ec_master_info_t mi;
-    ec_master_state_t ms;
+    bool have_info;
     unsigned int i;
     int bad = -1;
 
     do {
         uint64_t now = mono_ns();
         memset(&mi, 0, sizeof(mi));
-        if (ecrt_master(b->master, &mi) == 0 && mi.slave_count > 0 && mi.scan_busy == 0) {
+        have_info = ecrt_master(b->master, &mi) == 0;
+        if (have_info && mi.link_up && mi.slave_count > 0 && mi.scan_busy == 0) {
             bool ready = true;
             int n = (int)(mi.slave_count < (unsigned int)max ? mi.slave_count : (unsigned int)max);
             for (i = 0; (int)i < n; ++i) {
@@ -200,17 +201,17 @@ static int el_scan(bus_t *b, bus_slave_info *infos, int max, int expected, int *
         }
         usleep(20000);
     } while (mono_ns() < deadline);
-    if (last > 0) {
+    if (last > 0 && mono_ns() - stable_since >= (uint64_t)BUS_SETTLE_MS * 1000000ull) {
         /* 超时仍不足预期：返回当前结果，由调用方的启动检查给出缺失的关节 */
         *count = last;
         return reserve(b, err, err_size);
     }
-    memset(&ms, 0, sizeof(ms));
-    ecrt_master_state(b->master, &ms);
-    snprintf(err, err_size, "%s 在 %u ms 内未完成扫描：从站数=%u 应答=%u 链路=%s 扫描中=%u 首个未就绪位置=%d",
-             b->interface, timeout_ms, mi.slave_count, ms.slaves_responding, ms.link_up ? "UP" : "DOWN",
+    snprintf(err, err_size, "%s 在 %u ms 内未完成稳定扫描：从站数=%u 链路=%s 扫描中=%u 首个未就绪位置=%d",
+             b->interface, timeout_ms, mi.slave_count, !have_info ? "UNKNOWN" : mi.link_up ? "UP" : "DOWN",
              mi.scan_busy, bad);
-    return -1;
+    if (!have_info) return BUS_SCAN_MASTER;
+    if (!mi.link_up) return BUS_SCAN_LINK;
+    return !mi.scan_busy && !mi.slave_count ? BUS_SCAN_EMPTY : BUS_SCAN_UNSTABLE;
 }
 
 static int el_configure(bus_t *b, const int *positions, int n, char *err, size_t err_size)

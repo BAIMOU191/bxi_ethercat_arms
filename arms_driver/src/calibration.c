@@ -4,6 +4,7 @@
  */
 #define _GNU_SOURCE
 #include "config.h"
+#include "cJSON.h"
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -20,73 +21,68 @@ static const char *skip_ws(const char *p)
     return p;
 }
 
-/* 在 text 中查找 "key": 的值起点，搜索范围 [from, end)；未找到返回 NULL */
-static const char *find_value(const char *from, const char *end, const char *key)
+/* 用解析器取得直接成员的源文本区间，不在字符串、嵌套对象或相邻关节中搜索。 */
+static int member_span(const char *object, const char *name, const char **begin, const char **end)
 {
-    size_t klen = strlen(key);
-    const char *p = from;
-    while (p < end && (p = strstr(p, key)) != NULL && p < end) {
-        const char *q = skip_ws(p + klen);
-        if (*q == ':') return skip_ws(q + 1);
-        p += klen;
-    }
-    return NULL;
-}
-
-/* 查找 "joint": <joint> 所在关节对象的起点（数值之后的位置），以及下一个关节对象的起点 */
-static bool locate_joint(const char *text, int joint, const char **after_number, const char **object_end)
-{
-    const char *p = text;
-    while ((p = find_value(p, text + strlen(text), "\"joint\"")) != NULL) {
-        char *num_end;
-        long v = strtol(p, &num_end, 10);
-        if (num_end != p && v == joint) {
-            const char *next = find_value(num_end, text + strlen(text), "\"joint\"");
-            *after_number = num_end;
-            *object_end = next ? next : text + strlen(text);
-            return true;
+    if (*object != '{') return -1;
+    const char *p = skip_ws(object + 1);
+    while (*p != '}') {
+        const char *next;
+        cJSON *key = cJSON_ParseWithOpts(p, &next, 0);
+        bool match = cJSON_IsString(key) && strcmp(key->valuestring, name) == 0;
+        bool valid = cJSON_IsString(key);
+        cJSON_Delete(key);
+        if (!valid || *(p = skip_ws(next)) != ':') return -1;
+        p = skip_ws(p + 1);
+        cJSON *item = cJSON_ParseWithOpts(p, &next, 0);
+        if (!item) return -1;
+        cJSON_Delete(item);
+        if (match) {
+            *begin = p;
+            *end = next;
+            return 1;
         }
-        p = num_end != p ? num_end : p + 1;
+        p = skip_ws(next);
+        if (*p == '}') break;
+        if (*p != ',') return -1;
+        p = skip_ws(p + 1);
     }
-    return false;
+    return 0;
 }
 
 static char *replace_offset(const char *text, int joint, double value)
 {
-    const char *after, *end, *val;
-    char number[48];
-    char *out;
-    size_t prefix, total;
-
-    if (!locate_joint(text, joint, &after, &end)) return NULL;
-    snprintf(number, sizeof(number), "%.6f", value);
-    val = find_value(after, end, "\"offset_rad\"");
-    if (val) {
-        char *val_end;
-        strtod(val, &val_end);
-        if (val_end == val) return NULL;
-        prefix = (size_t)(val - text);
-        total = prefix + strlen(number) + strlen(val_end) + 1;
-        out = malloc(total);
-        if (!out) return NULL;
-        memcpy(out, text, prefix);
-        snprintf(out + prefix, total - prefix, "%s%s", number, val_end);
-        return out;
+    const char *array, *next;
+    const char *root = strncmp(text, "\xef\xbb\xbf", 3) == 0 ? text + 3 : text;
+    if (member_span(skip_ws(root), "joints", &array, &next) != 1 || *array != '[') return NULL;
+    const char *p = skip_ws(array + 1);
+    while (*p == '{') {
+        cJSON *item = cJSON_ParseWithOpts(p, &next, 0);
+        if (!item) return NULL;
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(item, "joint");
+        bool match = cJSON_IsNumber(id) && id->valuedouble == joint;
+        cJSON_Delete(item);
+        if (match) {
+            const char *from, *to;
+            char replacement[96];
+            int found = member_span(p, "offset_rad", &from, &to);
+            if (found < 0) return NULL;
+            if (!found) from = to = p + 1;
+            int n = snprintf(replacement, sizeof(replacement), found ? "%.6f" : " \"offset_rad\": %.6f,", value);
+            if (n < 0 || (size_t)n >= sizeof(replacement)) return NULL;
+            size_t prefix = (size_t)(from - text), tail = strlen(to) + 1;
+            char *out = malloc(prefix + (size_t)n + tail);
+            if (!out) return NULL;
+            memcpy(out, text, prefix);
+            memcpy(out + prefix, replacement, (size_t)n);
+            memcpy(out + prefix + (size_t)n, to, tail);
+            return out;
+        }
+        p = skip_ws(next);
+        if (*p != ',') break;
+        p = skip_ws(p + 1);
     }
-    /* 原来没有 offset_rad：插在 "joint": N 之后的逗号后面 */
-    {
-        const char *comma = skip_ws(after);
-        char insert[80];
-        if (*comma != ',') return NULL;
-        snprintf(insert, sizeof(insert), " \"offset_rad\": %s,", number);
-        prefix = (size_t)(comma + 1 - text);
-        total = prefix + strlen(insert) + strlen(comma + 1) + 1;
-        out = malloc(total);
-        if (!out) return NULL;
-        memcpy(out, text, prefix);
-        snprintf(out + prefix, total - prefix, "%s%s", insert, comma + 1);
-        return out;
-    }
+    return NULL;
 }
 
 /* 写入临时文件、重新加载校验，通过后替换原文件 */

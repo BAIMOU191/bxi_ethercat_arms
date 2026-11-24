@@ -121,18 +121,22 @@ int tlog_stamp_all_lines(void)
     if (pipe(fds) != 0) return -1;
     g_saved_out = dup(STDOUT_FILENO);
     g_saved_err = dup(STDERR_FILENO);
-    if (g_saved_out < 0 || g_saved_err < 0) return -1;
+    if (g_saved_out < 0 || g_saved_err < 0) goto fail;
+    if (dup2(fds[1], STDOUT_FILENO) < 0 || dup2(fds[1], STDERR_FILENO) < 0) goto fail;
     g_pipe_rd = fds[0];
-    if (dup2(fds[1], STDOUT_FILENO) < 0 || dup2(fds[1], STDERR_FILENO) < 0) return -1;
+    if (pthread_create(&g_thread, NULL, forward_main, NULL) != 0) goto fail;
     close(fds[1]);
     setvbuf(stdout, NULL, _IOLBF, 0);
-    if (pthread_create(&g_thread, NULL, forward_main, NULL) != 0) {
-        dup2(g_saved_out, STDOUT_FILENO);
-        dup2(g_saved_err, STDERR_FILENO);
-        return -1;
-    }
     g_all_lines = true;
     return 0;
+
+fail:
+    if (g_saved_out >= 0) { dup2(g_saved_out, STDOUT_FILENO); close(g_saved_out); }
+    if (g_saved_err >= 0) { dup2(g_saved_err, STDERR_FILENO); close(g_saved_err); }
+    close(fds[0]);
+    close(fds[1]);
+    g_saved_out = g_saved_err = g_pipe_rd = -1;
+    return -1;
 }
 
 void tlog_shutdown(void)

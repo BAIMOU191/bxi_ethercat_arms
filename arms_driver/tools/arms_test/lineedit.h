@@ -17,7 +17,8 @@
  * @brief 显示提示符并读取一行（不含换行符）
  * @return LE_OK；LE_EOF（Ctrl+D 或输入结束）；LE_INTERRUPTED（Ctrl+C）
  */
-int le_readline(const char *prompt, char *buf, size_t size);
+/* stop_fd 在 SIGTERM 后保持可读，即使信号由其他线程接收也能结束输入。 */
+int le_readline(const char *prompt, char *buf, size_t size, int stop_fd);
 
 /** @brief 加入历史记录（空行和与上一条相同的行不记录） */
 void le_history_add(const char *line);

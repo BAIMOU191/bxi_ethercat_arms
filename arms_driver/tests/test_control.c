@@ -72,6 +72,9 @@ int main(int argc, char **argv)
     usleep(100000);
     s = rd(a, 17);
     CHECK(s.cmd_moving, "moving");
+    arms_reset_stats(a);
+    usleep(15000);
+    CHECK(rd(a, 17).cmd_moving, "resetting statistics must not finish a move");
     usleep(400000);
     s = rd(a, 17);
     CHECK(!s.cmd_moving, "move finished");

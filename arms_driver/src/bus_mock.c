@@ -7,6 +7,7 @@
  *   ARMS_MOCK_DROP_PPM=<ppm>   每周期 WKC 为 0 的概率（故障注入）
  *   ARMS_MOCK_FAULT_CYCLE=<n>  第 n 周期后，主站 0 链上位置 0 的从站在使能状态下报故障
  *   ARMS_MOCK_OVERSPEED_CYCLE=<n> 第 n 周期后，主站 0 链上位置 0 的从站在使能状态下反馈速度 10 rad/s
+ *   ARMS_MOCK_PN075_UNREADABLE=1  模拟抱闸参数读取失败
  *   ARMS_MOCK_POWER_OFF=<s>,<n> 主站 0 从第 s 周期起掉电 n 个周期，恢复后从站报同步丢失故障
  */
 #include <stdio.h>
@@ -18,8 +19,10 @@
 
 struct bus {
     uint16_t params[BUS_MAX_SLAVES][0x200];
+    bool pn075_unreadable;
     int slaves;
     int configured;
+    float cycle_hz;
     int positions[BUS_MAX_SLAVES];
     uint8_t out[BUS_MAX_SLAVES][KGU_OUT_BYTES];
     uint8_t in[BUS_MAX_SLAVES][KGU_IN_BYTES];
@@ -50,6 +53,9 @@ static int mock_open(bus_t **out, const bus_open_params *p, char *err, size_t er
         snprintf(err, err_size, "内存不足");
         return -1;
     }
+    s = getenv("ARMS_MOCK_PN075_UNREADABLE");
+    b->pn075_unreadable = s && !strcmp(s, "1");
+    b->cycle_hz = 1e9f / (float)p->cycle_ns;
     b->slaves = 7;
     s = getenv("ARMS_MOCK_SLAVES");
     if (s) {
@@ -172,7 +178,7 @@ static int mock_receive(bus_t *b)
         f.statusword = al == 0x08 ? mock_drive(b, i, c.controlword) : 0x0250u;
         if ((f.statusword & 0x006Fu) == 0x0027u && c.kp > 0.0f) b->pos[i] += (c.pos - b->pos[i]) * 0.02f;
         f.pos = b->pos[i];
-        f.vel = (b->pos[i] - prev) * 1000.0f;
+        f.vel = (b->pos[i] - prev) * b->cycle_hz;
         if (b->overspeed_cycle && b->master == 0 && b->positions[i] == 0 && b->cycles >= b->overspeed_cycle &&
             (f.statusword & 0x006Fu) == 0x0027u)
             f.vel = 10.0f;
@@ -231,6 +237,10 @@ static int mock_sdo(bus_t *b, int slave, uint16_t index, uint8_t sub, uint8_t *d
             data[k] = (uint8_t)(x >> (8 * k));
         *n = 4;
         return 0;
+    }
+    if (!write && index == 0x2075 && b->pn075_unreadable) {
+        *abort = 0x08000000;
+        return -1;
     }
     if (sub || index < 0x2000 || index >= 0x2200 || *n < 2) {
         *abort = 0x06020000;

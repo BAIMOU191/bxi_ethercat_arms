@@ -14,6 +14,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,32 +77,42 @@ void le_history_add(const char *line)
     if (g_history[g_history_len]) g_history_len++;
 }
 
-static int read_byte(unsigned char *c)
+static int read_byte(unsigned char *c, int stop_fd)
 {
+    struct pollfd fds[] = {{STDIN_FILENO, POLLIN, 0}, {stop_fd, POLLIN, 0}};
+    if (poll(fds, 2, -1) < 0) return errno == EINTR ? LE_INTERRUPTED : LE_EOF;
+    if (fds[1].revents) return LE_EOF;
     ssize_t n = read(STDIN_FILENO, c, 1);
     if (n == 1) return 0;
     if (n < 0 && errno == EINTR) return LE_INTERRUPTED;
     return LE_EOF;
 }
 
-static int plain_readline(const char *prompt, char *buf, size_t size)
+static int plain_readline(const char *prompt, char *buf, size_t size, int stop_fd)
 {
-    size_t n;
+    size_t n = 0;
+    bool too_long = false;
     fputs(prompt, stdout);
     fflush(stdout);
-    if (!fgets(buf, (int)size, stdin)) {
-        if (ferror(stdin) && errno == EINTR) {
-            clearerr(stdin);
-            return LE_INTERRUPTED;
-        }
-        return LE_EOF;
+    for (;;) {
+        unsigned char c;
+        int rc = read_byte(&c, stop_fd);
+        if (rc == LE_INTERRUPTED) return rc;
+        if (rc == LE_EOF && !n) return LE_EOF;
+        if (rc == LE_EOF || c == '\n') break;
+        if (n + 1 < size) buf[n++] = (char)c;
+        else too_long = true;
     }
-    n = strlen(buf);
-    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
+    if (too_long) {
+        fputs("输入行过长，命令未执行。\n", stderr);
+        n = 0;
+    }
+    if (n && buf[n - 1] == '\r') --n;
+    buf[n] = '\0';
     return LE_OK;
 }
 
-int le_readline(const char *prompt, char *buf, size_t size)
+int le_readline(const char *prompt, char *buf, size_t size, int stop_fd)
 {
     struct termios orig, raw;
     size_t len = 0, pos = 0;
@@ -108,7 +120,7 @@ int le_readline(const char *prompt, char *buf, size_t size)
     char saved[1024] = "";
 
     if (size < 2) return LE_EOF;
-    if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &orig) != 0) return plain_readline(prompt, buf, size);
+    if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &orig) != 0) return plain_readline(prompt, buf, size, stop_fd);
     if (g_out < 0) {
         g_out = open("/dev/tty", O_WRONLY | O_CLOEXEC);
         if (g_out < 0) g_out = STDOUT_FILENO;
@@ -120,13 +132,13 @@ int le_readline(const char *prompt, char *buf, size_t size)
     raw.c_lflag &= (tcflag_t) ~(ECHO | ICANON | IEXTEN); /* 保留 ISIG：Ctrl+C 仍产生 SIGINT */
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) return plain_readline(prompt, buf, size);
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) return plain_readline(prompt, buf, size, stop_fd);
 
     buf[0] = '\0';
     refresh(prompt, buf, len, pos);
     for (;;) {
         unsigned char c;
-        int r = read_byte(&c);
+        int r = read_byte(&c, stop_fd);
         if (r != 0) {
             rc = r;
             break;
@@ -168,10 +180,11 @@ int le_readline(const char *prompt, char *buf, size_t size)
             buf[len] = '\0';
         } else if (c == 27) { /* ESC 序列 */
             unsigned char s1, s2;
-            if (read_byte(&s1) || read_byte(&s2)) continue;
+            if ((rc = read_byte(&s1, stop_fd)) != 0 || (rc = read_byte(&s2, stop_fd)) != 0) break;
             if (s1 == '[' && s2 >= '0' && s2 <= '9') {
                 unsigned char s3;
-                if (read_byte(&s3) || s3 != '~') continue;
+                if ((rc = read_byte(&s3, stop_fd)) != 0) break;
+                if (s3 != '~') continue;
                 if (s2 == '1' || s2 == '7') pos = 0;
                 else if (s2 == '4' || s2 == '8') pos = len;
                 else if (s2 == '3' && pos < len) {
