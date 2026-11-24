@@ -34,7 +34,7 @@ static volatile sig_atomic_t g_interrupted;
 static arms_t *g_arms;
 static bool powered, power_known, mock_backend;
 static bool g_stamp_all; /* -T：每行加时间戳，输出经过管道 */
-static unsigned int power_wait = 3000;
+static unsigned int power_wait = 15000; /* 上电后等待总线稳定的最长时间 [ms] */
 
 static void on_sigint(int sig)
 {
@@ -423,7 +423,7 @@ static int cmd_power(int argc, char **argv)
     if (!strcmp(op, "status")) {
         printf("电源: %s（以现场指示为准）\n", !power_known ? "状态未知" : powered ? "已请求上电" : "已请求断电");
     } else if (!strcmp(op, "on")) {
-        if (!powered && arms_power_on(power_wait) != 0) {
+        if (!powered && arms_power_on(0) != 0) {
             power_known = false;
             return failed("上电失败");
         }
@@ -1149,7 +1149,7 @@ static void usage(FILE *out)
         "      --mock           使用模拟后端，不访问硬件，不需要 root\n"
         "      --no-power       不操作电机电源（电源已由其他程序打开时使用）\n"
         "      --keep-power     退出时不断电\n"
-        "      --power-wait MS  上电后等待驱动器启动的时间（默认 3000）\n"
+        "      --power-wait MS  上电后等待总线稳定的最长时间（默认 15000）；从站数达到配置并稳定后立即继续\n"
         "      --no-rt-setup    不配置实时运行环境（中断绑定、CPU 隔离）\n"
         "  -m, --mask MASK      屏蔽掩码（31 位，第 n 位对应关节 n）。被屏蔽的关节不打开、不做在线检查，\n"
         "                       掉线不触发下电保护；例如 0x10200000 屏蔽 21 和 28（默认取配置 "
@@ -1282,8 +1282,8 @@ int main(int argc, char **argv)
         case 'w': {
             char *end;
             long v = strtol(optarg, &end, 10);
-            if (*end || v < 0 || v > 60000) {
-                fprintf(stderr, "错误: --power-wait 需要 0..60000 的毫秒数\n");
+            if (*end || v < 1000 || v > 60000) {
+                fprintf(stderr, "错误: --power-wait 需要 1000..60000 的毫秒数\n");
                 return 2;
             }
             power_wait = (unsigned int)v;
@@ -1324,12 +1324,13 @@ int main(int argc, char **argv)
         if (arms_env_start_master() != 0) return 1;
         if (rt_setup && arms_env_rt_apply(opt.config_path, opt.rt_cpu >= 0 ? opt.rt_cpu : -2) < 0) return 1;
         if (power) {
-            if (arms_power_on(power_wait) != 0) {
+            if (arms_power_on(0) != 0) {
                 arms_env_rt_revert();
                 return 1;
             }
             powered = power_known = true;
-            opt.scan_timeout_ms = 20000;
+            /* 不固定等待：扫描时等到各臂从站数达到配置并保持稳定，最长 power_wait */
+            opt.scan_timeout_ms = power_wait;
         }
     }
     tlog("启动: %s后端，扫描并预热，全部关节保持伺服失能", opt.backend == ARMS_BACKEND_MOCK ? "模拟" : "EtherLab ");

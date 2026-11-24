@@ -289,7 +289,8 @@ class ArmsNode final : public rclcpp::Node
                 throw std::runtime_error("real-time environment setup failed");
             if (power) {
                 dev.owns_power = true;
-                if (arms_power_on(3000))
+                opt.scan_timeout_ms = 15000; /* 扫描等待总线稳定，不固定延时 */
+                if (arms_power_on(0))
                     throw std::runtime_error("power-on request failed");
             }
         }

@@ -15,6 +15,7 @@
 #include "kgu.h"
 
 #define BUS_MAX_SLAVES 16
+#define BUS_SETTLE_MS 300u /* 从站数保持不变该时长后认为总线稳定 */
 
 typedef void (*bus_log_fn)(void *user, const char *fmt, ...);
 
@@ -42,8 +43,12 @@ typedef struct bus bus_t;
 typedef struct {
     const char *name;
     int (*open)(bus_t **out, const bus_open_params *params, char *err, size_t err_size);
-    /* 等待从站身份就绪（最长 timeout_ms），写入 infos[0..*count-1] */
-    int (*scan)(bus_t *bus, bus_slave_info *infos, int max, int *count, unsigned int timeout_ms,
+    /*
+     * 等待总线稳定后返回从站身份，写入 infos[0..*count-1]。
+     * 稳定：从站数不少于 expected，身份可读，且从站数持续 BUS_SETTLE_MS 不变。
+     * 到 timeout_ms 仍未稳定时，有从站则返回当前结果（由调用方判断缺失），一个都没有则失败。
+     */
+    int (*scan)(bus_t *bus, bus_slave_info *infos, int max, int expected, int *count, unsigned int timeout_ms,
                 char *err, size_t err_size);
     /* 为链上位置 positions[0..n-1] 配置 MIT PDO 和 DC Sync0 */
     int (*configure)(bus_t *bus, const int *positions, int n, char *err, size_t err_size);

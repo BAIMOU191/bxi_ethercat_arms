@@ -74,10 +74,11 @@ static int mock_open(bus_t **out, const bus_open_params *p, char *err, size_t er
     return 0;
 }
 
-static int mock_scan(bus_t *b, bus_slave_info *infos, int max, int *count, unsigned int timeout_ms,
+static int mock_scan(bus_t *b, bus_slave_info *infos, int max, int expected, int *count, unsigned int timeout_ms,
                      char *err, size_t err_size)
 {
     int i;
+    (void)expected;
     (void)timeout_ms;
     (void)err;
     (void)err_size;

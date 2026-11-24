@@ -138,20 +138,24 @@ static int el_open(bus_t **out, const bus_open_params *p, char *err, size_t err_
     return 0;
 }
 
-static int el_scan(bus_t *b, bus_slave_info *infos, int max, int *count, unsigned int timeout_ms,
+static int el_scan(bus_t *b, bus_slave_info *infos, int max, int expected, int *count, unsigned int timeout_ms,
                    char *err, size_t err_size)
 {
     uint64_t deadline = mono_ns() + (uint64_t)timeout_ms * 1000000ull;
+    uint64_t stable_since = 0;
+    int last = -1;
     ec_master_info_t mi;
     ec_master_state_t ms;
     unsigned int i;
     int bad = -1;
 
     do {
+        uint64_t now = mono_ns();
         memset(&mi, 0, sizeof(mi));
         if (ecrt_master(b->master, &mi) == 0 && mi.slave_count > 0 && mi.scan_busy == 0) {
             bool ready = true;
-            for (i = 0; i < mi.slave_count && (int)i < max; ++i) {
+            int n = (int)(mi.slave_count < (unsigned int)max ? mi.slave_count : (unsigned int)max);
+            for (i = 0; (int)i < n; ++i) {
                 ec_slave_info_t si;
                 if (ecrt_master_get_slave(b->master, (uint16_t)i, &si) != 0 || si.vendor_id == 0 ||
                     si.product_code == 0) {
@@ -165,12 +169,28 @@ static int el_scan(bus_t *b, bus_slave_info *infos, int max, int *count, unsigne
                 snprintf(infos[i].name, sizeof(infos[i].name), "%s", si.name);
             }
             if (ready) {
-                *count = (int)(mi.slave_count < (unsigned int)max ? mi.slave_count : (unsigned int)max);
-                return 0;
+                /* 上电后驱动器陆续启动，从站数会逐步增加；数量达到预期并保持不变才算稳定 */
+                if (n != last) {
+                    last = n;
+                    stable_since = now;
+                }
+                if (n >= expected && now - stable_since >= (uint64_t)BUS_SETTLE_MS * 1000000ull) {
+                    *count = n;
+                    return 0;
+                }
+            } else {
+                last = -1;
             }
+        } else {
+            last = -1;
         }
         usleep(20000);
     } while (mono_ns() < deadline);
+    if (last > 0) {
+        /* 超时仍不足预期：返回当前结果，由调用方的启动检查给出缺失的关节 */
+        *count = last;
+        return 0;
+    }
     memset(&ms, 0, sizeof(ms));
     ecrt_master_state(b->master, &ms);
     snprintf(err, err_size, "%s 在 %u ms 内未完成扫描：从站数=%u 应答=%u 链路=%s 扫描中=%u 首个未就绪位置=%d",

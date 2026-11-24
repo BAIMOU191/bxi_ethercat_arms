@@ -1020,17 +1020,28 @@ arms_status arms_open(const arms_options *options, arms_t **out)
             st = ARMS_E_MASTER;
             goto fail;
         }
-        logf_(a, "%s 臂: 网口 %s, 主站 %d, 扫描中", arms_arm_name(i), ac->interface, r->ops->master_index(r->bus));
-        if (r->ops->scan(r->bus, infos, BUS_MAX_SLAVES, &found,
-                         options->scan_timeout_ms ? options->scan_timeout_ms : DEFAULT_SCAN_TIMEOUT_MS, err,
-                         sizeof(err)) != 0) {
-            if (check || strstr(err, "DOWN")) {
+        logf_(a, "%s 臂: 网口 %s, 主站 %d, 等待总线稳定", arms_arm_name(i), ac->interface,
+              r->ops->master_index(r->bus));
+        {
+            /* 预期从站数：配置中该臂用到的最大链上位置 + 1 */
+            int expected = 0, scan_rc;
+            uint64_t t0 = mono_ns();
+            for (k = 0; k < r->count; ++k)
+                if (r->slot_slave[k] + 1 > expected) expected = r->slot_slave[k] + 1;
+            scan_rc = r->ops->scan(r->bus, infos, BUS_MAX_SLAVES, expected, &found,
+                                   options->scan_timeout_ms ? options->scan_timeout_ms : DEFAULT_SCAN_TIMEOUT_MS, err,
+                                   sizeof(err));
+            if (scan_rc == 0) {
+                logf_(a, "%s 臂: 总线稳定，发现 %d 个从站（预期 %d），用时 %.2f s", arms_arm_name(i), found, expected,
+                      (double)(mono_ns() - t0) / 1e9);
+            } else if (check || strstr(err, "DOWN")) {
                 set_error("%s 臂: %s", arms_arm_name(i), err);
                 st = strstr(err, "DOWN") ? ARMS_E_LINK : ARMS_E_TOPOLOGY;
                 goto fail;
+            } else {
+                logf_(a, "警告: %s 臂: %s", arms_arm_name(i), err);
+                found = 0;
             }
-            logf_(a, "警告: %s 臂: %s", arms_arm_name(i), err);
-            found = 0;
         }
         {
             /* 启动检查：链上位置存在且型号一致才视为在线 */

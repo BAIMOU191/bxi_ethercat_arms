@@ -34,8 +34,12 @@ int arms_power_on(unsigned int wait_ms)
         tlog_err("电源: motor_pwr_set(1) 失败");
         return -1;
     }
-    tlog("电源: 已请求上电，等待驱动器启动 %u ms", wait_ms);
-    usleep(wait_ms * 1000u);
+    if (wait_ms) {
+        tlog("电源: 已请求上电，等待驱动器启动 %u ms", wait_ms);
+        usleep(wait_ms * 1000u);
+    } else {
+        tlog("电源: 已请求上电");
+    }
     return 0;
 }
 
