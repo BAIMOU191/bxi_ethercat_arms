@@ -1,0 +1,178 @@
+== 阶段 1 验收 2026-11-24 11:34:30  关节=left  每轮 300s  频率=1000 2000
+-- 启动 EtherLab 主站
+Starting EtherCAT master 1.6.13  done
+-- 主站绑定: 72:fa:76:be:f3:0e,a2:b2:41:5f:5c:5f
+rt_cpu=5 irq_cpu=5 ifaces=eth0,eth1
+  IRQ 83 (eth0) -> CPU 5
+  IRQ 84 (eth0) -> CPU 5
+  IRQ 105 (eth1) -> CPU 5
+  IRQ 106 (eth1) -> CPU 5
+  ksoftirqd/5 (pid 38) -> SCHED_FIFO 80
+  已把 0 个线程限制到 CPU 0,1,2,3,4,6,7
+  kerneloops 已暂停
+完成。测试结束后运行: sudo /home/bxi/bxi_ws/bxi_ethercat_arms/arms_driver/scripts/rt_setup.sh revert
+
+== 1000 Hz
+arms_test 0.1.0-9bb6771-dirty (Nov 24 2026 11:30:07)
+电源: 已请求上电（双臂与整机共用），等待驱动器启动 3000 ms...
+启动: EtherLab 后端，扫描并预热（全部关节保持失能）...
+  配置: /home/bxi/bxi_ws/bxi_ethercat_arms/arms_driver/config/arms.json
+  left 臂: 网口 eth0 -> 主站 0，扫描中...
+  left 臂: 发现 7 个从站，配置使用 7 个
+  实时线程: SCHED_FIFO 80, CPU 5, 周期 1000 Hz
+  预热中: OP 从站 左 0/7 右 0/0
+  预热中: OP 从站 左 0/7 右 0/0
+  预热中: OP 从站 左 0/7 右 0/0
+  预热中: OP 从站 左 0/7 右 0/0
+  预热中: OP 从站 左 2/7 右 0/0
+  预热中: OP 从站 左 4/7 右 0/0
+  预热中: OP 从站 左 4/7 右 0/0
+  预热中: OP 从站 左 6/7 右 0/0
+  预热完成：全部 7 个关节进入 OP，伺服保持失能
+周期 1000 Hz  已运行 20 周期  平均 1000.0 us  最短 999.0  最长 1001.0  抖动RMS 0.46 us
+唤醒最大延迟 4.5 us  单周期最大耗时 12.0 us  超时(>1.5T) 0  跳过周期 0
+left  eth0 主站0 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 2.3 us 发 9.3 us
+right 未打开
+>> info
+版本     0.1.0-9bb6771-dirty (Nov 24 2026 11:30:07)
+配置     /home/bxi/bxi_ws/bxi_ethercat_arms/arms_driver/config/arms.json
+后端     etherlab
+周期     1kHz
+关节映射:
+  15 l_shoulder_y_joint   left 臂 slave 0（testmotor 显示为 slave 1）
+  16 l_shoulder_x_joint   left 臂 slave 1（testmotor 显示为 slave 2）
+  17 l_shoulder_z_joint   left 臂 slave 2（testmotor 显示为 slave 3）
+  18 l_elbow_y_joint      left 臂 slave 3（testmotor 显示为 slave 4）
+  19 l_wrist_x_joint      left 臂 slave 4（testmotor 显示为 slave 5）
+  20 l_wrist_y_joint      left 臂 slave 5（testmotor 显示为 slave 6）
+  21 l_wrist_z_joint      left 臂 slave 6（testmotor 显示为 slave 7）
+OK
+>> commtest 300
+失能通信测试 300 秒，回车或 Ctrl+C 提前结束...
+   10 s  周期 10032  WKC异常 左 0 右 0  周期最长 1002.5 us
+   20 s  周期 20043  WKC异常 左 0 右 0  周期最长 1002.5 us
+   30 s  周期 30054  WKC异常 左 0 右 0  周期最长 1009.8 us
+   40 s  周期 40065  WKC异常 左 0 右 0  周期最长 1036.3 us
+   50 s  周期 50076  WKC异常 左 0 右 0  周期最长 1045.3 us
+   60 s  周期 60087  WKC异常 左 0 右 0  周期最长 1045.3 us
+   70 s  周期 70098  WKC异常 左 0 右 0  周期最长 1045.3 us
+   80 s  周期 80109  WKC异常 左 0 右 0  周期最长 1045.3 us
+   90 s  周期 90119  WKC异常 左 0 右 0  周期最长 1045.3 us
+  100 s  周期 100131  WKC异常 左 0 右 0  周期最长 1045.3 us
+  110 s  周期 110141  WKC异常 左 0 右 0  周期最长 1045.3 us
+  120 s  周期 120151  WKC异常 左 0 右 0  周期最长 1045.3 us
+  130 s  周期 130163  WKC异常 左 0 右 0  周期最长 1054.1 us
+  140 s  周期 140174  WKC异常 左 0 右 0  周期最长 1054.1 us
+  150 s  周期 150184  WKC异常 左 0 右 0  周期最长 1054.1 us
+  160 s  周期 160193  WKC异常 左 0 右 0  周期最长 1054.1 us
+  170 s  周期 170204  WKC异常 左 0 右 0  周期最长 1054.1 us
+  180 s  周期 180212  WKC异常 左 0 右 0  周期最长 1054.1 us
+  190 s  周期 190220  WKC异常 左 0 右 0  周期最长 1054.1 us
+  200 s  周期 200229  WKC异常 左 0 右 0  周期最长 1054.1 us
+  210 s  周期 210237  WKC异常 左 0 右 0  周期最长 1054.1 us
+  220 s  周期 220246  WKC异常 左 0 右 0  周期最长 1054.1 us
+  230 s  周期 230255  WKC异常 左 0 右 0  周期最长 1054.1 us
+  240 s  周期 240265  WKC异常 左 0 右 0  周期最长 1054.1 us
+  250 s  周期 250274  WKC异常 左 0 右 0  周期最长 1062.3 us
+  260 s  周期 260283  WKC异常 左 0 右 0  周期最长 1062.3 us
+  270 s  周期 270294  WKC异常 左 0 右 0  周期最长 1071.6 us
+  280 s  周期 280304  WKC异常 左 0 右 0  周期最长 1071.6 us
+  290 s  周期 290312  WKC异常 左 0 右 0  周期最长 1071.6 us
+  300 s  周期 300320  WKC异常 左 0 右 0  周期最长 1071.6 us
+周期 1000 Hz  已运行 300320 周期  平均 1000.0 us  最短 927.5  最长 1071.6  抖动RMS 0.81 us
+唤醒最大延迟 76.1 us  单周期最大耗时 38.8 us  超时(>1.5T) 0  跳过周期 0
+left  eth0 主站0 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 16.3 us 发 35.0 us
+right 未打开
+结果: 通过（无 WKC 异常、无发送错误、无超时周期）
+OK
+>> bus
+周期 1000 Hz  已运行 300320 周期  平均 1000.0 us  最短 927.5  最长 1071.6  抖动RMS 0.81 us
+唤醒最大延迟 76.1 us  单周期最大耗时 38.8 us  超时(>1.5T) 0  跳过周期 0
+left  eth0 主站0 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 16.3 us 发 35.0 us
+right 未打开
+OK
+退出: 停止通信并释放主站...
+电源: 已请求断电（实际断电请以现场指示为准）
+已退出
+
+== 2000 Hz
+arms_test 0.1.0-9bb6771-dirty (Nov 24 2026 11:30:07)
+电源: 已请求上电（双臂与整机共用），等待驱动器启动 3000 ms...
+启动: EtherLab 后端，扫描并预热（全部关节保持失能）...
+  配置: /home/bxi/bxi_ws/bxi_ethercat_arms/arms_driver/config/arms.json
+  left 臂: 网口 eth0 -> 主站 0，扫描中...
+  left 臂: 发现 7 个从站，配置使用 7 个
+  实时线程: SCHED_FIFO 80, CPU 5, 周期 2000 Hz
+  预热中: OP 从站 左 2/7 右 0/0
+  预热中: OP 从站 左 5/7 右 0/0
+  预热完成：全部 7 个关节进入 OP，伺服保持失能
+周期 2000 Hz  已运行 40 周期  平均 500.9 us  最短 473.7  最长 537.0  抖动RMS 11.16 us
+唤醒最大延迟 47.6 us  单周期最大耗时 27.4 us  超时(>1.5T) 0  跳过周期 0
+left  eth0 主站0 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 18.1 us 发 20.1 us
+right 未打开
+>> info
+版本     0.1.0-9bb6771-dirty (Nov 24 2026 11:30:07)
+配置     /home/bxi/bxi_ws/bxi_ethercat_arms/arms_driver/config/arms.json
+后端     etherlab
+周期     2kHz
+关节映射:
+  15 l_shoulder_y_joint   left 臂 slave 0（testmotor 显示为 slave 1）
+  16 l_shoulder_x_joint   left 臂 slave 1（testmotor 显示为 slave 2）
+  17 l_shoulder_z_joint   left 臂 slave 2（testmotor 显示为 slave 3）
+  18 l_elbow_y_joint      left 臂 slave 3（testmotor 显示为 slave 4）
+  19 l_wrist_x_joint      left 臂 slave 4（testmotor 显示为 slave 5）
+  20 l_wrist_y_joint      left 臂 slave 5（testmotor 显示为 slave 6）
+  21 l_wrist_z_joint      left 臂 slave 6（testmotor 显示为 slave 7）
+OK
+>> commtest 300
+失能通信测试 300 秒，回车或 Ctrl+C 提前结束...
+   10 s  周期 20058  WKC异常 左 0 右 0  周期最长 692.1 us
+   20 s  周期 40080  WKC异常 左 0 右 0  周期最长 741.7 us
+   30 s  周期 60098  WKC异常 左 0 右 0  周期最长 741.7 us
+   40 s  周期 80118  WKC异常 左 0 右 0  周期最长 741.7 us
+   50 s  周期 100140  WKC异常 左 0 右 0  周期最长 741.7 us
+   60 s  周期 120162  WKC异常 左 2 右 0  周期最长 858.7 us
+   70 s  周期 140184  WKC异常 左 2 右 0  周期最长 858.7 us
+   80 s  周期 160202  WKC异常 左 2 右 0  周期最长 858.7 us
+   90 s  周期 180225  WKC异常 左 3 右 0  周期最长 950.6 us
+  100 s  周期 200247  WKC异常 左 3 右 0  周期最长 950.6 us
+  110 s  周期 220268  WKC异常 左 3 右 0  周期最长 950.6 us
+  120 s  周期 240286  WKC异常 左 3 右 0  周期最长 950.6 us
+  130 s  周期 260309  WKC异常 左 3 右 0  周期最长 950.6 us
+  140 s  周期 280331  WKC异常 左 3 右 0  周期最长 950.6 us
+  150 s  周期 300353  WKC异常 左 3 右 0  周期最长 950.6 us
+  160 s  周期 320373  WKC异常 左 3 右 0  周期最长 950.6 us
+  170 s  周期 340391  WKC异常 左 3 右 0  周期最长 950.6 us
+  180 s  周期 360411  WKC异常 左 3 右 0  周期最长 950.6 us
+  190 s  周期 380433  WKC异常 左 3 右 0  周期最长 950.6 us
+  200 s  周期 400455  WKC异常 左 3 右 0  周期最长 950.6 us
+  210 s  周期 420478  WKC异常 左 3 右 0  周期最长 950.6 us
+  220 s  周期 440500  WKC异常 左 3 右 0  周期最长 950.6 us
+  230 s  周期 460522  WKC异常 左 3 右 0  周期最长 950.6 us
+  240 s  周期 480543  WKC异常 左 3 右 0  周期最长 950.6 us
+  250 s  周期 500564  WKC异常 左 3 右 0  周期最长 950.6 us
+  260 s  周期 520586  WKC异常 左 3 右 0  周期最长 950.6 us
+  270 s  周期 540609  WKC异常 左 3 右 0  周期最长 950.6 us
+  280 s  周期 560631  WKC异常 左 3 右 0  周期最长 950.6 us
+  290 s  周期 580652  WKC异常 左 3 右 0  周期最长 950.6 us
+  300 s  周期 600673  WKC异常 左 3 右 0  周期最长 950.6 us
+周期 2000 Hz  已运行 600673 周期  平均 500.0 us  最短 64.5  最长 950.6  抖动RMS 5.19 us
+唤醒最大延迟 459.1 us  单周期最大耗时 93.6 us  超时(>1.5T) 0  跳过周期 0
+left  eth0 主站0 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 3 (最长连续 1)  发送错误 0  收 53.7 us 发 88.1 us
+right 未打开
+FAILED: 通信测试未通过（见上方统计）
+>> bus
+周期 2000 Hz  已运行 600673 周期  平均 500.0 us  最短 64.5  最长 950.6  抖动RMS 5.19 us
+唤醒最大延迟 459.1 us  单周期最大耗时 93.6 us  超时(>1.5T) 0  跳过周期 0
+left  eth0 主站0 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 3 (最长连续 1)  发送错误 0  收 53.7 us 发 88.1 us
+right 未打开
+OK
+退出: 停止通信并释放主站...
+电源: 已请求断电（实际断电请以现场指示为准）
+已退出
+
+== 汇总
+  1000 Hz: 通过
+  2000 Hz: 未通过
+日志: /tmp/arms_phase1_20261124_113430.log
+已还原（线程 0 个，已退出 0 个）
