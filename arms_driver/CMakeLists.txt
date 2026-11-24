@@ -55,7 +55,8 @@ if(ARMS_HAVE_ETHERLAB)
 endif()
 set_target_properties(arms_driver PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_executable(arms_test tools/arms_test/main.c tools/arms_test/motion.c tools/arms_test/joint_select.c tools/arms_test/power.c
+add_executable(arms_test tools/arms_test/main.c tools/arms_test/motion.c tools/arms_test/joint_select.c
+               tools/arms_test/lineedit.c tools/arms_test/power.c
                tools/arms_test/runtime_env.c tools/arms_test/tlog.c)
 target_link_libraries(arms_test PRIVATE arms_driver)
 

@@ -167,14 +167,23 @@ class ArmsNode final : public rclcpp::Node
             st = arms_disable(dev.driver, m);
         else if (name == "reset")
             st = arms_reset(dev.driver, m, 0);
-        else if (__builtin_popcount(m) == 1) {
-            auto op = name == "brake_release" ? ARMS_RELEASE
-                      : name == "brake_lock"  ? ARMS_LOCK
-                      : q.hardware_zero       ? ARMS_ZERO_HW
-                                              : ARMS_ZERO_SOFT;
-            st = arms_service(dev.driver, __builtin_ctz(m), op, q.confirm);
+        else if (name == "brake_release" || name == "brake_lock") {
+            const auto op = name == "brake_release" ? ARMS_RELEASE : ARMS_LOCK;
+            st = ARMS_OK;
+            std::string failed;
+            for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; j++)
+                if ((m & ARMS_MASK_JOINT(j)) && arms_service(dev.driver, j, op, q.confirm) != ARMS_OK) {
+                    st = ARMS_E_STATE;
+                    failed += std::to_string(j) + ": " + arms_last_error() + "; ";
+                }
+            r.success = st == ARMS_OK;
+            r.message = r.success ? "OK" : failed;
+            return;
+        } else if (__builtin_popcount(m) == 1) {
+            st = arms_service(dev.driver, __builtin_ctz(m), q.hardware_zero ? ARMS_ZERO_HW : ARMS_ZERO_SOFT,
+                              q.confirm);
         } else {
-            r.message = "brake and zero operations require exactly one joint";
+            r.message = "zero requires exactly one joint";
             return;
         }
         r.success = st == ARMS_OK;
@@ -295,6 +304,13 @@ class ArmsNode final : public rclcpp::Node
         }
         if (!healthy())
             throw std::runtime_error("startup selftest failed");
+        {
+            arms_mask released = 0, unknown = 0;
+            arms_brake_scan(dev.driver, &released, &unknown);
+            if (released)
+                RCLCPP_WARN(get_logger(), "brake force-released (Pn075=1) on joint mask 0x%08x; enable refused until brake_lock",
+                            released);
+        }
         auto qos = rclcpp::SensorDataQoS().keep_last(1);
         joint_pub = create_publisher<Joint>("hardware/joint_states", qos);
         state_pub = create_publisher<State>("hardware/actuator_states", qos);

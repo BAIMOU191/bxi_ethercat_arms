@@ -218,6 +218,8 @@ struct arms {
     uint64_t cycle_start_ns;
     unsigned int poll_div, poll_cnt;
     uint64_t stable_cycles, ready_cycles;
+    uint64_t open_ns, activated_ns;   /* arms_open 开始、主站激活的时刻 */
+    atomic_ullong ready_ns;           /* 预热完成的时刻 */
 };
 
 static void post(arms_t *a, arms_mask joints, unsigned int req);
@@ -496,6 +498,7 @@ static void cycle_rx(arms_t *a, uint64_t now)
         a->stable_cycles = all_good ? a->stable_cycles + 1 : 0;
         if (a->stable_cycles >= a->ready_cycles) {
             do_reset_stats(a);
+            atomic_store_explicit(&a->ready_ns, now, memory_order_relaxed);
             atomic_store_explicit(&a->ready, true, memory_order_release);
         }
     }
@@ -889,6 +892,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         set_error("内存不足");
         return ARMS_E_SYSTEM;
     }
+    a->open_ns = mono_ns();
     a->opt = *options;
 
     if (options->config_path) {
@@ -1096,6 +1100,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
             goto fail;
         }
     }
+    a->activated_ns = mono_ns();
 
     if (a->mode == ARMS_MODE_EXTERNAL) {
         logf_(a, "外部驱动模式: 周期 %u Hz, 等待调用方周期调用 arms_rx/arms_tx", a->cycle_hz);
@@ -1170,7 +1175,13 @@ arms_status arms_wait_ready(arms_t *a, unsigned int timeout_ms)
         }
         usleep(10000);
     }
-    logf_(a, "预热完成: %d 个关节处于 OP, 伺服失能", a->arm[0].count + a->arm[1].count);
+    {
+        uint64_t ready = atomic_load(&a->ready_ns);
+        double warm = ready > a->activated_ns ? (double)(ready - a->activated_ns) / 1e9 : 0.0;
+        double total = ready > a->open_ns ? (double)(ready - a->open_ns) / 1e9 : 0.0;
+        logf_(a, "预热完成: %d 个关节处于 OP, 伺服失能；预热用时 %.2f s（主站激活到稳定 OP），启动总用时 %.2f s",
+              a->arm[0].count + a->arm[1].count, warm, total);
+    }
     return ARMS_OK;
 }
 
@@ -1538,23 +1549,38 @@ static arms_status verified(arms_t *a, int j, unsigned n, uint16_t value)
     }
     return ARMS_OK;
 }
-static arms_status maintenance_ready(arms_t *a, int j, bool confirmed, arms_joint_state *s)
+/* 维护操作前置条件：已确认、该关节所在臂通信正常；need_disabled 时还要求该关节驱动器失能 */
+static arms_status maintenance_ready_ex(arms_t *a, int j, bool confirmed, arms_joint_state *s, bool need_disabled)
 {
+    arms_bus_stats stats;
+    const arms_arm_stats *as;
     if (!a || !confirmed) {
         set_error("维护操作需要明确确认（--confirm）");
         return ARMS_E_STATE;
     }
-    if (arms_read_joint(a, j, s) != ARMS_OK)
+    if (j < ARMS_JOINT_FIRST || j > ARMS_JOINT_LAST || !(a->joints & ARMS_MASK_JOINT(j)) ||
+        arms_read_joint(a, j, s) != ARMS_OK) {
+        set_error("关节 %d 未打开", j);
         return ARMS_E_ARG;
-    arms_bus_stats stats;
+    }
     arms_get_stats(a, &stats);
-    if (stats.tripped || arms_check_online(a, NULL) != ARMS_OK ||
-        (s->mode != ARMS_JS_LOCKED && s->mode != ARMS_JS_RELEASED) || (s->status_word & 0x006f) != 0x0040 ||
-        !s->sample_ns || mono_ns() - s->sample_ns > 50000000ull) {
-        set_error("要求反馈新鲜、通信正常、未触发保护、驱动器已失能");
+    as = &stats.arm[a->cfg.joint[j].arm];
+    if ((s->al_state & 0x0F) != 0x08 || as->comm_failed || !s->sample_ns ||
+        mono_ns() - s->sample_ns > 50000000ull) {
+        set_error("关节 %d 不在线或反馈过期", j);
+        return ARMS_E_STATE;
+    }
+    if (need_disabled && ((s->mode != ARMS_JS_LOCKED && s->mode != ARMS_JS_RELEASED) ||
+                          (s->status_word & 0x006f) != 0x0040)) {
+        set_error("关节 %d 未失能（当前 %s），先执行 disable", j, arms_joint_mode_name(s->mode));
         return ARMS_E_STATE;
     }
     return ARMS_OK;
+}
+
+static arms_status maintenance_ready(arms_t *a, int j, bool confirmed, arms_joint_state *s)
+{
+    return maintenance_ready_ex(a, j, confirmed, s, true);
 }
 arms_status arms_pn_write(arms_t *a, int j, unsigned n, unsigned v, bool confirmed)
 {
@@ -1573,10 +1599,42 @@ arms_status arms_pn_write(arms_t *a, int j, unsigned n, unsigned v, bool confirm
     set_error("Pn 不在可写范围内；抱闸、校零、参数保存请使用 release/lock、zero、pn_save 命令");
     return ARMS_E_ARG;
 }
+arms_status arms_brake_scan(arms_t *a, arms_mask *released, arms_mask *unknown)
+{
+    arms_mask rel = 0, unk = 0;
+    int j;
+    if (!a) return ARMS_E_ARG;
+    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        uint8_t data[4];
+        size_t n = 0;
+        unsigned v;
+        if (!(a->joints & ARMS_MASK_JOINT(j))) continue;
+        if (arms_sdo_read(a, j, (uint16_t)arms_pn_index(75), 0, data, sizeof(data), &n) != ARMS_OK || n != 2) {
+            unk |= ARMS_MASK_JOINT(j);
+            continue;
+        }
+        v = kgu_get_u16(data, 0);
+        if (v == 0) {
+            a->released &= ~ARMS_MASK_JOINT(j);
+            atomic_fetch_and(&a->brake_confirmed, ~ARMS_MASK_JOINT(j));
+        } else if (v == 1) {
+            rel |= ARMS_MASK_JOINT(j);
+            a->released |= ARMS_MASK_JOINT(j);
+            atomic_fetch_or(&a->brake_confirmed, ARMS_MASK_JOINT(j));
+        } else {
+            unk |= ARMS_MASK_JOINT(j); /* 2 = 强制锁闸，使能时抱闸也不会松开 */
+        }
+    }
+    if (released) *released = rel;
+    if (unknown) *unknown = unk;
+    return ARMS_OK;
+}
+
 arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
 {
     arms_joint_state s;
-    arms_status st = maintenance_ready(a, j, confirmed, &s);
+    /* 锁回不要求失能，任何状态下都允许恢复抱闸控制 */
+    arms_status st = maintenance_ready_ex(a, j, confirmed, &s, op != ARMS_LOCK);
     if (st != ARMS_OK)
         return st;
     arms_mask bit = ARMS_MASK_JOINT(j);
@@ -1584,28 +1642,7 @@ arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
     size_t n = 0;
     switch (op) {
     case ARMS_RELEASE:
-        if (a->released & ~bit) {
-            set_error("请先锁回已释放关节");
-            return ARMS_E_STATE;
-        }
-        for (int other = ARMS_JOINT_FIRST; other <= ARMS_JOINT_LAST; other++)
-            if (other != j && (a->joints & ARMS_MASK_JOINT(other))) {
-                st = arms_sdo_read(a, other, arms_pn_index(75), 0, data, 2, &n);
-                if (st != ARMS_OK)
-                    return st;
-                if (n != 2) {
-                    set_error("无法确认关节 %d 的抱闸参数 Pn075（读回 %zu 字节），未松开关节 %d", other, n, j);
-                    return ARMS_E_STATE;
-                }
-                if (kgu_get_u16(data, 0) != 0) {
-                    unsigned v = kgu_get_u16(data, 0);
-                    set_error("关节 %d 的 Pn075=%u（%s），同一时间只允许一个关节松闸，未松开关节 %d；"
-                              "先托住关节 %d 并执行 lock %d --confirm",
-                              other, v, v == 1 ? "强制松闸" : v == 2 ? "强制锁闸" : "非默认值", j, other, other);
-                    return ARMS_E_STATE;
-                }
-            }
-        a->released |= bit; /* a failed acknowledgement does not prove the brake is engaged */
+        a->released |= bit; /* 写入失败时无法确认抱闸已闭合，按松闸处理，直到 lock 成功 */
         st = verified(a, j, 75, 1);
         if (st == ARMS_OK)
             atomic_fetch_or(&a->brake_confirmed, bit);

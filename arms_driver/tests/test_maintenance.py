@@ -24,8 +24,10 @@ with tempfile.TemporaryDirectory() as tmp:
         assert word in out, word
     # 维护命令须带 --confirm
     run('release 21', ok=False)
-    # 同一时间只允许一个关节松闸
-    run('release 21 --confirm', 'release 28 --confirm', ok=False)
+    # 可同时松开多个关节、单臂或全部关节
+    out = run('release 21 --confirm', 'release 28 --confirm', 'release left --confirm', 'status 15',
+              'lock all --confirm', 'release all --confirm', 'lock all --confirm', 'enable 15')
+    assert out.count('已松闸') >= 2 + 7 + 14 and 'released' in out, out
     # 松闸期间拒绝使能
     run('release 21 --confirm', 'enable 22', ok=False)
     # 使能中的关节拒绝松闸

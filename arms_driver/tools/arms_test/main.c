@@ -24,6 +24,7 @@
 #include "arms/arms.h"
 #include "arms/lease.h"
 #include "joint_select.h"
+#include "lineedit.h"
 #include "motion.h"
 #include "power.h"
 #include "runtime_env.h"
@@ -667,10 +668,25 @@ static void startup_selftest(void)
             arms_read_joint(g_arms, j, &s);
             if (s.mode == ARMS_JS_FAULT || s.error_code) faulted |= ARMS_MASK_JOINT(j);
         }
-    if (!faulted) return;
-    tlog("自检: 发现驱动器故障，自动复位一次");
-    if (arms_reset(g_arms, faulted, 0) != ARMS_OK)
-        tlog_err("自检: 复位未完成: %s；可手动执行 reset 或查看 status", arms_last_error());
+    if (faulted) {
+        tlog("自检: 发现驱动器故障，自动复位一次");
+        if (arms_reset(g_arms, faulted, 0) != ARMS_OK)
+            tlog_err("自检: 复位未完成: %s；可手动执行 reset 或查看 status", arms_last_error());
+    }
+    {
+        arms_mask released = 0, unknown = 0;
+        arms_brake_scan(g_arms, &released, &unknown);
+        if (released) {
+            char list[256];
+            size_t len = 0;
+            list[0] = '\0';
+            for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST && len < sizeof(list); j++)
+                if (released & ARMS_MASK_JOINT(j)) len += (size_t)snprintf(list + len, sizeof(list) - len, " %d", j);
+            tlog_err("自检: 关节%s 的抱闸处于强制松开（Pn075=1），失能时没有保持力；需要时执行 lock <关节> --confirm",
+                     list);
+        }
+        if (unknown) tlog_err("自检: 有关节的 Pn075 无法读取或为强制锁闸（2），可用 pn <关节> 75 查看");
+    }
 }
 static bool uint_arg(const char *s, unsigned max, unsigned *out)
 {
@@ -682,13 +698,35 @@ static bool uint_arg(const char *s, unsigned max, unsigned *out)
     *out = (unsigned)v;
     return true;
 }
+/* release / lock：可选择任意关节组合，逐个执行并汇总 */
+static int cmd_brake(int argc, char **argv)
+{
+    arms_mask m, done = 0;
+    bool release = !strcmp(argv[0], "release");
+    int j, failures = 0;
+    if (need_session() || selection(argv[1], &m)) return -2;
+    if (argc != 3 || strcmp(argv[2], "--confirm")) return bad_args("须带 --confirm");
+    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        if (!(m & ARMS_MASK_JOINT(j))) continue;
+        if (arms_service(g_arms, j, release ? ARMS_RELEASE : ARMS_LOCK, true) == ARMS_OK) {
+            done |= ARMS_MASK_JOINT(j);
+            printf("%d %-20s %s\n", j, arms_joint_name(g_arms, j), release ? "已松闸 (Pn075=1)" : "已锁回 (Pn075=0)");
+        } else {
+            failures++;
+            printf("%d %-20s 失败: %s\n", j, arms_joint_name(g_arms, j), arms_last_error());
+        }
+    }
+    if (release && done) tlog("松闸关节没有保持力，完成后执行 lock；松闸期间 enable 会被拒绝");
+    return failures ? failed("%d 个关节未完成", failures) : ok();
+}
+
 static int cmd_service(int argc, char **argv)
 {
     arms_mask m;
     if (need_session() || selection(argv[1], &m))
         return -1;
     if (__builtin_popcount(m) != 1)
-        return failed("维护操作必须选择单个已打开的关节");
+        return failed("该命令一次只能选择一个关节");
     int j = __builtin_ctz(m);
     const char *op = argv[0];
     bool confirm = argc > 2 && !strcmp(argv[argc - 1], "--confirm");
@@ -833,13 +871,14 @@ static const command commands[] = {
      cmd_selftest},
     {"identify", "查看", "<关节>", 1, 1, "读取从站身份、序列号与配置映射", "不移动关节。", "  identify 21",
      cmd_service},
-    {"release", "维护", "<关节> --confirm", 2, 2, "强制松开单个关节的抱闸（Pn075=1），用于手动转动",
-     "  执行前托住该关节：驱动器失能、抱闸松开后关节没有任何保持力。\n"
-     "  要求该关节失能、通信正常；同一时间只允许一个关节松闸，松闸期间拒绝 enable。\n"
-     "  完成后执行 lock；quit 退出时也会尝试锁回。",
-     "  release 21 --confirm", cmd_service},
+    {"release", "维护", "<关节> --confirm", 2, 2, "强制松开抱闸（Pn075=1），用于手动转动",
+     "  关节写法同 status：21 | 15-18 | left | right | all。\n"
+     "  执行前托住对应关节：驱动器失能、抱闸松开后关节没有任何保持力，手臂会因重力下落。\n"
+     "  要求关节失能、通信正常；松闸期间拒绝 enable。完成后执行 lock，quit 退出时也会尝试锁回。",
+     "  release 21 --confirm\n  release left --confirm\n  release all --confirm", cmd_brake},
     {"lock", "维护", "<关节> --confirm", 2, 2, "恢复正常抱闸控制（Pn075=0）并回读确认",
-     "  看到 OK 后再松开对该关节的支撑。", "  lock 21 --confirm", cmd_service},
+     "  任何状态下都可执行。看到每个关节的“已锁回”后再撤去支撑。",
+     "  lock 21 --confirm\n  lock all --confirm", cmd_brake},
     {"zero", "维护", "<关节> [--hw] --confirm", 2, 3, "以当前位置为零点",
      "  默认写入配置文件的 offset_rad，下次启动生效。\n"
      "  --hw 向驱动器发送 Pn101 清零脉冲，需重新上电生效。要求关节失能、静止、抱闸锁住。",
@@ -1235,19 +1274,16 @@ int main(int argc, char **argv)
         while (!g_quit) {
             char prompt[128], line[512], *av[16];
             int ac;
+            int r;
             build_prompt(prompt, sizeof(prompt));
-            printf("%s", prompt);
-            fflush(stdout);
             g_interrupted = 0;
-            if (!fgets(line, sizeof(line), stdin)) {
-                if (g_interrupted && !feof(stdin)) {
-                    clearerr(stdin);
-                    printf("\n（Ctrl+C：输入 quit 退出）\n");
-                    continue;
-                }
-                printf("\n");
-                break;
+            r = le_readline(prompt, line, sizeof(line));
+            if (r == LE_INTERRUPTED) {
+                printf("（Ctrl+C：输入 quit 退出）\n");
+                continue;
             }
+            if (r == LE_EOF) break;
+            le_history_add(line);
             ac = split(line, av, 16);
             if (ac > 0 && !stamp_all) {
                 char ts[16];
