@@ -133,6 +133,9 @@ static void set_defaults(arms_config *c)
     c->wkc_tolerance = 3;
     c->command_timeout_ms = 50;
     snprintf(c->timeout_action, sizeof(c->timeout_action), "hold");
+    c->check_motors = true;
+    c->ignore_mask = 0;
+    snprintf(c->offline_action, sizeof(c->offline_action), "power_off");
     c->release_max_joints = 1;
     c->power_managed = false;
     c->op_timeout_ms = 30000;
@@ -394,6 +397,25 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
             (!get_str(safety, "timeout_action", c->timeout_action, sizeof(c->timeout_action)) ||
              (strcmp(c->timeout_action, "hold") != 0 && strcmp(c->timeout_action, "disable") != 0))) {
             fail(error, size, "safety.timeout_action 只能是 hold 或 disable");
+            goto out;
+        }
+        {
+            const cJSON *cm = cJSON_GetObjectItemCaseSensitive(safety, "check_motors");
+            if (cm && !cJSON_IsBool(cm)) {
+                fail(error, size, "safety.check_motors 必须是 true/false");
+                goto out;
+            }
+            if (cm) c->check_motors = cJSON_IsTrue(cm);
+        }
+        if (cJSON_GetObjectItemCaseSensitive(safety, "ignore_mask") &&
+            (!get_u32_hex(safety, "ignore_mask", &c->ignore_mask) || c->ignore_mask > 0x7FFFFFFFu)) {
+            fail(error, size, "safety.ignore_mask 必须是 0..0x7fffffff（第 n 位对应关节 n）");
+            goto out;
+        }
+        if (cJSON_GetObjectItemCaseSensitive(safety, "offline_action") &&
+            (!get_str(safety, "offline_action", c->offline_action, sizeof(c->offline_action)) ||
+             (strcmp(c->offline_action, "power_off") != 0 && strcmp(c->offline_action, "disable") != 0))) {
+            fail(error, size, "safety.offline_action 只能是 power_off 或 disable");
             goto out;
         }
     }

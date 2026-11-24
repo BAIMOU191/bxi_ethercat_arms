@@ -34,7 +34,7 @@
 enum { REQ_NONE = 0, REQ_ENABLE, REQ_DISABLE, REQ_RESET, REQ_HOLD };
 
 /* 请求结果，由周期上下文写入 */
-enum { RES_PENDING = 0, RES_OK, RES_TIMEOUT, RES_FAULT, RES_STATE, RES_COMM };
+enum { RES_PENDING = 0, RES_OK, RES_TIMEOUT, RES_FAULT, RES_STATE, RES_COMM, RES_TRIP };
 
 /* 关节控制阶段 */
 enum { CTL_OFF = 0, CTL_ENABLING, CTL_ON, CTL_RESETTING };
@@ -94,6 +94,8 @@ void arms_options_init(arms_options *o)
     o->backend = ARMS_BACKEND_ETHERLAB;
     o->mode = ARMS_MODE_CONFIG;
     o->rt_cpu = -2;
+    o->check_motors = -1;
+    o->ignore_mask = -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -174,7 +176,11 @@ struct arms {
     unsigned int cycle_hz;
     uint64_t period_ns;
     arms_mask joints;
+    arms_mask ignored;                /* 屏蔽掩码 */
+    arms_mask missing;                /* 启动时不在线、未打开的关节 */
+    bool power_off_action;            /* safety.offline_action = power_off */
     arm_rt arm[ARMS_ARM_COUNT];
+    atomic_bool clear_trip;
 
     pthread_t thread;
     bool thread_started;
@@ -193,6 +199,8 @@ struct arms {
 
     /* 以下仅在周期上下文中访问 */
     joint_ctl ctl[ARMS_JOINT_LAST + 1];
+    bool tripped;
+    arms_mask trip_joints, offline_joints;
     uint64_t timeout_cycles;
     uint64_t reset_pulse_cycles;
     uint64_t recover_cycles;
@@ -276,6 +284,9 @@ static void publish(arms_t *a)
     } else {
         memset(&a->snap.stats.period, 0, sizeof(a->snap.stats.period));
     }
+    a->snap.stats.offline_joints = a->offline_joints;
+    a->snap.stats.tripped = a->tripped;
+    a->snap.stats.trip_joints = a->trip_joints;
     a->snap.stats.wake_late_us_max = a->wake_late_max / 1000.0;
     a->snap.stats.work_us_max = a->work_max / 1000.0;
     for (i = 0; i < ARMS_ARM_COUNT; ++i) {
@@ -415,6 +426,26 @@ static void cycle_rx(arms_t *a, uint64_t now)
             if (a->arm[i].used) a->arm[i].ops->update_states(a->arm[i].bus, a->arm[i].al, &a->arm[i].link_up);
     }
 
+    /* 离线检测：AL 无响应的从站；通信失败的臂视为全部离线 */
+    {
+        arms_mask offline = 0, failed = 0;
+        for (i = 0; i < ARMS_ARM_COUNT; ++i) {
+            arm_rt *r = &a->arm[i];
+            if (!r->used) continue;
+            for (k = 0; k < r->count; ++k) {
+                if (r->al[k] == 0) offline |= ARMS_MASK_JOINT(r->slot_joint[k]);
+                if (r->comm_failed) failed |= ARMS_MASK_JOINT(r->slot_joint[k]);
+            }
+        }
+        a->offline_joints = offline;
+        if (atomic_exchange_explicit(&a->clear_trip, false, memory_order_acq_rel) && !offline && !failed)
+            a->tripped = false;
+        if (ready && a->power_off_action && !a->tripped && (offline || failed)) {
+            a->tripped = true;
+            a->trip_joints = offline ? offline : failed;
+        }
+    }
+
     if (!ready) {
         a->stable_cycles = all_good ? a->stable_cycles + 1 : 0;
         if (a->stable_cycles >= a->ready_cycles) {
@@ -487,7 +518,9 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
         c->phase = CTL_OFF;
         break;
     case REQ_ENABLE:
-        if (c->phase == CTL_ON) {
+        if (a->tripped) {
+            finish(a, j, RES_TRIP);
+        } else if (c->phase == CTL_ON) {
             finish(a, j, RES_OK);
         } else if (!ready || !comm_ok) {
             finish(a, j, RES_COMM);
@@ -528,8 +561,8 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
         break;
     }
 
-    if ((c->phase == CTL_ENABLING || c->phase == CTL_ON) && (fault || !op || r->comm_failed)) {
-        if (c->phase == CTL_ENABLING) finish(a, j, fault ? RES_FAULT : RES_COMM);
+    if ((c->phase == CTL_ENABLING || c->phase == CTL_ON) && (fault || !op || r->comm_failed || a->tripped)) {
+        if (c->phase == CTL_ENABLING) finish(a, j, a->tripped ? RES_TRIP : fault ? RES_FAULT : RES_COMM);
         c->phase = CTL_OFF;
     }
 
@@ -789,6 +822,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     char path[ARMS_PATH_LEN], err[512];
     arms_status st = ARMS_OK;
     int i, j;
+    bool check;
 
     last_error[0] = '\0';
     if (!options || !out) {
@@ -847,13 +881,22 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         return ARMS_E_UNSUPPORTED;
     }
 
+    if (options->ignore_mask > 0x7FFFFFFFll) {
+        set_error("屏蔽掩码 0x%llx 超出 31 位", (unsigned long long)options->ignore_mask);
+        free(a);
+        return ARMS_E_ARG;
+    }
+    a->ignored = (options->ignore_mask >= 0 ? (arms_mask)options->ignore_mask : a->cfg.ignore_mask) & ARMS_MASK_ALL;
+    check = options->check_motors >= 0 ? options->check_motors != 0 : a->cfg.check_motors;
+    a->power_off_action = strcmp(a->cfg.offline_action, "power_off") == 0;
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         if (!a->cfg.joint[j].present) continue;
         if (options->joints && !(options->joints & ARMS_MASK_JOINT(j))) continue;
+        if (a->ignored & ARMS_MASK_JOINT(j)) continue;
         a->joints |= ARMS_MASK_JOINT(j);
     }
     if (!a->joints) {
-        set_error("所选关节在配置中都不存在");
+        set_error("所选关节在配置中都不存在或全部被屏蔽");
         free(a);
         return ARMS_E_ARG;
     }
@@ -886,6 +929,8 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     }
 
     logf_(a, "配置: %s", path);
+    logf_(a, "启动检查: %s, 屏蔽掩码 0x%08x, 离线处理: %s", check ? "开启" : "关闭", a->ignored,
+          a->power_off_action ? "下电保护" : "失能并自动重连");
     for (i = 0; i < ARMS_ARM_COUNT; ++i) {
         arm_rt *r = &a->arm[i];
         const arms_arm_config *ac = &a->cfg.arm[i];
@@ -913,9 +958,56 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         if (r->ops->scan(r->bus, infos, BUS_MAX_SLAVES, &found,
                          options->scan_timeout_ms ? options->scan_timeout_ms : DEFAULT_SCAN_TIMEOUT_MS, err,
                          sizeof(err)) != 0) {
-            set_error("%s 臂: %s", arms_arm_name(i), err);
-            st = strstr(err, "DOWN") ? ARMS_E_LINK : ARMS_E_TOPOLOGY;
-            goto fail;
+            if (check || strstr(err, "DOWN")) {
+                set_error("%s 臂: %s", arms_arm_name(i), err);
+                st = strstr(err, "DOWN") ? ARMS_E_LINK : ARMS_E_TOPOLOGY;
+                goto fail;
+            }
+            logf_(a, "警告: %s 臂: %s", arms_arm_name(i), err);
+            found = 0;
+        }
+        {
+            /* 启动检查：链上位置存在且型号一致才视为在线 */
+            arms_mask miss = 0;
+            char list[256];
+            size_t len = 0;
+            int n = 0;
+            list[0] = '\0';
+            for (k = 0; k < r->count; ++k) {
+                int pos = r->slot_slave[k];
+                int jn = r->slot_joint[k];
+                if (pos < found && infos[pos].vendor_id == a->cfg.vendor_id &&
+                    infos[pos].product_code == a->cfg.product_code) {
+                    r->slot_joint[n] = jn;
+                    r->slot_slave[n] = pos;
+                    n++;
+                    continue;
+                }
+                miss |= ARMS_MASK_JOINT(jn);
+                if (len < sizeof(list))
+                    len += (size_t)snprintf(list + len, sizeof(list) - len, "%s%d(%s, slave %d%s)", len ? " " : "",
+                                            jn, a->cfg.joint[jn].name, pos, pos < found ? ", 型号不符" : "");
+            }
+            if (miss) {
+                if (check) {
+                    set_error("启动检查失败: %s 臂总线上发现 %d 个从站，以下关节不在线: %s", arms_arm_name(i), found,
+                              list);
+                    st = ARMS_E_TOPOLOGY;
+                    goto fail;
+                }
+                logf_(a, "警告: %s 臂以下关节不在线，本次不使用: %s", arms_arm_name(i), list);
+                r->count = n;
+                a->missing |= miss;
+                a->joints &= ~miss;
+                for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j)
+                    if (miss & ARMS_MASK_JOINT(j)) a->js[j].mode = ARMS_JS_ABSENT;
+            }
+        }
+        if (r->count == 0) {
+            r->ops->close(r->bus);
+            r->bus = NULL;
+            r->used = false;
+            continue;
         }
         r->slaves_found = found;
         as->present = true;
@@ -924,29 +1016,17 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         as->master_index = r->ops->master_index(r->bus);
         snprintf(as->interface, sizeof(as->interface), "%s", ac->interface);
         logf_(a, "%s 臂: 发现 %d 个从站, 使用 %d 个", arms_arm_name(i), found, r->count);
-        for (k = 0; k < r->count; ++k) {
-            int pos = r->slot_slave[k];
-            int jn = r->slot_joint[k];
-            if (pos >= found) {
-                set_error("%s 臂: 关节 %d (%s) 配置为 slave %d, 总线上只有 %d 个从站", arms_arm_name(i), jn,
-                          a->cfg.joint[jn].name, pos, found);
-                st = ARMS_E_TOPOLOGY;
-                goto fail;
-            }
-            if (infos[pos].vendor_id != a->cfg.vendor_id || infos[pos].product_code != a->cfg.product_code) {
-                set_error("%s 臂: slave %d 的厂商/产品号为 0x%08x/0x%08x, 配置要求 0x%08x/0x%08x",
-                          arms_arm_name(i), pos, infos[pos].vendor_id, infos[pos].product_code, a->cfg.vendor_id,
-                          a->cfg.product_code);
-                st = ARMS_E_TOPOLOGY;
-                goto fail;
-            }
-        }
         if (r->ops->configure(r->bus, r->slot_slave, r->count, err, sizeof(err)) != 0) {
             set_error("%s 臂: %s", arms_arm_name(i), err);
             st = ARMS_E_MASTER;
             goto fail;
         }
         r->wkc_expected = r->ops->expected_wkc(r->bus);
+    }
+    if (!a->joints) {
+        set_error("没有在线的关节");
+        st = ARMS_E_TOPOLOGY;
+        goto fail;
     }
     for (i = 0; i < ARMS_ARM_COUNT; ++i) {
         arm_rt *r = &a->arm[i];
@@ -1073,6 +1153,63 @@ int arms_rt_cpu(const arms_t *a) { return a ? a->rt_cpu : -1; }
 const char *arms_backend_name(const arms_t *a) { return a && a->ops ? a->ops->name : "?"; }
 const char *arms_config_path(const arms_t *a) { return a ? a->cfg.path : ""; }
 arms_mask arms_opened_joints(const arms_t *a) { return a ? a->joints : 0; }
+arms_mask arms_ignored_joints(const arms_t *a) { return a ? a->ignored : 0; }
+arms_mask arms_missing_joints(const arms_t *a) { return a ? a->missing : 0; }
+bool arms_offline_power_off(const arms_t *a) { return a && a->power_off_action; }
+
+static size_t list_joints(const arms_t *a, arms_mask m, char *buf, size_t size)
+{
+    size_t len = 0;
+    int j;
+    buf[0] = '\0';
+    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST && len < size; ++j)
+        if (m & ARMS_MASK_JOINT(j))
+            len += (size_t)snprintf(buf + len, size - len, "%s%d(%s)", len ? " " : "", j, a->cfg.joint[j].name);
+    return len;
+}
+
+arms_status arms_check_online(arms_t *a, arms_mask *offline_out)
+{
+    shared_snapshot s;
+    arms_mask off = 0;
+    char list[512];
+    int j;
+    if (!a) return ARMS_E_ARG;
+    read_snapshot(a, &s);
+    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        const arms_arm_stats *as;
+        if (!(a->joints & ARMS_MASK_JOINT(j))) continue;
+        as = &s.stats.arm[a->cfg.joint[j].arm];
+        if ((s.s[j].al_state & 0x0F) != 0x08 || as->comm_failed || as->wkc_last != as->wkc_expected)
+            off |= ARMS_MASK_JOINT(j);
+    }
+    if (offline_out) *offline_out = off;
+    if (!off) return ARMS_OK;
+    list_joints(a, off, list, sizeof(list));
+    set_error("以下关节不在线: %s", list);
+    return ARMS_E_STATE;
+}
+
+arms_status arms_clear_trip(arms_t *a)
+{
+    shared_snapshot s;
+    uint64_t until;
+    arms_status st;
+    if (!a) return ARMS_E_ARG;
+    st = arms_check_online(a, NULL);
+    if (st != ARMS_OK) return st;
+    atomic_store(&a->clear_trip, true);
+    until = mono_ns() + 200000000ull;
+    do {
+        usleep(2000);
+        read_snapshot(a, &s);
+    } while (s.stats.tripped && mono_ns() < until);
+    if (s.stats.tripped) {
+        set_error("离线保护未能清除：通信仍不稳定");
+        return ARMS_E_STATE;
+    }
+    return ARMS_OK;
+}
 
 const char *arms_joint_name(const arms_t *a, int joint)
 {
@@ -1129,6 +1266,7 @@ static const char *result_text(unsigned int r)
     case RES_FAULT: return "驱动器故障";
     case RES_STATE: return "从站不在 OP 或请求被取消";
     case RES_COMM: return "通信未就绪或已失败";
+    case RES_TRIP: return "离线保护已触发，需重新上电并通过在线检查";
     case RES_PENDING: return "未响应";
     }
     return "?";

@@ -43,6 +43,9 @@ typedef struct {
     unsigned int wkc_tolerance;
     unsigned int command_timeout_ms;
     char timeout_action[16];
+    bool check_motors;      /* 启动时要求全部未屏蔽关节在线 */
+    uint32_t ignore_mask;   /* 第 n 位对应关节 n：不打开、不检查 */
+    char offline_action[16];/* "power_off" | "disable" */
     unsigned int release_max_joints;
     bool power_managed;
     unsigned int op_timeout_ms;

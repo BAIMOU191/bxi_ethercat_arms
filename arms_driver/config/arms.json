@@ -6,6 +6,9 @@
     "wkc_tolerance": 3,
     "command_timeout_ms": 50,
     "timeout_action": "hold",
+    "check_motors": true,
+    "ignore_mask": "0x00000000",
+    "offline_action": "power_off",
     "release_max_joints": 1,
     "op_timeout_ms": 30000
   },

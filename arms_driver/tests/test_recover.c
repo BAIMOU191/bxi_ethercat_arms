@@ -55,14 +55,27 @@ int main(int argc, char **argv)
     CHECK(left(a).comm_failed, "left comm failed");
     CHECK(left(a).comm_drops == 1, "drop counted");
     CHECK(mode(a, 15) != ARMS_JS_ENABLED, "15 disabled on drop");
-    CHECK(mode(a, 22) == ARMS_JS_ENABLED, "right arm unaffected");
     CHECK(arms_enable(a, ARMS_MASK_JOINT(16), 0) != ARMS_OK, "enable refused while offline");
+
+    /* 默认 offline_action = power_off：触发离线保护，所有关节失能 */
+    {
+        arms_bus_stats st;
+        arms_get_stats(a, &st);
+        CHECK(st.tripped, "trip on offline");
+        CHECK((st.trip_joints & ARMS_MASK_LEFT) == ARMS_MASK_LEFT && !(st.trip_joints & ARMS_MASK_RIGHT),
+              "trip joints = left arm");
+    }
+    usleep(20000);
+    CHECK(mode(a, 22) == ARMS_JS_LOCKED, "right arm disabled by trip");
+    CHECK(arms_clear_trip(a) != ARMS_OK, "clear refused while offline");
 
     for (i = 0; i < 500 && left(a).comm_failed; ++i) usleep(10000);
     CHECK(!left(a).comm_failed, "left recovered");
     CHECK(left(a).comm_recoveries == 1, "recovery counted");
     usleep(100000);
     for (i = 15; i <= 21; ++i) CHECK(mode(a, i) == ARMS_JS_LOCKED, "locked after recovery (auto reset, not enabled)");
+    CHECK(arms_enable(a, ARMS_MASK_LEFT, 0) != ARMS_OK, "enable refused while tripped");
+    CHECK(arms_clear_trip(a) == ARMS_OK, arms_last_error());
     CHECK(arms_enable(a, ARMS_MASK_LEFT, 0) == ARMS_OK, arms_last_error());
 
     arms_close(a);

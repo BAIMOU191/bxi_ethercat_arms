@@ -90,6 +90,16 @@ ctest --test-dir build --output-on-failure
 | `priority` | 实时线程 SCHED_FIFO 优先级 |
 | `softirq_priority` | `ksoftirqd/<irq_cpu>` 的 SCHED_FIFO 优先级，须低于 `priority` |
 
+`safety` 段中与在线检查相关的字段：
+
+| 字段 | 说明 |
+|---|---|
+| `check_motors` | `true`：启动时未屏蔽的关节必须全部在线，否则打开失败（`arms_test` 随即下电）；`false`：不在线的关节本次不使用 |
+| `ignore_mask` | 31 位屏蔽掩码，第 n 位对应关节 n。被屏蔽的关节不打开、不检查，掉线不触发保护。`arms_test -m` 可覆盖 |
+| `offline_action` | `power_off`：运行中未屏蔽的关节掉线时全部失能并锁定保护（`arms_test` 同时下电），`power on` 重新上电并检查后解除；`disable`：只失能，恢复后自动重连 |
+
+EtherCAT 为串联链路，链中一个电机断电通常会使其后的电机一并离线，屏蔽链中间的关节不能避免保护触发。
+
 ## 外部驱动模式
 
 ```c

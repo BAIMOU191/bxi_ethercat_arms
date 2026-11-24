@@ -6,6 +6,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/select.h>
 #include <time.h>
@@ -38,6 +39,40 @@ static snapshot previous;
 static volatile bool power_off;
 
 void motion_set_power_off(bool off) { power_off = off; }
+
+static void (*trip_handler)(void);
+static bool trip_seen;
+
+void motion_set_trip_handler(void (*fn)(void)) { trip_handler = fn; }
+
+/* 离线保护：驱动在周期内已失能全部关节，这里打印触发关节并调用下电处理 */
+static void check_trip(void)
+{
+    arms_bus_stats st;
+    char list[512];
+    size_t len = 0;
+    int j;
+    if (arms_get_stats(bus, &st) != ARMS_OK) return;
+    if (!st.tripped) {
+        trip_seen = false;
+        return;
+    }
+    if (trip_seen) return;
+    trip_seen = true;
+    pthread_mutex_lock(&lock);
+    refreshing = 0;
+    pthread_mutex_unlock(&lock);
+    list[0] = '\0';
+    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST && len < sizeof(list); ++j)
+        if (st.trip_joints & ARMS_MASK_JOINT(j))
+            len += (size_t)snprintf(list + len, sizeof(list) - len, " %d(%s)", j, arms_joint_name(bus, j));
+    if (power_off) {
+        tlog("电机已断电，以下关节离线:%s", list);
+        return;
+    }
+    tlog_err("离线保护触发: 以下关节不在线:%s；全部关节已失能", list);
+    if (trip_handler) trip_handler();
+}
 
 static uint64_t now_ns(void)
 {
@@ -135,7 +170,8 @@ static void monitor_faults(void)
                 tlog("%s 臂通信中断（电机已断电）", arms_arm_name(arm));
                 continue;
             }
-            tlog_err("%s 臂通信失败，该臂关节已失能；电源或网线恢复后自动重连", arms_arm_name(arm));
+            tlog_err("%s 臂通信失败，该臂关节已失能%s", arms_arm_name(arm),
+                     arms_offline_power_off(bus) ? "" : "；电源或网线恢复后自动重连");
             report[arm] = true;
         }
         if (previous.stats.arm[arm].comm_failed && !a->comm_failed)
@@ -173,6 +209,7 @@ static void *refresh_main(void *arg)
             }
         }
         pthread_mutex_unlock(&lock);
+        check_trip();
         if (tick >= diagnostic) {
             monitor_faults();
             diagnostic = next_tick(diagnostic, 10 * REFRESH_NS);

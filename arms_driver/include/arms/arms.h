@@ -86,6 +86,8 @@ typedef struct {
     int rt_cpu;                   /**< 实时线程 CPU，-2 表示使用配置值，-1 表示不绑定 */
     arms_mask joints;             /**< 参与的关节，0 表示配置中的全部关节 */
     unsigned int scan_timeout_ms; /**< 扫描超时，0 表示 10000 ms */
+    int check_motors;             /**< 1: 未屏蔽关节必须全部在线，否则打开失败；0: 跳过不在线的关节；-1 取配置 */
+    int64_t ignore_mask;          /**< 屏蔽掩码，第 n 位对应关节 n，屏蔽的关节不打开、不检查；-1 取配置 */
     arms_log_fn log;              /**< 启动过程日志 */
     void *log_user;
 } arms_options;
@@ -172,6 +174,9 @@ typedef struct {
     double wake_late_us_max;         /**< 独立模式：唤醒相对计划时刻的最大延迟 */
     double work_us_max;              /**< 单周期最大处理时间 */
     arms_arm_stats arm[ARMS_ARM_COUNT];
+    arms_mask offline_joints;        /**< 当前不在线（AL 未响应）的已打开关节 */
+    bool tripped;                    /**< 离线保护已触发（safety.offline_action = power_off），需 arms_clear_trip() */
+    arms_mask trip_joints;           /**< 触发保护时不在线的关节 */
 } arms_bus_stats;
 
 /**
@@ -233,6 +238,24 @@ int arms_rt_cpu(const arms_t *arms);
 const char *arms_backend_name(const arms_t *arms);
 const char *arms_config_path(const arms_t *arms);
 arms_mask arms_opened_joints(const arms_t *arms);
+/** @brief 生效的屏蔽掩码（只含 15..28 位） */
+arms_mask arms_ignored_joints(const arms_t *arms);
+/** @brief 启动时未屏蔽但不在线、因而未打开的关节（check_motors = 0 时可能非空） */
+arms_mask arms_missing_joints(const arms_t *arms);
+/** @brief 是否在关节离线时触发下电保护（safety.offline_action = power_off） */
+bool arms_offline_power_off(const arms_t *arms);
+
+/**
+ * @brief 检查已打开关节是否全部在线（OP、WKC 正确、通信正常）
+ * @param offline 可为 NULL；返回不在线的关节
+ * @return ARMS_OK 全部在线；否则 ARMS_E_STATE，arms_last_error() 列出关节
+ */
+arms_status arms_check_online(arms_t *arms, arms_mask *offline);
+
+/**
+ * @brief 清除离线保护：要求全部已打开关节重新在线，清除后关节处于失能
+ */
+arms_status arms_clear_trip(arms_t *arms);
 
 /** @brief 关节名称；arms 可为 NULL，此时返回标准名称 */
 const char *arms_joint_name(const arms_t *arms, int joint);

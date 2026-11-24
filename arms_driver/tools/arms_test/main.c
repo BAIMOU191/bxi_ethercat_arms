@@ -101,11 +101,13 @@ static unsigned int hz_short(unsigned int hz, char *buf, size_t n)
 /* ---- status ---- */
 static int cmd_status(int argc, char **argv)
 {
-    arms_mask sel = arms_opened_joints(g_arms);
+    arms_mask known, sel;
     char err[256];
     int j;
     if (need_session()) return -1;
-    if (argc > 1 && arms_parse_joints(argv[1], arms_opened_joints(g_arms), &sel, err, sizeof(err)) != 0)
+    known = arms_opened_joints(g_arms) | arms_ignored_joints(g_arms) | arms_missing_joints(g_arms);
+    sel = known;
+    if (argc > 1 && arms_parse_joints(argv[1], known, &sel, err, sizeof(err)) != 0)
         return failed("%s", err);
     printf("%-3s %-20s %-11s %-8s %-6s %-6s %-6s %10s %10s %9s %10s %8s %8s %4s %5s\n", "关节", "名称", "臂/位置", "状态", "AL",
            "SW", "ERR", "pos[rad]", "vel[rad/s]", "tor[N.m]", "cmd", "kp", "kd", "flag", "flt");
@@ -114,6 +116,11 @@ static int cmd_status(int argc, char **argv)
         char where[16], flags[4];
         int n = 0;
         if (!(sel & ARMS_MASK_JOINT(j))) continue;
+        if (!(arms_opened_joints(g_arms) & ARMS_MASK_JOINT(j))) {
+            printf("%-3d %-20s %-11s %-8s\n", j, arms_joint_name(g_arms, j), "-",
+                   (arms_ignored_joints(g_arms) & ARMS_MASK_JOINT(j)) ? "ignored" : "missing");
+            continue;
+        }
         arms_read_joint(g_arms, j, &s);
         snprintf(where, sizeof(where), "%s/%d", s.arm == 0 ? "L" : "R", s.slave);
         if (s.cmd_moving) flags[n++] = 'M';
@@ -153,6 +160,44 @@ static void print_stats(const arms_bus_stats *st)
     }
 }
 
+static void print_mask_line(const char *label, arms_mask m)
+{
+    int j;
+    printf("%s 0x%08x", label, m);
+    if (m) {
+        printf("  [");
+        for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j)
+            if (m & ARMS_MASK_JOINT(j)) printf(" %d", j);
+        printf(" ]");
+    }
+    printf("\n");
+}
+
+static void print_protection(const arms_bus_stats *st)
+{
+    print_mask_line("屏蔽掩码", arms_ignored_joints(g_arms));
+    if (arms_missing_joints(g_arms)) print_mask_line("启动时不在线（未使用）", arms_missing_joints(g_arms));
+    printf("离线处理: %s", arms_offline_power_off(g_arms) ? "下电保护" : "失能并自动重连");
+    if (st->tripped) print_mask_line("  [保护已触发] 触发关节", st->trip_joints);
+    else printf("\n");
+    if (st->offline_joints) print_mask_line("当前不在线", st->offline_joints);
+}
+
+/* ---- check ---- */
+static int cmd_check(int argc, char **argv)
+{
+    arms_bus_stats st;
+    arms_mask off = 0;
+    (void)argc;
+    (void)argv;
+    if (need_session()) return -1;
+    arms_get_stats(g_arms, &st);
+    print_protection(&st);
+    if (arms_check_online(g_arms, &off) != ARMS_OK) return failed("%s", arms_last_error());
+    printf("已打开的 %d 个关节全部在线\n", __builtin_popcount(arms_opened_joints(g_arms)));
+    return ok();
+}
+
 static int cmd_bus(int argc, char **argv)
 {
     arms_bus_stats st;
@@ -165,6 +210,7 @@ static int cmd_bus(int argc, char **argv)
     }
     arms_get_stats(g_arms, &st);
     print_stats(&st);
+    print_protection(&st);
     return ok();
 }
 
@@ -351,8 +397,22 @@ static int cmd_power(int argc, char **argv)
         }
         powered = power_known = true;
         motion_set_power_off(false);
-        if (wait_bus_online(30000) != 0) return failed("上电后 30 秒内通信未恢复，请检查驱动器电源与网线");
-        tlog("通信已恢复，全部关节处于失能");
+        if (wait_bus_online(30000) != 0 || arms_check_online(g_arms, NULL) != ARMS_OK) {
+            /* 在线检查未通过：重新下电保护 */
+            char why[512];
+            arms_mask off = 0;
+            arms_check_online(g_arms, &off);
+            snprintf(why, sizeof(why), "%s", off ? arms_last_error() : "通信在 30 秒内未恢复");
+            motion_set_power_off(true);
+            if (arms_power_off() == 0) {
+                powered = false;
+                return failed("上电后在线检查未通过，已重新下电。%s", why);
+            }
+            power_known = false;
+            return failed("上电后在线检查未通过，下电失败，请立即手动断电。%s", why);
+        }
+        if (arms_clear_trip(g_arms) != ARMS_OK) return failed("离线保护未能清除: %s", arms_last_error());
+        tlog("在线检查通过，通信已恢复，全部关节处于失能");
     } else {
         if (!powered && !power_known) return failed("未接管电源，无法确认或切断外部供电");
         if (motion_enabled() && disable_joints(arms_opened_joints(g_arms), 50)) return -1;
@@ -566,6 +626,8 @@ static const command commands[] = {
     {"swing", "测试", "<关节> <幅值> [周期秒] [次数] [kp] [kd]", 2, 6, "以当前指令位置为中心正弦摆动",
      "  幅值单位 rad，默认周期 4 秒、3 次、各关节默认增益。回车或 Ctrl+C 中止，1 秒过渡返回中心。",
      "  swing 17 0.05 1 1", cmd_swing},
+    {"check", "状态", "", 0, 0, "检查已打开关节是否全部在线，并显示屏蔽掩码与离线保护状态",
+     "  在线条件: 从站处于 OP、WKC 正确、该臂通信正常。被屏蔽的关节不参与检查。", "  check", cmd_check},
     {"power", "控制", "on | off | status", 1, 1, "请求上电、断电或显示电源控制状态",
      "  off: 先将全部已使能关节失能，再断电；断电期间通信中断属正常。\n"
      "  on:  上电并等待通信恢复（最长 30 秒），恢复后全部关节处于失能，需重新 enable。\n"
@@ -650,6 +712,28 @@ static int split(char *line, char **argv, int max)
     return n;
 }
 
+/* 离线保护触发时由监视线程调用：驱动已将全部关节失能，这里切断电机电源 */
+static void on_trip(void)
+{
+    if (mock_backend) {
+        tlog_err("离线保护: 模拟后端不操作电源");
+        return;
+    }
+    if (!powered) {
+        tlog_err("离线保护: 电源不由本程序控制，请立即手动断电");
+        return;
+    }
+    motion_set_power_off(true);
+    if (arms_power_off() == 0) {
+        powered = false;
+        power_known = true;
+        tlog_err("离线保护: 电机已下电。排除问题后执行 power on 重新上电并检查");
+    } else {
+        power_known = false;
+        tlog_err("离线保护: 下电失败，请立即手动断电");
+    }
+}
+
 static void build_prompt(char *buf, size_t size)
 {
     arms_bus_stats st;
@@ -667,9 +751,9 @@ static void build_prompt(char *buf, size_t size)
     {
         char state[32] = "";
         if (fault >= 0) snprintf(state, sizeof(state), " FAULT:%d", fault);
-        snprintf(buf, size, "arms %s L%d/%d R%d/%d E%d%s%s> ", hz, st.arm[0].slaves_op, st.arm[0].slaves_expected,
+        snprintf(buf, size, "arms %s L%d/%d R%d/%d E%d%s%s%s> ", hz, st.arm[0].slaves_op, st.arm[0].slaves_expected,
                  st.arm[1].slaves_op, st.arm[1].slaves_expected, enabled, state,
-                 (st.arm[0].comm_failed || st.arm[1].comm_failed) ? " COMM!" : "");
+                 (st.arm[0].comm_failed || st.arm[1].comm_failed) ? " COMM!" : "", st.tripped ? " TRIP" : "");
     }
 }
 
@@ -692,6 +776,9 @@ static void usage(FILE *out)
             "      --keep-power     退出时不断电\n"
             "      --power-wait MS  上电后等待驱动器启动的时间（默认 3000）\n"
             "      --no-rt-setup    不配置实时运行环境（中断绑定、CPU 隔离）\n"
+            "  -m, --mask MASK      屏蔽掩码（31 位，第 n 位对应关节 n）。被屏蔽的关节不打开、不做在线检查，\n"
+            "                       掉线不触发下电保护；例如 0x10200000 屏蔽 21 和 28（默认取配置 safety.ignore_mask）\n"
+            "      --no-check       关闭启动在线检查：不在线的关节本次不使用，不下电\n"
             "  -T, --timestamps     每一行输出都加时间戳（默认只在事件行加）\n"
             "  -h, --help           显示本帮助\n"
             "  -V, --version        显示版本\n"
@@ -702,6 +789,11 @@ static void usage(FILE *out)
             "  arms_test -f 2000 -j left           只打开左臂，2 kHz\n"
             "  arms_test -e \"commtest 300\"         通信测试 300 秒后退出\n"
             "  arms_test --mock                    使用模拟后端\n"
+            "  arms_test -m 0x10200000             屏蔽关节 21、28 后启动\n"
+            "\n"
+            "启动在线检查（默认开启）: 上电扫描后，未屏蔽的关节必须全部在线，否则下电并退出。\n"
+            "运行中未屏蔽的关节掉线: 全部关节失能并下电（safety.offline_action = power_off），\n"
+            "排除问题后执行 power on 重新上电并检查。EtherCAT 为串联链路，链中一个电机断电会使其后的电机一并离线。\n"
             "进入终端后输入 help 查看命令，任一命令加 -h 查看详细用法。\n");
 }
 
@@ -710,11 +802,12 @@ int main(int argc, char **argv)
     static const struct option long_opts[] = {
         {"freq", required_argument, NULL, 'f'},   {"joints", required_argument, NULL, 'j'},
         {"config", required_argument, NULL, 'c'}, {"exec", required_argument, NULL, 'e'},
-        {"mock", no_argument, NULL, 'm'},         {"rt-cpu", required_argument, NULL, 'r'},
+        {"mock", no_argument, NULL, 'M'},        {"rt-cpu", required_argument, NULL, 'r'},
         {"power", no_argument, NULL, 'p'},        {"help", no_argument, NULL, 'h'},
         {"version", no_argument, NULL, 'V'},      {"power-wait", required_argument, NULL, 'w'},
         {"keep-power", no_argument, NULL, 'k'},   {"no-power", no_argument, NULL, 'P'},
         {"no-rt-setup", no_argument, NULL, 'R'},  {"timestamps", no_argument, NULL, 'T'},
+        {"mask", required_argument, NULL, 'm'},   {"no-check", no_argument, NULL, 'N'},
         {NULL, 0, NULL, 0},
     };
     arms_options opt;
@@ -729,7 +822,7 @@ int main(int argc, char **argv)
     arms_options_init(&opt);
     opt.mode = ARMS_MODE_STANDALONE;
     opt.log = log_line;
-    while ((ch = getopt_long(argc, argv, "f:j:r:c:e:ThV", long_opts, NULL)) != -1) {
+    while ((ch = getopt_long(argc, argv, "f:j:r:c:e:m:ThV", long_opts, NULL)) != -1) {
         switch (ch) {
         case 'f': {
             char *end;
@@ -755,7 +848,20 @@ int main(int argc, char **argv)
             }
             execs[nexec++] = optarg;
             break;
-        case 'm': opt.backend = ARMS_BACKEND_MOCK; break;
+        case 'M': opt.backend = ARMS_BACKEND_MOCK; break;
+        case 'm': {
+            char *end;
+            unsigned long long v;
+            errno = 0;
+            v = strtoull(optarg, &end, 0);
+            if (*end || errno || optarg[0] == '-' || v > 0x7FFFFFFFull) {
+                fprintf(stderr, "错误: --mask 需要 31 位掩码 0..0x7fffffff，第 n 位对应关节 n\n");
+                return 2;
+            }
+            opt.ignore_mask = (int64_t)v;
+            break;
+        }
+        case 'N': opt.check_motors = 0; break;
         case 'r': {
             char *end;
             long v = strtol(optarg, &end, 10);
@@ -825,7 +931,12 @@ int main(int argc, char **argv)
     if (st != ARMS_OK) {
         tlog_err("启动失败: %s", arms_strerror(st));
         tlog_err("  原因: %s", arms_last_error());
-        if (powered && !keep_power) arms_power_off();
+        if (powered && st == ARMS_E_TOPOLOGY) {
+            if (arms_power_off() == 0) tlog_err("启动在线检查未通过，电机已下电保护");
+            else tlog_err("启动在线检查未通过，下电失败，请立即手动断电");
+        } else if (powered && !keep_power) {
+            arms_power_off();
+        }
         arms_env_rt_revert();
         return 1;
     }
@@ -834,6 +945,7 @@ int main(int argc, char **argv)
         arms_get_stats(g_arms, &bs);
         print_stats(&bs);
     }
+    motion_set_trip_handler(on_trip);
     if (motion_start(g_arms, &g_interrupted, nexec > 0) != 0) {
         rc = 1;
         goto close_session;

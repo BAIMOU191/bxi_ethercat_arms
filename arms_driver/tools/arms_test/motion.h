@@ -13,6 +13,8 @@ int motion_wait_or_enter(unsigned int ms);
 arms_mask motion_enabled(void);
 /* 电机已主动断电时，通信中断按正常事件提示，不打印诊断快照 */
 void motion_set_power_off(bool off);
+/* 离线保护触发时在监视线程中调用一次（用于切断电机电源） */
+void motion_set_trip_handler(void (*fn)(void));
 
 /* NAN 表示使用每个关节的默认增益，move_s < 0 表示自动计算时间。 */
 int motion_mit(arms_mask mask, arms_command cmd, double move_s);
