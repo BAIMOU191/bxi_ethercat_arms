@@ -1421,8 +1421,9 @@ static arms_status request_and_wait(arms_t *a, arms_mask mask, unsigned int req,
 arms_status arms_enable(arms_t *a, arms_mask joints, unsigned int timeout_ms)
 {
     if (!a) return ARMS_E_ARG;
-    if (a->opt.maintenance) {
-        set_error("维护会话禁止使能");
+    if (a->released) {
+        /* 松闸状态下使能后再失能，抱闸不会闭合，关节会失去保持 */
+        set_error("关节 %d 处于松闸状态，先执行 lock 再使能", __builtin_ctz(a->released));
         return ARMS_E_STATE;
     }
     return request_and_wait(a, joints, REQ_ENABLE, timeout_ms, "使能");
@@ -1539,8 +1540,8 @@ static arms_status verified(arms_t *a, int j, unsigned n, uint16_t value)
 }
 static arms_status maintenance_ready(arms_t *a, int j, bool confirmed, arms_joint_state *s)
 {
-    if (!a || !a->opt.maintenance || !confirmed) {
-        set_error("需要专用维护会话及明确确认");
+    if (!a || !confirmed) {
+        set_error("维护操作需要明确确认（--confirm）");
         return ARMS_E_STATE;
     }
     if (arms_read_joint(a, j, s) != ARMS_OK)
@@ -1569,7 +1570,7 @@ arms_status arms_pn_write(arms_t *a, int j, unsigned n, unsigned v, bool confirm
     for (size_t i = 0; i < sizeof(allowed) / sizeof(*allowed); i++)
         if (n == allowed[i][0] && v <= allowed[i][1])
             return verified(a, j, n, v);
-    set_error("Pn 不在可写范围内；抱闸、校准、保存须使用专用命令");
+    set_error("Pn 不在可写范围内；抱闸、校零、参数保存请使用 release/lock、zero、pn_save 命令");
     return ARMS_E_ARG;
 }
 arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)

@@ -833,14 +833,19 @@ static const command commands[] = {
      cmd_selftest},
     {"identify", "查看", "<关节>", 1, 1, "读取从站身份、序列号与配置映射", "不移动关节。", "  identify 21",
      cmd_service},
-    {"release", "维护", "<关节> --confirm", 2, 2, "确认已有机械支撑后释放单关节抱闸", "仅限专用维护会话。",
-     "", cmd_service},
-    {"lock", "维护", "<关节> --confirm", 2, 2, "恢复单关节抱闸控制并回读参数", "保持机械支撑直至确认。", "",
-     cmd_service},
-    {"zero", "维护", "<关节> [--hw] --confirm", 2, 3, "写入软件偏置或请求驱动器硬件清零",
-     "软件偏置下次启动生效。", "", cmd_service},
-    {"pn_save", "维护", "<关节> --confirm", 2, 2, "发送参数保存脉冲并回读", "仅限维护会话。", "",
-     cmd_service},
+    {"release", "维护", "<关节> --confirm", 2, 2, "强制松开单个关节的抱闸（Pn075=1），用于手动转动",
+     "  执行前托住该关节：驱动器失能、抱闸松开后关节没有任何保持力。\n"
+     "  要求该关节失能、通信正常；同一时间只允许一个关节松闸，松闸期间拒绝 enable。\n"
+     "  完成后执行 lock；quit 退出时也会尝试锁回。",
+     "  release 21 --confirm", cmd_service},
+    {"lock", "维护", "<关节> --confirm", 2, 2, "恢复正常抱闸控制（Pn075=0）并回读确认",
+     "  看到 OK 后再松开对该关节的支撑。", "  lock 21 --confirm", cmd_service},
+    {"zero", "维护", "<关节> [--hw] --confirm", 2, 3, "以当前位置为零点",
+     "  默认写入配置文件的 offset_rad，下次启动生效。\n"
+     "  --hw 向驱动器发送 Pn101 清零脉冲，需重新上电生效。要求关节失能、静止、抱闸锁住。",
+     "  zero 21 --confirm\n  zero 21 --hw --confirm", cmd_service},
+    {"pn_save", "维护", "<关节> --confirm", 2, 2, "发送参数保存脉冲（Pn097）",
+     "  把驱动器当前参数写入掉电保存区。松闸期间拒绝执行。", "  pn_save 21 --confirm", cmd_service},
     {"pn", "维护", "<关节> <参数号> [值 --confirm]", 2, 4, "读取参数；仅白名单参数可写",
      "参数号支持 75、075 或 Pn075。", "  pn 21 75", cmd_service},
     {"sdo", "维护", "<关节> <索引> <子索引> [值 --confirm]", 3, 5, "读对象字典或写白名单参数",
@@ -1012,7 +1017,8 @@ static void usage(FILE *out)
         "safety.ignore_mask）\n"
         "      --check / --no-check  本次要求 / 不要求未屏蔽关节全部在线（不改变运行时掉线策略）\n"
         "      --check-motor 0|1     显式选择启动检查；--motor-disable MASK 等价于 --mask\n"
-        "      --maintenance        禁止使能，允许经确认的维护操作\n"
+        "\n"
+        "维护命令（release/lock/zero/pn_save 及参数写入）在同一会话中可用，须带 --confirm 且关节失能。\n"
         "  -T, --timestamps     每一行输出都加时间戳（默认只在事件行加）\n"
         "  -h, --help           显示本帮助\n"
         "  -V, --version        显示版本\n"
@@ -1051,7 +1057,6 @@ int main(int argc, char **argv)
         {"timestamps", no_argument, NULL, 'T'},
         {"check", no_argument, NULL, 1000},
         {"check-motor", required_argument, NULL, 1001},
-        {"maintenance", no_argument, NULL, 1002},
         {"motor-disable", required_argument, NULL, 'm'},
         {"mask", required_argument, NULL, 'm'},
         {"no-check", no_argument, NULL, 'N'},
@@ -1117,9 +1122,6 @@ int main(int argc, char **argv)
                 return 2;
             }
             opt.check_motors = optarg[0] - '0';
-            break;
-        case 1002:
-            opt.maintenance = true;
             break;
         case 'N': opt.check_motors = 0; break;
         case 'r': {

@@ -129,7 +129,7 @@ for (;;) {
 ```bash
 cd arms_driver
 ./arms_test --mock --check-motor 1 --motor-disable 0x10200000 -e check
-./arms_test --mock --maintenance -e 'help' -e 'identify 21' -e 'status 21 --raw'
+./arms_test --mock -e 'help' -e 'identify 21' -e 'status 21 --raw'
 ```
 
 维护、自检、校零、设备身份校验和现场验收见 [阶段 4/5 使用说明](docs/phase4-5.md)。ROS 构建、服务和话题见 [arms_ros](arms_ros/README.md)。开机服务模板在 deploy/，不会在构建或安装源码时启用。

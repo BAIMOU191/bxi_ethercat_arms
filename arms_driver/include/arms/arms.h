@@ -86,7 +86,6 @@ typedef struct {
     int rt_cpu;                   /**< 实时线程 CPU，-2 表示使用配置值，-1 表示不绑定 */
     arms_mask joints;             /**< 参与的关节，0 表示配置中的全部关节 */
     unsigned int scan_timeout_ms; /**< 扫描超时，0 表示 10000 ms */
-    bool maintenance;             /**< 专用维护会话：禁止伺服使能 */
     int check_motors;             /**< 1: 未屏蔽关节必须全部在线，否则打开失败；0: 跳过不在线的关节；-1 取配置 */
     int64_t ignore_mask;          /**< 屏蔽掩码，第 n 位对应关节 n，屏蔽的关节不打开、不检查；-1 取配置 */
     arms_log_fn log;              /**< 启动过程日志 */
@@ -351,7 +350,8 @@ arms_status arms_hold(arms_t *arms, arms_mask joints);
 
 /*
  * 维护接口：只能在同一个非实时管理线程中调用（内部使用阻塞的 SDO 访问）。
- * 写操作要求 arms_options.maintenance 会话、通信正常、未触发保护、驱动器失能，且 confirmed 为 true。
+ * 写操作要求通信正常、未触发离线保护、该关节驱动器失能，且 confirmed 为 true。
+ * 有关节处于松闸状态（ARMS_RELEASE 之后、ARMS_LOCK 之前）时，arms_enable() 被拒绝。
  */
 
 /** 维护操作 */

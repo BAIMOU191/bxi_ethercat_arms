@@ -174,7 +174,7 @@ class ArmsNode final : public rclcpp::Node
                                               : ARMS_ZERO_SOFT;
             st = arms_service(dev.driver, __builtin_ctz(m), op, q.confirm);
         } else {
-            r.message = "maintenance requires exactly one joint";
+            r.message = "brake and zero operations require exactly one joint";
             return;
         }
         r.success = st == ARMS_OK;
@@ -258,7 +258,6 @@ class ArmsNode final : public rclcpp::Node
             opt.config_path = config.c_str();
         bool mock = declare_parameter("mock", false), power = declare_parameter("manage_power", false);
         bool rt_setup = declare_parameter("setup_rt", false);
-        opt.maintenance = declare_parameter("maintenance", false);
         auto check = declare_parameter<int64_t>("check_motor", -1);
         opt.ignore_mask = declare_parameter<int64_t>("motor_disable", -1);
         max_age_ms = declare_parameter<int64_t>("command_max_age_ms", 100);

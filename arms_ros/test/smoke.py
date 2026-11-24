@@ -25,31 +25,31 @@ def call(name,confirm=False):
     q=JointOperation.Request();q.joints=1<<21;q.confirm=confirm
     f=cli.call_async(q);until(f.done);r=f.result();test.destroy_client(cli);return r
 try:
-    for maintenance in (False,True):
-        seen.clear()
-        cmd=['ros2','run','arms_ros','arms_node','--ros-args','-r','__ns:='+ns,'-p','mock:=true','-p','config:='+str(Path(sys.argv[1]).resolve()),'-p','maintenance:='+str(maintenance).lower()]
-        proc=subprocess.Popen(cmd,start_new_session=True)
-        try:
-            until(lambda:len(seen)==3);assert len(seen['joint_states'].name)==14
-            assert seen['arms/diagnostics'].status[0].level in (0,b'\x00'),seen['arms/diagnostics']
-            assert call('selftest').success and not call('enable').success
-            if maintenance:
-                assert not call('enable',True).success
-                assert call('brake_release',True).success and call('brake_lock',True).success
-            else:
-                assert not call('brake_release',True).success
-                assert call('enable',True).success
-                m=ActuatorCmds();m.actuators_name=['l_wrist_z_joint'];m.pos=[.1];m.vel=[0.];m.kp=[5.];m.kd=[0.];m.torque=[0.]
-                def moved():
-                    m.header.stamp=test.get_clock().now().to_msg();pub.publish(m)
-                    s=seen['joint_states'];return abs(s.position[s.name.index('l_wrist_z_joint')]-.1)<.02
-                until(moved)
-                m.pos=[];pub.publish(m)
-                until(lambda:any(k.key=='rejected_commands' and int(k.value)>0 for k in seen['arms/diagnostics'].status[0].values))
-                assert call('disable').success
-        finally:
-            if proc.poll() is None: os.killpg(proc.pid,signal.SIGINT)
-            proc.wait(timeout=15)
+    cmd=['ros2','run','arms_ros','arms_node','--ros-args','-r','__ns:='+ns,'-p','mock:=true','-p','config:='+str(Path(sys.argv[1]).resolve())]
+    proc=subprocess.Popen(cmd,start_new_session=True)
+    try:
+        until(lambda:len(seen)==3);assert len(seen['joint_states'].name)==14
+        assert seen['arms/diagnostics'].status[0].level in (0,b'\x00'),seen['arms/diagnostics']
+        assert call('selftest').success and not call('enable').success
+        # 维护操作需要确认；松闸期间拒绝使能
+        assert not call('brake_release').success
+        assert call('brake_release',True).success
+        assert not call('enable',True).success
+        assert call('brake_lock',True).success
+        assert call('enable',True).success
+        # 使能中拒绝松闸
+        assert not call('brake_release',True).success
+        m=ActuatorCmds();m.actuators_name=['l_wrist_z_joint'];m.pos=[.1];m.vel=[0.];m.kp=[5.];m.kd=[0.];m.torque=[0.]
+        def moved():
+            m.header.stamp=test.get_clock().now().to_msg();pub.publish(m)
+            s=seen['joint_states'];return abs(s.position[s.name.index('l_wrist_z_joint')]-.1)<.02
+        until(moved)
+        m.pos=[];pub.publish(m)
+        until(lambda:any(k.key=='rejected_commands' and int(k.value)>0 for k in seen['arms/diagnostics'].status[0].values))
+        assert call('disable').success
+    finally:
+        if proc.poll() is None: os.killpg(proc.pid,signal.SIGINT)
+        proc.wait(timeout=15)
 finally:
     test.destroy_node();rclpy.shutdown()
-print('PASS: ROS feedback, diagnostics, validated commands, explicit enable and maintenance interlocks')
+print('PASS: ROS feedback, diagnostics, validated commands, explicit enable and brake interlocks')
