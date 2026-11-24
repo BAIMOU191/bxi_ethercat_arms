@@ -18,7 +18,7 @@ IRQ_CPU=5
 IFACES="eth0,eth1"
 FIFO_PRIO=80
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
 
 need_root() { [[ $EUID -eq 0 ]] || { echo "需要 root：sudo $0 $*" >&2; exit 1; }; }
 

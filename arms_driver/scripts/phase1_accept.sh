@@ -18,7 +18,7 @@ while [[ $# -gt 0 ]]; do
     -j) JOINTS=$2; shift 2 ;;
     -t) SECONDS_PER_RUN=$2; shift 2 ;;
     -f) FREQS=$2; shift 2 ;;
-    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数 $1（-h 查看用法）" >&2; exit 2 ;;
   esac
 done
