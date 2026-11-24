@@ -125,9 +125,11 @@ static void set_defaults(arms_config *c)
     memset(c, 0, sizeof(*c));
     c->version = 1;
     c->cycle_hz = 1000;
+    c->mode = ARMS_MODE_STANDALONE;
     c->rt_cpu = -1;
     c->irq_cpu = -1;
     c->rt_priority = 80;
+    c->softirq_priority = 70;
     c->wkc_tolerance = 3;
     c->command_timeout_ms = 50;
     snprintf(c->timeout_action, sizeof(c->timeout_action), "hold");
@@ -320,7 +322,23 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
     rt = obj(root, "realtime");
     if (rt) {
         long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+        char mode[16];
         if (ncpu < 1) ncpu = 1;
+        if (cJSON_GetObjectItemCaseSensitive(rt, "mode")) {
+            if (!get_str(rt, "mode", mode, sizeof(mode)) ||
+                (strcmp(mode, "standalone") != 0 && strcmp(mode, "external") != 0)) {
+                fail(error, size, "realtime.mode 只能是 standalone 或 external");
+                goto out;
+            }
+            c->mode = strcmp(mode, "external") == 0 ? ARMS_MODE_EXTERNAL : ARMS_MODE_STANDALONE;
+        }
+        if (cJSON_GetObjectItemCaseSensitive(rt, "softirq_priority")) {
+            if (!get_int(rt, "softirq_priority", 1, 98, &v)) {
+                fail(error, size, "realtime.softirq_priority 必须是 1..98");
+                goto out;
+            }
+            c->softirq_priority = (int)v;
+        }
         if (cJSON_GetObjectItemCaseSensitive(rt, "rt_cpu") && !get_int(rt, "rt_cpu", -1, ncpu - 1, &v)) {
             fail(error, size, "realtime.rt_cpu 必须是 -1..%ld", ncpu - 1);
             goto out;
@@ -434,6 +452,11 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
             }
             used[j->slave] = true;
         }
+    }
+    if (c->softirq_priority >= c->rt_priority) {
+        fail(error, size, "realtime.softirq_priority (%d) 必须低于 realtime.priority (%d)", c->softirq_priority,
+             c->rt_priority);
+        goto out;
     }
     ok = true;
 out:

@@ -1,7 +1,8 @@
-/*
- * arms_test - interactive test tool for the BXI dual-arm EtherCAT driver.
- * Every command is described once in the command table; help, "-h",
- * argument-count checks and confirmations are generated from it.
+/**
+ * @file main.c
+ * @brief arms_test：双臂 EtherCAT 驱动测试工具
+ *
+ * 命令统一登记在 commands[] 中，help、"命令 -h" 和参数个数检查均由该表生成。
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -36,20 +37,16 @@ static void log_line(void *user, const char *line)
     fflush(stdout);
 }
 
-/* ------------------------------------------------------------------ */
-/* command table                                                       */
-
 typedef int (*cmd_fn)(int argc, char **argv);
 
 typedef struct {
     const char *name;
     const char *group;
-    const char *args;     /* usage after the name */
+    const char *args;     /* 命令名之后的参数说明 */
     int min_args, max_args;
     const char *brief;
-    const char *detail;   /* multi-line help */
+    const char *detail;   /* 详细说明，可多行 */
     const char *example;
-    int phase;            /* >1: planned, not implemented yet */
     cmd_fn fn;
 } command;
 
@@ -77,7 +74,6 @@ static void print_detail(const command *c)
     printf("  %s\n", c->brief);
     if (c->detail && c->detail[0]) printf("%s\n", c->detail);
     if (c->example && c->example[0]) printf("示例:\n%s\n", c->example);
-    if (c->phase > 1) printf("状态: 计划在阶段 %d 实现，当前不可用\n", c->phase);
 }
 
 static int need_session(void)
@@ -257,13 +253,14 @@ static int cmd_info(int argc, char **argv)
     hz_short(arms_cycle_hz(g_arms), hz, sizeof(hz));
     printf("版本     %s\n配置     %s\n后端     %s\n周期     %s\n", arms_version(), arms_config_path(g_arms),
            arms_backend_name(g_arms), hz);
+    if (arms_rt_cpu(g_arms) >= 0) printf("实时 CPU %d\n", arms_rt_cpu(g_arms));
+    else printf("实时 CPU 未绑定\n");
     printf("关节映射:\n");
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_joint_state s;
         if (!(arms_opened_joints(g_arms) & ARMS_MASK_JOINT(j))) continue;
         arms_read_joint(g_arms, j, &s);
-        printf("  %d %-20s %s 臂 slave %d（testmotor 显示为 slave %d）\n", j, s.name, arms_arm_name(s.arm), s.slave,
-               s.slave + 1);
+        printf("  %d %-20s %s 臂 slave %d\n", j, s.name, arms_arm_name(s.arm), s.slave);
     }
     return ok();
 }
@@ -274,13 +271,6 @@ static int cmd_version(int argc, char **argv)
     (void)argv;
     printf("arms_test %s\n", arms_version());
     return ok();
-}
-
-static int cmd_planned(int argc, char **argv)
-{
-    const command *c = find_command(argv[0]);
-    (void)argc;
-    return failed("%s 计划在阶段 %d 实现，当前版本不可用", argv[0], c ? c->phase : 0);
 }
 
 static int g_quit;
@@ -296,41 +286,25 @@ static int cmd_help(int argc, char **argv);
 
 static const command commands[] = {
     {"help", "通用", "[命令]", 0, 1, "列出所有命令，或显示某个命令的详细用法",
-     "  不带参数: 按分组列出命令\n  带命令名: 等同于 <命令> -h", "  help\n  help commtest", 1, cmd_help},
-    {"status", "查看", "[关节]", 0, 1, "显示关节状态表（位置/速度/力矩、状态机、AL、状态字、错误码）",
-     "  关节可写: 21 | l_wrist_z | left | right | all | 15-18 | 21,28（默认全部已打开关节）\n"
-     "  状态: offline/preop/safeop/locked(OP且失能)/enabled/FAULT",
-     "  status\n  status left\n  status 21", 1, cmd_status},
-    {"watch", "查看", "[关节] [刷新Hz]", 0, 2, "持续刷新显示关节位置，回车结束",
-     "  刷新频率 1..50 Hz，默认 5", "  watch left 10", 1, cmd_watch},
+     "  不带参数: 按分组列出命令\n  带命令名: 等同于 <命令> -h", "  help\n  help commtest", cmd_help},
+    {"status", "查看", "[关节]", 0, 1, "显示关节状态表（位置/速度/力矩、状态、AL、状态字、错误码）",
+     "  关节写法: 21 | l_wrist_z | left | right | all | 15-18 | 21,28（默认全部已打开关节）\n"
+     "  状态: offline / preop / safeop / locked（OP，伺服失能）/ enabled / FAULT",
+     "  status\n  status left\n  status 21", cmd_status},
+    {"watch", "查看", "[关节] [刷新Hz]", 0, 2, "持续刷新显示关节位置，回车结束", "  刷新频率 1..50 Hz，默认 5",
+     "  watch left 10", cmd_watch},
     {"bus", "查看", "[reset]", 0, 1, "显示两条臂的通信统计；reset 清零",
-     "  周期: 实际周期的平均/最短/最长、抖动、唤醒延迟、超时周期、跳过周期\n"
+     "  周期: 平均/最短/最长间隔、抖动、唤醒延迟、超时周期、跳过周期\n"
      "  每条臂: 链路、OP 从站数、WKC、异常次数、最长连续异常、发送错误、收发耗时",
-     "  bus\n  bus reset", 1, cmd_bus},
-    {"commtest", "测试", "<秒>", 1, 1, "失能状态下的通信质量测试，结束时给出通过/不通过",
+     "  bus\n  bus reset", cmd_bus},
+    {"info", "查看", "", 0, 0, "显示版本、配置文件、周期、实时 CPU、关节与总线位置的对应关系", "", "  info",
+     cmd_info},
+    {"commtest", "测试", "<秒>", 1, 1, "伺服失能状态下的通信质量测试，结束时给出结论",
      "  先清零统计，再运行指定秒数，每 10 秒打印一次进度\n"
-     "  通过条件: 两臂 WKC 异常=0、发送错误=0、没有超时或跳过的周期",
-     "  commtest 300", 1, cmd_commtest},
-    {"info", "查看", "", 0, 0, "显示版本、配置文件、周期、关节到总线位置的映射", "", "  info", 1, cmd_info},
-    {"enable", "控制", "<关节>", 1, 1, "使能关节（目标先设为当前位置，不会跳变）", "", "  enable 21", 3, cmd_planned},
-    {"disable", "控制", "<关节>", 1, 1, "失能关节", "", "  disable all", 3, cmd_planned},
-    {"reset", "控制", "<关节>", 1, 1, "清除驱动器故障（0x80）", "", "  reset 21", 3, cmd_planned},
-    {"mit", "控制", "<关节> <pos> [vel tff kp kd] [--hold ms]", 2, 8, "单关节 MIT 目标（自动使能，按配置限幅）",
-     "", "  mit 21 0.2\n  mit 21 -0.2 0 0 5 0", 3, cmd_planned},
-    {"swing", "测试", "<关节> <幅度rad> <周期s> [--count n]", 3, 5, "单关节往返测试", "", "  swing 21 0.2 2", 3,
-     cmd_planned},
-    {"release", "抱闸/校准", "<关节>", 1, 1, "释力：Pn075=1，可用手掰动（危险，需确认）", "", "  release 21", 4,
-     cmd_planned},
-    {"lock", "抱闸/校准", "<关节>", 1, 1, "恢复抱闸：Pn075=0", "", "  lock all", 4, cmd_planned},
-    {"zero", "抱闸/校准", "<关节> [--hw]", 1, 2, "软件零位（默认）或 Pn101 硬件清零", "", "  zero 21", 4,
-     cmd_planned},
-    {"identify", "查看", "<关节>", 1, 1, "核对编号映射：释力后手动转动，显示读数变化的关节", "", "  identify 21", 4,
-     cmd_planned},
-    {"selftest", "查看", "", 0, 0, "自检：Pn075、Pn082、周期、错误码", "", "  selftest", 4, cmd_planned},
-    {"pn", "参数", "<关节> <参数号> [值]", 2, 3, "读/写驱动器参数（写需确认）", "", "  pn 21 75", 4, cmd_planned},
-    {"version", "通用", "", 0, 0, "显示版本", "", "  version", 1, cmd_version},
-    {"quit", "通用", "", 0, 0, "安全退出（失能 → 停止通信 → 释放主站）", "  也可以用 exit 或 q", "  quit", 1,
-     cmd_quit},
+     "  通过条件: WKC 异常 0 次、发送错误 0 次、无超时周期、无跳过周期",
+     "  commtest 300", cmd_commtest},
+    {"version", "通用", "", 0, 0, "显示版本", "", "  version", cmd_version},
+    {"quit", "通用", "", 0, 0, "退出：停止通信并释放主站", "  也可以用 exit 或 q", "  quit", cmd_quit},
 };
 #define COMMAND_COUNT (sizeof(commands) / sizeof(commands[0]))
 
@@ -346,7 +320,7 @@ static const command *find_command(const char *name)
 
 static int cmd_help(int argc, char **argv)
 {
-    static const char *groups[] = {"查看", "测试", "控制", "抱闸/校准", "参数", "通用"};
+    static const char *groups[] = {"查看", "测试", "通用"};
     size_t g, i;
     if (argc > 1) {
         const command *c = find_command(argv[1]);
@@ -361,7 +335,7 @@ static int cmd_help(int argc, char **argv)
             char head[96];
             if (strcmp(c->group, groups[g]) != 0) continue;
             snprintf(head, sizeof(head), "%s %s", c->name, c->args);
-            printf("  %-42s %s%s\n", head, c->brief, c->phase > 1 ? "（未实现）" : "");
+            printf("  %-24s %s\n", head, c->brief);
         }
     }
     printf("关节写法: 21 | l_wrist_z | left | right | all | 15-18 | 21,28\n");
@@ -428,22 +402,20 @@ static void build_prompt(char *buf, size_t size)
     }
 }
 
-/* ------------------------------------------------------------------ */
-
 static void usage(FILE *out)
 {
     fprintf(out,
             "用法: arms_test [选项]\n"
-            "BXI 双臂 EtherCAT 测试工具（KGU 驱动器，MIT 模式）。启动后扫描、预热，全部关节保持失能。\n"
+            "BXI 双臂 EtherCAT 测试工具（KGU 驱动器，MIT 模式）。启动后扫描、预热，全部关节保持伺服失能。\n"
             "\n"
             "选项:\n"
             "  -f, --freq HZ        周期频率 2000|1000|500|250|200|125（默认取配置）\n"
             "  -j, --joints LIST    参与的关节: all | left | right | 15-21 | 21,28（默认 all）\n"
+            "  -r, --rt-cpu N       实时线程 CPU，-1 表示不绑定（默认取配置 realtime.rt_cpu）\n"
             "  -c, --config FILE    配置文件（默认 $ARMS_CONFIG、/etc/bxi/arms.json、./config/arms.json）\n"
-            "  -e, --exec CMD       执行一条命令后退出，例如 -e \"commtest 300\"（可重复）\n"
+            "  -e, --exec CMD       执行命令后退出，例如 -e \"commtest 300\"（可重复，按顺序执行）\n"
             "      --mock           使用模拟后端，不访问硬件\n"
-            "      --no-check       跳过自检（阶段 4 起生效）\n"
-            "      --power          启动前请求电机总电源上电，退出时断电（默认不碰电源）\n"
+            "      --power          启动前请求电机总电源上电，退出时断电（默认不操作电源）\n"
             "      --power-wait MS  上电后等待驱动器启动的时间（默认 3000）\n"
             "      --keep-power     配合 --power：退出时不断电\n"
             "  -h, --help           显示本帮助\n"
@@ -451,11 +423,11 @@ static void usage(FILE *out)
             "\n"
             "关节编号: 15-21 左臂（肩y/x/z、肘y、腕x/y/z），22-28 右臂，顺序相同。\n"
             "示例:\n"
-            "  sudo arms_test --power                上电、扫描两臂、预热，进入交互终端\n"
-            "  sudo arms_test                        电源已由别的程序打开时使用\n"
-            "  sudo arms_test -f 2000 -j left        只测左臂，2 kHz\n"
-            "  sudo arms_test -e \"commtest 300\"      跑 5 分钟通信测试后退出\n"
-            "  arms_test --mock                      不接硬件，熟悉命令\n"
+            "  sudo arms_test --power                    上电、扫描两臂、预热，进入交互终端\n"
+            "  sudo arms_test                            电源已打开时直接扫描\n"
+            "  sudo arms_test -f 2000 -j left            只打开左臂，2 kHz\n"
+            "  sudo arms_test --power -e \"commtest 300\"  通信测试 300 秒后退出\n"
+            "  arms_test --mock                          使用模拟后端\n"
             "进入终端后输入 help 查看命令，任一命令加 -h 查看详细用法。\n");
 }
 
@@ -464,7 +436,7 @@ int main(int argc, char **argv)
     static const struct option long_opts[] = {
         {"freq", required_argument, NULL, 'f'},   {"joints", required_argument, NULL, 'j'},
         {"config", required_argument, NULL, 'c'}, {"exec", required_argument, NULL, 'e'},
-        {"mock", no_argument, NULL, 'm'},         {"no-check", no_argument, NULL, 'n'},
+        {"mock", no_argument, NULL, 'm'},         {"rt-cpu", required_argument, NULL, 'r'},
         {"power", no_argument, NULL, 'p'},        {"help", no_argument, NULL, 'h'},
         {"version", no_argument, NULL, 'V'},      {"power-wait", required_argument, NULL, 'w'},
         {"keep-power", no_argument, NULL, 'k'},   {NULL, 0, NULL, 0},
@@ -479,8 +451,9 @@ int main(int argc, char **argv)
     arms_status st;
 
     arms_options_init(&opt);
+    opt.mode = ARMS_MODE_STANDALONE;
     opt.log = log_line;
-    while ((ch = getopt_long(argc, argv, "f:j:c:e:hV", long_opts, NULL)) != -1) {
+    while ((ch = getopt_long(argc, argv, "f:j:r:c:e:hV", long_opts, NULL)) != -1) {
         switch (ch) {
         case 'f': {
             char *end;
@@ -507,7 +480,16 @@ int main(int argc, char **argv)
             execs[nexec++] = optarg;
             break;
         case 'm': opt.backend = ARMS_BACKEND_MOCK; break;
-        case 'n': opt.skip_selftest = true; break;
+        case 'r': {
+            char *end;
+            long v = strtol(optarg, &end, 10);
+            if (*end || v < -1 || v > 1023) {
+                fprintf(stderr, "错误: --rt-cpu 需要 CPU 编号，或 -1 表示不绑定\n");
+                return 2;
+            }
+            opt.rt_cpu = (int)v;
+            break;
+        }
         case 'p': power = true; break;
         case 'k': keep_power = true; break;
         case 'w': {
@@ -538,7 +520,7 @@ int main(int argc, char **argv)
 
     printf("arms_test %s\n", arms_version());
     if (power && opt.backend == ARMS_BACKEND_MOCK) {
-        printf("提示: mock 模式忽略 --power\n");
+        printf("提示: 模拟后端忽略 --power\n");
         power = false;
     }
     if (power) {
@@ -546,7 +528,7 @@ int main(int argc, char **argv)
         powered = true;
         opt.scan_timeout_ms = 20000;
     }
-    printf("启动: %s 后端，扫描并预热（全部关节保持失能）...\n", opt.backend == ARMS_BACKEND_MOCK ? "mock" : "EtherLab");
+    printf("启动: %s 后端，扫描并预热，全部关节保持伺服失能\n", opt.backend == ARMS_BACKEND_MOCK ? "模拟" : "EtherLab");
     st = arms_open(&opt, &g_arms);
     if (st != ARMS_OK) {
         fprintf(stderr, "启动失败: %s\n  原因: %s\n", arms_strerror(st), arms_last_error());
@@ -589,7 +571,7 @@ int main(int argc, char **argv)
             run_command(ac, av);
         }
     }
-    printf("退出: 停止通信并释放主站...\n");
+    printf("退出: 停止通信并释放主站\n");
     arms_close(g_arms);
     if (powered) {
         if (keep_power) printf("电源: 按 --keep-power 保持上电\n");

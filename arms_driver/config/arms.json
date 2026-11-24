@@ -1,8 +1,7 @@
 {
-  "_note": "左右臂对应的网口和 slave 位置尚未在现场核对；mac 留空表示不校验。核对后填写 mac，并用 identify 确认每个关节的 slave。",
   "version": 1,
   "cycle_hz": 1000,
-  "realtime": { "rt_cpu": 5, "irq_cpu": 5, "priority": 80 },
+  "realtime": { "mode": "standalone", "rt_cpu": 3, "irq_cpu": 3, "priority": 80, "softirq_priority": 70 },
   "safety": {
     "wkc_tolerance": 3,
     "command_timeout_ms": 50,

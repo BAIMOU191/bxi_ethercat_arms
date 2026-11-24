@@ -1,9 +1,9 @@
-/*
- * Bus backend interface: one instance per arm (one EtherCAT master).
+/**
+ * @file bus.h
+ * @brief 总线后端接口，每条臂一个实例（对应一个 EtherCAT 主站）
  *
- * Threading: open/scan/configure/activate/close run in the caller's thread
- * before or after the realtime loop. receive/send/inputs/outputs/
- * update_states run only in the realtime thread.
+ * open/scan/configure/activate/close 在周期开始前或结束后调用；
+ * receive/send/inputs/outputs/update_states 只在周期上下文中调用。
  */
 #ifndef ARMS_BUS_H
 #define ARMS_BUS_H
@@ -42,19 +42,20 @@ typedef struct bus bus_t;
 typedef struct {
     const char *name;
     int (*open)(bus_t **out, const bus_open_params *params, char *err, size_t err_size);
-    /* Fill infos[0..*count-1]; wait up to timeout_ms for identities. */
+    /* 等待从站身份就绪（最长 timeout_ms），写入 infos[0..*count-1] */
     int (*scan)(bus_t *bus, bus_slave_info *infos, int max, int *count, unsigned int timeout_ms,
                 char *err, size_t err_size);
-    /* Configure MIT PDOs + DC Sync0 for slaves[0..n-1] (ring positions). */
+    /* 为链上位置 positions[0..n-1] 配置 MIT PDO 和 DC Sync0 */
     int (*configure)(bus_t *bus, const int *positions, int n, char *err, size_t err_size);
     int (*activate)(bus_t *bus, char *err, size_t err_size);
-    /* Realtime: returns working counter of the last exchange, <0 on error. */
+    /* 接收并处理过程数据，返回 WKC；失败返回负值 */
     int (*receive)(bus_t *bus);
+    /* 写入 DC 应用时间并发送过程数据 */
     int (*send)(bus_t *bus, uint64_t app_time_ns);
-    /* Realtime: process data pointers for the i-th configured slave. */
+    /* 第 index 个配置从站的过程数据 */
     const uint8_t *(*inputs)(bus_t *bus, int index);
     uint8_t *(*outputs)(bus_t *bus, int index);
-    /* Realtime, low rate: refresh AL states into al[0..n-1]; link state. */
+    /* 刷新 AL 状态和链路状态（低频调用） */
     void (*update_states)(bus_t *bus, uint8_t *al, bool *link_up);
     uint32_t (*expected_wkc)(bus_t *bus);
     int (*master_index)(bus_t *bus);

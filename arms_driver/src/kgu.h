@@ -1,7 +1,9 @@
-/*
- * KGU EtherCAT actuator (KaiserDrive KDE) - MIT mode process data layout.
- * Source: KGU EtherCAT manual V1.2 (mode 0x6060 = 10, "混合力控") and the
- * mapping verified on hardware in bxi_pci_drv_testmotor (23 B out / 16 B in).
+/**
+ * @file kgu.h
+ * @brief KGU 执行器（KaiserDrive KDE）MIT 模式过程数据布局
+ *
+ * 依据《KGU 系列谐波减速模组说明 EtherCAT 版 V1.2》：0x6060 = 10（混合力控），
+ * RxPDO 0x1601 共 23 字节，TxPDO 0x1A01 共 16 字节，数值均为小端。
  */
 #ifndef ARMS_KGU_H
 #define ARMS_KGU_H
@@ -33,17 +35,15 @@
 #define KGU_IN_TORQUE 10       /* 0x4002 f32 N.m */
 #define KGU_IN_ERROR 14        /* 0x603F u16 */
 
-/* CiA402 control words (manual table "402 控制命令与状态字") */
+/* CiA402 控制字 */
 #define KGU_CW_DISABLE 0x0000u
 #define KGU_CW_SHUTDOWN 0x0006u
 #define KGU_CW_SWITCH_ON 0x0007u
 #define KGU_CW_ENABLE 0x000Fu
 #define KGU_CW_FAULT_RESET 0x0080u
 
-/* Status word patterns (masked with 0x006F) */
+/* 状态字故障位 */
 #define KGU_SW_FAULT_BIT 0x0008u
-
-/* Supported cycle periods: 0.5 / 1 / 2 / 4 / 5 / 8 ms */
 
 static inline uint16_t kgu_get_u16(const uint8_t *p, unsigned int off)
 {

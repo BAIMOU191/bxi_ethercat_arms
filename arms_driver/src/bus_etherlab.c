@@ -1,8 +1,9 @@
-/*
- * EtherLab (IgH) bus backend: one master per arm, KGU MIT PDO mapping,
- * DC Sync0 on every configured slave, first configured slave = reference clock.
- * PDO layout and DC settings ported from bxi_pci_drv_testmotor (verified on
- * hardware at 1 kHz / 2 kHz).
+/**
+ * @file bus_etherlab.c
+ * @brief EtherLab 总线后端
+ *
+ * 每条臂对应一个主站。所有配置的从站使用 KGU MIT PDO 映射并启用 DC Sync0，
+ * 链上位置最小的从站作为 DC 参考时钟。
  */
 #include <ctype.h>
 #include <errno.h>
@@ -74,7 +75,7 @@ static bool read_line(const char *path, char *buf, size_t size)
     return true;
 }
 
-/* Master index = position of the interface MAC in ec_master main_devices. */
+/* 主站号 = 网口 MAC 在 ec_master main_devices 中的序号 */
 static int resolve_master(const bus_open_params *p, char *err, size_t err_size)
 {
     char path[128], mac[32], devices[512];

@@ -1,9 +1,10 @@
-/*
- * Mock bus: simulates KGU slaves for offline development and unit tests.
+/**
+ * @file bus_mock.c
+ * @brief 模拟总线后端，用于离线调试和单元测试
  *
- * Environment knobs:
- *   ARMS_MOCK_SLAVES=<n>       slaves per arm (default 7)
- *   ARMS_MOCK_DROP_PPM=<ppm>   probability of a WKC=0 cycle (fault injection)
+ * 环境变量：
+ *   ARMS_MOCK_SLAVES=<n>       每条臂的从站数（默认 7）
+ *   ARMS_MOCK_DROP_PPM=<ppm>   每周期 WKC 为 0 的概率（故障注入）
  */
 #include <stdio.h>
 #include <stdlib.h>

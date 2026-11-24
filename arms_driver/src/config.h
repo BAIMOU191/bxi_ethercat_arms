@@ -34,9 +34,11 @@ typedef struct {
     char path[ARMS_PATH_LEN];
     int version;
     unsigned int cycle_hz;
-    int rt_cpu;
-    int irq_cpu;
+    arms_run_mode mode;     /* ARMS_MODE_STANDALONE / ARMS_MODE_EXTERNAL */
+    int rt_cpu;             /* -1 = 不绑定 */
+    int irq_cpu;            /* -1 = 不调整；由 rt_setup.sh 使用 */
     int rt_priority;
+    int softirq_priority;   /* 由 rt_setup.sh 使用 */
     unsigned int wkc_tolerance;
     unsigned int command_timeout_ms;
     char timeout_action[16];

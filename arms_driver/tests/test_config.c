@@ -1,4 +1,4 @@
-/* Unit tests: configuration validation, joint selection, KGU encoding. */
+/* 单元测试：配置校验、关节选择、KGU 编解码 */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,9 +37,10 @@ int main(int argc, char **argv)
     char err[512];
     arms_mask m;
 
-    /* shipped template */
+    /* 随附的配置文件 */
     CHECK(argc > 1 && arms_config_load(argv[1], &c, err, sizeof(err)), err);
     CHECK(c.cycle_hz == 1000, "cycle_hz");
+    CHECK(c.mode == ARMS_MODE_STANDALONE && c.rt_cpu == 3 && c.irq_cpu == 3 && c.softirq_priority == 70, "realtime");
     CHECK(c.joint[21].present && c.joint[21].slave == 6 && c.joint[21].arm == ARMS_ARM_LEFT, "joint 21");
 
     /* wrong name for index */
@@ -58,11 +59,21 @@ int main(int argc, char **argv)
     CHECK(!load_text("{\"cycle_hz\":3000,\"arms\":{\"left\":{\"interface\":\"eth0\"}},\"joints\":[{\"joint\":15,"
                      "\"name\":\"l_shoulder_y_joint\",\"arm\":\"left\",\"slave\":0}]}", &c, err, sizeof(err)),
           "3000 Hz accepted");
-    /* minimal valid */
+    /* realtime 段 */
+    CHECK(load_text("{\"realtime\":{\"mode\":\"external\",\"rt_cpu\":0},\"arms\":{\"left\":{\"interface\":\"eth0\"}},"
+                    "\"joints\":[{\"joint\":15,\"name\":\"l_shoulder_y_joint\",\"arm\":\"left\",\"slave\":0}]}",
+                    &c, err, sizeof(err)) && c.mode == ARMS_MODE_EXTERNAL && c.rt_cpu == 0, err);
+    CHECK(!load_text("{\"realtime\":{\"mode\":\"fast\"},\"arms\":{\"left\":{\"interface\":\"eth0\"}},\"joints\":[{\"joint\":15,"
+                     "\"name\":\"l_shoulder_y_joint\",\"arm\":\"left\",\"slave\":0}]}", &c, err, sizeof(err)),
+          "invalid mode accepted");
+    CHECK(!load_text("{\"realtime\":{\"priority\":70,\"softirq_priority\":80},\"arms\":{\"left\":{\"interface\":\"eth0\"}},"
+                     "\"joints\":[{\"joint\":15,\"name\":\"l_shoulder_y_joint\",\"arm\":\"left\",\"slave\":0}]}",
+                     &c, err, sizeof(err)), "softirq priority above control thread accepted");
+    /* 最小合法配置 */
     CHECK(load_text("{\"cycle_hz\":2000,\"arms\":{\"left\":{\"interface\":\"eth0\"}},\"joints\":[{\"joint\":15,"
                     "\"name\":\"l_shoulder_y_joint\",\"arm\":\"left\",\"slave\":0}]}", &c, err, sizeof(err)), err);
 
-    /* joint selection */
+    /* 关节选择 */
     CHECK(arms_parse_joints("left", 0, &m, err, sizeof(err)) == 0 && m == ARMS_MASK_LEFT, "left");
     CHECK(arms_parse_joints("15-18,28", 0, &m, err, sizeof(err)) == 0 &&
           m == (ARMS_MASK_JOINT(15) | ARMS_MASK_JOINT(16) | ARMS_MASK_JOINT(17) | ARMS_MASK_JOINT(18) | ARMS_MASK_JOINT(28)),
@@ -73,7 +84,7 @@ int main(int argc, char **argv)
     CHECK(arms_parse_joints("foo", 0, &m, err, sizeof(err)) != 0, "foo accepted");
     CHECK(arms_parse_joints("22", ARMS_MASK_LEFT, &m, err, sizeof(err)) != 0, "unopened joint accepted");
 
-    /* KGU encode/decode round trip */
+    /* KGU 编解码 */
     {
         uint8_t out[KGU_OUT_BYTES], in[KGU_IN_BYTES];
         kgu_command cmd = {KGU_CW_ENABLE, 0.2f, -1.5f, 0.25f, 5.0f, 0.5f, KGU_MODE_MIT};

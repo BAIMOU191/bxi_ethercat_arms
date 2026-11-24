@@ -1,7 +1,6 @@
-/*
- * Motor main power through the BXI PCI SDK (motor_pwr_set). Used only by the
- * test tool; the library itself never touches power (power is shared with
- * the waist/leg PCI process).
+/**
+ * @file power.c
+ * @brief 电机总电源控制（BXI PCI SDK motor_pwr_set）
  */
 #include "power.h"
 
@@ -33,7 +32,7 @@ int arms_power_on(unsigned int wait_ms)
         fprintf(stderr, "电源: motor_pwr_set(1) 失败\n");
         return -1;
     }
-    printf("电源: 已请求上电（双臂与整机共用），等待驱动器启动 %u ms...\n", wait_ms);
+    printf("电源: 已请求上电，等待驱动器启动 %u ms\n", wait_ms);
     fflush(stdout);
     usleep(wait_ms * 1000u);
     return 0;

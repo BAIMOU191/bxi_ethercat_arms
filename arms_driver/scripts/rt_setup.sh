@@ -1,32 +1,60 @@
 #!/usr/bin/env bash
-# rt_setup.sh - prepare (and undo) the realtime environment for arms_test / arms_node.
+# rt_setup.sh - 配置/还原双臂 EtherCAT 实时运行环境（运行时设置，重启后失效）
 #
-#   sudo scripts/rt_setup.sh apply  [--rt-cpu 5] [--irq-cpu 5] [--ifaces eth0,eth1] [--softirq-prio 70]
-#   sudo scripts/rt_setup.sh revert
-#   scripts/rt_setup.sh status
+# 用法:
+#   sudo rt_setup.sh apply  [-c arms.json] [--rt-cpu N] [--irq-cpu N] [--ifaces eth0,eth1] [--softirq-prio P]
+#   sudo rt_setup.sh revert
+#   rt_setup.sh status [-c arms.json]
 #
-# apply:  EtherCAT NIC IRQs -> irq_cpu, ksoftirqd/<irq_cpu> -> SCHED_FIFO 80,
-#         (ksoftirqd stays below the 80 of the control thread),
-#         every other task and the unbound workqueues -> off rt_cpu/irq_cpu,
-#         cpufreq governor of those CPUs -> performance, kerneloops stopped.
-# revert: restores everything recorded in the state file.
-# These are runtime settings only; a reboot also restores the defaults.
+# apply:  EtherCAT 网口中断绑定到 irq_cpu；ksoftirqd/<irq_cpu> 设为 SCHED_FIFO；
+#         其他线程和非绑定工作队列限制到其余 CPU；实时 CPU 调频设为 performance；
+#         暂停 kerneloops。参数默认取配置文件 realtime 段和 arms 段，命令行参数优先。
+# revert: 按状态文件逐项还原。
 set -euo pipefail
-export LC_ALL=C   # taskset/chrt output is parsed below; the Chinese locale uses full-width colons
+export LC_ALL=C
 
 STATE=/run/arms_rt_setup.state
-RT_CPU=5
-IRQ_CPU=5
-IFACES="eth0,eth1"
-# ksoftirqd runs below the control thread (80): packet processing never delays a
-# cycle that is already running, and the control thread never waits for it.
-FIFO_PRIO=70
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+CONFIG=""
+RT_CPU=""
+IRQ_CPU=""
+IFACES=""
+SOFTIRQ_PRIO=""
 
 usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
 
-need_root() { [[ $EUID -eq 0 ]] || { echo "需要 root：sudo $0 $*" >&2; exit 1; }; }
+need_root() { [[ $EUID -eq 0 ]] || { echo "需要 root 权限: sudo $0 $1" >&2; exit 1; }; }
 
-cpu_list_without() { # all online CPUs except the given ones -> list "0-3,6,7"
+default_config() {
+  local c
+  for c in "${ARMS_CONFIG:-}" /etc/bxi/arms.json "$SELF_DIR/../config/arms.json"; do
+    [[ -n $c && -r $c ]] && { echo "$c"; return; }
+  done
+}
+
+load_config() {
+  [[ -z $CONFIG ]] && CONFIG=$(default_config)
+  [[ -z $CONFIG ]] && return
+  [[ -r $CONFIG ]] || { echo "无法读取配置文件 $CONFIG" >&2; exit 1; }
+  local vals
+  vals=$(python3 - "$CONFIG" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+rt = c.get("realtime", {})
+arms = c.get("arms", {})
+ifs = ",".join(a["interface"] for a in (arms.get("left"), arms.get("right")) if a and a.get("interface"))
+print(rt.get("rt_cpu", -1), rt.get("irq_cpu", -1), rt.get("softirq_priority", 70), ifs or "-")
+PY
+)
+  read -r c_rt c_irq c_prio c_ifs <<< "$vals"
+  [[ -z $RT_CPU ]] && RT_CPU=$c_rt
+  [[ -z $IRQ_CPU ]] && IRQ_CPU=$c_irq
+  [[ -z $SOFTIRQ_PRIO ]] && SOFTIRQ_PRIO=$c_prio
+  [[ -z $IFACES && $c_ifs != "-" ]] && IFACES=$c_ifs
+  return 0
+}
+
+cpu_list_without() {
   local skip=" $* " out=() c
   for c in $(seq 0 $(( $(nproc --all) - 1 ))); do
     [[ $skip == *" $c "* ]] || out+=("$c")
@@ -34,7 +62,7 @@ cpu_list_without() { # all online CPUs except the given ones -> list "0-3,6,7"
   (IFS=,; echo "${out[*]}")
 }
 
-cpu_mask_without() { # hex mask of all CPUs except the given ones
+cpu_mask_without() {
   local skip=" $* " m=0 c
   for c in $(seq 0 $(( $(nproc --all) - 1 ))); do
     [[ $skip == *" $c "* ]] || m=$(( m | (1 << c) ))
@@ -44,24 +72,38 @@ cpu_mask_without() { # hex mask of all CPUs except the given ones
 
 irqs_for() { awk -v ifc="$1" '$NF==ifc {sub(":","",$1); print $1}' /proc/interrupts; }
 
+check_params() {
+  local n; n=$(nproc --all)
+  [[ $RT_CPU =~ ^[0-9]+$ && $RT_CPU -lt $n ]] || { echo "rt_cpu 无效: '$RT_CPU'" >&2; exit 2; }
+  [[ $IRQ_CPU =~ ^[0-9]+$ && $IRQ_CPU -lt $n ]] || { echo "irq_cpu 无效: '$IRQ_CPU'" >&2; exit 2; }
+  [[ $SOFTIRQ_PRIO =~ ^[0-9]+$ && $SOFTIRQ_PRIO -ge 1 && $SOFTIRQ_PRIO -le 98 ]] ||
+    { echo "softirq 优先级无效: '$SOFTIRQ_PRIO'" >&2; exit 2; }
+  [[ -n $IFACES ]] || { echo "未指定网口" >&2; exit 2; }
+}
+
 apply() {
   need_root apply
-  [[ -e $STATE ]] && { echo "已有未还原的设置（$STATE）；先运行 revert" >&2; exit 1; }
+  [[ -e $STATE ]] && { echo "已有未还原的设置 ($STATE)，请先执行 revert" >&2; exit 1; }
+  load_config
+  check_params
   local housekeeping; housekeeping=$(cpu_list_without "$RT_CPU" "$IRQ_CPU")
   : > "$STATE"
-  echo "rt_cpu=$RT_CPU irq_cpu=$IRQ_CPU ifaces=$IFACES"
+  echo "配置: ${CONFIG:-无}  实时 CPU $RT_CPU  中断 CPU $IRQ_CPU  网口 $IFACES"
   IFS=, read -ra ifs <<< "$IFACES"
   for ifc in "${ifs[@]}"; do
     for irq in $(irqs_for "$ifc"); do
       echo "irq $irq $(cat /proc/irq/$irq/smp_affinity_list)" >> "$STATE"
       echo "$IRQ_CPU" > /proc/irq/$irq/smp_affinity_list
-      echo "  IRQ $irq ($ifc) -> CPU $IRQ_CPU"
+      echo "  中断 $irq ($ifc) -> CPU $IRQ_CPU"
     done
   done
-  local ks; ks=$(pgrep -x "ksoftirqd/$IRQ_CPU")
-  echo "ksoftirqd $ks $(chrt -p "$ks" | awk -F'[:：]' 'NR==1{print $2}' | tr -d ' ') $(chrt -p "$ks" | awk -F'[:：]' 'NR==2{print $2}' | tr -d ' ')" >> "$STATE"
-  chrt -f -p "$FIFO_PRIO" "$ks"
-  echo "  ksoftirqd/$IRQ_CPU (pid $ks) -> SCHED_FIFO $FIFO_PRIO"
+  local ks pol prio
+  ks=$(pgrep -x "ksoftirqd/$IRQ_CPU")
+  pol=$(chrt -p "$ks" | awk -F': ' 'NR==1{print $2}')
+  prio=$(chrt -p "$ks" | awk -F': ' 'NR==2{print $2}')
+  echo "ksoftirqd $ks $pol $prio" >> "$STATE"
+  chrt -f -p "$SOFTIRQ_PRIO" "$ks"
+  echo "  ksoftirqd/$IRQ_CPU -> SCHED_FIFO $SOFTIRQ_PRIO"
   if [[ -w /sys/devices/virtual/workqueue/cpumask ]]; then
     echo "wq $(cat /sys/devices/virtual/workqueue/cpumask)" >> "$STATE"
     cpu_mask_without "$RT_CPU" "$IRQ_CPU" > /sys/devices/virtual/workqueue/cpumask
@@ -71,19 +113,24 @@ apply() {
     aff=$(taskset -pc "$tid" 2>/dev/null | awk -F': ' '{print $2}') || continue
     [[ -z $aff ]] && continue
     if taskset -pc "$housekeeping" "$tid" >/dev/null 2>&1; then
-      echo "task $tid $aff" >> "$STATE"; moved=$((moved + 1))
+      echo "task $tid $aff" >> "$STATE"
+      moved=$((moved + 1))
     fi
   done
-  echo "  已把 $moved 个线程限制到 CPU $housekeeping"
-  for c in $(echo "$RT_CPU $IRQ_CPU" | tr ' ' '\n' | sort -u); do
+  echo "  $moved 个线程限制到 CPU $housekeeping"
+  for c in $(printf '%s\n' "$RT_CPU" "$IRQ_CPU" | sort -u); do
     local g=/sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor
-    if [[ -w $g ]]; then echo "gov $c $(cat "$g")" >> "$STATE"; echo performance > "$g"; fi
+    if [[ -w $g ]]; then
+      echo "gov $c $(cat "$g")" >> "$STATE"
+      echo performance > "$g"
+    fi
   done
   if systemctl is-active --quiet kerneloops 2>/dev/null; then
-    echo "svc kerneloops" >> "$STATE"; systemctl stop kerneloops
+    echo "svc kerneloops" >> "$STATE"
+    systemctl stop kerneloops
     echo "  kerneloops 已暂停"
   fi
-  echo "完成。测试结束后运行: sudo $0 revert"
+  echo "完成"
 }
 
 revert() {
@@ -94,13 +141,10 @@ revert() {
     case $kind in
       irq) echo "$b" > /proc/irq/$a/smp_affinity_list ;;
       ksoftirqd)
-        case $b in
-          SCHED_OTHER) chrt -o -p 0 "$a" ;;
-          SCHED_FIFO) chrt -f -p "${c:-1}" "$a" ;;
-          *) chrt -o -p 0 "$a" ;;
-        esac ;;
+        if [[ $b == SCHED_FIFO || $b == SCHED_RR ]]; then chrt -f -p "${c:-1}" "$a"; else chrt -o -p 0 "$a"; fi ;;
       wq) echo "$a" > /sys/devices/virtual/workqueue/cpumask ;;
-      task) if taskset -pc "$b" "$a" >/dev/null 2>&1; then restored=$((restored+1)); else gone=$((gone+1)); fi ;;
+      task)
+        if taskset -pc "$b" "$a" >/dev/null 2>&1; then restored=$((restored + 1)); else gone=$((gone + 1)); fi ;;
       gov) echo "$b" > /sys/devices/system/cpu/cpu$a/cpufreq/scaling_governor ;;
       svc) systemctl start "$a" ;;
     esac
@@ -110,28 +154,36 @@ revert() {
 }
 
 status() {
-  echo "状态文件: $([[ -e $STATE ]] && echo "$STATE（已应用）" || echo "无（未应用）")"
-  IFS=, read -ra ifs <<< "$IFACES"
-  for ifc in "${ifs[@]}"; do
-    for irq in $(irqs_for "$ifc"); do
-      echo "IRQ $irq ($ifc): CPU $(cat /proc/irq/$irq/effective_affinity_list 2>/dev/null || cat /proc/irq/$irq/smp_affinity_list)"
+  load_config
+  echo "状态: $([[ -e $STATE ]] && echo "已应用 ($STATE)" || echo "未应用")"
+  echo "配置: ${CONFIG:-无}  实时 CPU ${RT_CPU:--}  中断 CPU ${IRQ_CPU:--}  网口 ${IFACES:--}"
+  if [[ -n $IFACES ]]; then
+    IFS=, read -ra ifs <<< "$IFACES"
+    for ifc in "${ifs[@]}"; do
+      for irq in $(irqs_for "$ifc"); do
+        echo "  中断 $irq ($ifc): CPU $(cat /proc/irq/$irq/effective_affinity_list 2>/dev/null || cat /proc/irq/$irq/smp_affinity_list)"
+      done
     done
-  done
-  local ks; ks=$(pgrep -x "ksoftirqd/$IRQ_CPU" || true)
-  [[ -n $ks ]] && echo "ksoftirqd/$IRQ_CPU: $(chrt -p "$ks" | tr '\n' ' ')"
-  [[ -r /sys/devices/virtual/workqueue/cpumask ]] && echo "workqueue cpumask: $(cat /sys/devices/virtual/workqueue/cpumask)"
-  echo "kerneloops: $(systemctl is-active kerneloops 2>/dev/null || true)"
+  fi
+  if [[ $IRQ_CPU =~ ^[0-9]+$ ]]; then
+    local ks; ks=$(pgrep -x "ksoftirqd/$IRQ_CPU" || true)
+    [[ -n $ks ]] && echo "  ksoftirqd/$IRQ_CPU: $(chrt -p "$ks" | awk -F': ' '{printf "%s ", $2}')"
+  fi
+  [[ -r /sys/devices/virtual/workqueue/cpumask ]] && echo "  workqueue cpumask: $(cat /sys/devices/virtual/workqueue/cpumask)"
+  echo "  kerneloops: $(systemctl is-active kerneloops 2>/dev/null || true)"
 }
 
-cmd=${1:-}; shift || true
+cmd=${1:-}
+[[ $# -gt 0 ]] && shift
 while [[ $# -gt 0 ]]; do
   case $1 in
+    -c|--config) CONFIG=$2; shift 2 ;;
     --rt-cpu) RT_CPU=$2; shift 2 ;;
     --irq-cpu) IRQ_CPU=$2; shift 2 ;;
     --ifaces) IFACES=$2; shift 2 ;;
-    --softirq-prio) FIFO_PRIO=$2; shift 2 ;;
+    --softirq-prio) SOFTIRQ_PRIO=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "未知参数 $1" >&2; usage; exit 2 ;;
+    *) echo "未知参数 $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 case $cmd in
@@ -139,5 +191,5 @@ case $cmd in
   revert) revert ;;
   status) status ;;
   -h|--help|"") usage ;;
-  *) echo "未知子命令 $cmd" >&2; usage; exit 2 ;;
+  *) echo "未知子命令 $cmd" >&2; usage >&2; exit 2 ;;
 esac
