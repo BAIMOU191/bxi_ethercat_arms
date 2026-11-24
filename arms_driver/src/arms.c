@@ -1,6 +1,5 @@
 #define _GNU_SOURCE
 #include "arms/arms.h"
-#include "arms/pn.h"
 
 #include <errno.h>
 #include <math.h>
@@ -203,7 +202,6 @@ struct arms {
     atomic_uint brake_held;           /* Pn075 = 2 的关节 */
     atomic_uint brake_known;          /* 最近一次 Pn075 回读有效的关节 */
     _Atomic double offset_rad[ARMS_JOINT_LAST + 1]; /* 管理线程更新，周期线程读取 */
-    arms_mask pn_profile;              /* 启动扫描身份匹配已核实的参数表 */
     arms_mask brake_touched;          /* 本次会话改动过抱闸模式的关节 */
     arms_config cfg;
     arms_options opt;
@@ -1098,8 +1096,6 @@ arms_status arms_open(const arms_options *options, arms_t **out)
                 int jn = r->slot_joint[k];
                 if (pos < found && infos[pos].vendor_id == a->cfg.vendor_id &&
                     infos[pos].product_code == a->cfg.product_code) {
-                    if (infos[pos].vendor_id == KGU_VENDOR_ID && infos[pos].product_code == KGU_PRODUCT_CODE &&
-                        infos[pos].revision == KGU_PN_REVISION) a->pn_profile |= ARMS_MASK_JOINT(jn);
                     r->slot_joint[n] = jn;
                     r->slot_slave[n] = pos;
                     n++;
@@ -1732,32 +1728,50 @@ static arms_status maintenance_ready_ex(arms_t *a, int j, bool confirmed, arms_j
     return ARMS_OK;
 }
 
-arms_status arms_pn_write(arms_t *a, int j, unsigned n, int v, bool confirmed)
+/* 运行中的 MIT 主站拥有这些周期输出及其映射，不允许两个生产者同时写同一状态。
+ * 与 Pn 手册目录无关；其余 SDO 由从站按自己的对象字典和访问属性应答。 */
+static bool owned_by_cycle(uint16_t index, uint8_t sub)
 {
-    const arms_pn_info *p = arms_pn_lookup(n);
-    if (!p) {
-        set_error("Pn%03u 未在本机型手册中定义，不发送写请求", n);
-        return ARMS_E_ARG;
+    if (index == 0x1601 || index == 0x1a01 || index == 0x1c12 || index == 0x1c13) return true;
+    return !sub && (index == 0x6040 || index == 0x6060 || (index >= 0x4010 && index <= 0x4014));
+}
+
+arms_status arms_sdo_write(arms_t *a, int j, uint16_t idx, uint8_t sub, const uint8_t *data,
+                           size_t len, bool confirmed)
+{
+    if (!data || !len) { set_error("SDO 写入需要非空数据"); return ARMS_E_ARG; }
+    if (!sub && (idx == 0x2075 || idx == 0x2097 || idx == 0x2101)) {
+        if (len != 2) { set_error("抱闸/保存/清零动作需要 2 字节"); return ARMS_E_ARG; }
+        unsigned v = kgu_get_u16(data, 0);
+        if (idx == 0x2075) return arms_set_brake(a, j, (arms_brake_mode)v, confirmed);
+        if (v != 1) { set_error("保存/清零只接受写 1 触发，复位由程序完成"); return ARMS_E_ARG; }
+        return arms_service(a, j, idx == 0x2097 ? ARMS_SAVE : ARMS_ZERO_HW, confirmed);
     }
-    if (!arms_pn_accepts(p, v)) {
-        set_error("Pn%03u 不接受值 %d；见 pn help Pn%03u", n, v, n);
-        return ARMS_E_ARG;
-    }
-    if (n == 75) return arms_set_brake(a, j, (arms_brake_mode)v, confirmed);
-    if (n == 97 || n == 101) return arms_service(a, j, n == 97 ? ARMS_SAVE : ARMS_ZERO_HW, confirmed);
     arms_joint_state s;
     arms_bus_stats stats;
     arms_status st = maintenance_read(a, j, confirmed, &s, &stats);
     if (st != ARMS_OK) return st;
-    if (!(a->pn_profile & ARMS_MASK_JOINT(j))) {
-        set_error("关节 %d 身份与本参数表的 KGU EtherCAT 修订不匹配，未写 Pn%03u", j, n);
-        return ARMS_E_STATE;
-    }
     if (stats.tripped || stats.protect.reason != ARMS_PROTECT_NONE || s.error_code || !drive_disabled(&s)) {
-        set_error("关节 %d 未确认失能或有故障/保护，未写 Pn%03u", j, n);
+        set_error("关节 %d 未确认失能或有故障/保护，未写 %04x:%02x", j, idx, sub);
         return ARMS_E_STATE;
     }
-    return verified(a, j, n, (uint16_t)v);
+    if (owned_by_cycle(idx, sub)) {
+        set_error("%04x:%02x 由正在运行的 PDO 循环接管，不并行写入", idx, sub);
+        return ARMS_E_STATE;
+    }
+    /* bus_ops 的同一回调用于上传和下载；下载不会修改调用方的缓冲区。 */
+    return mailbox(a, j, idx, sub, (uint8_t *)data, &len, true);
+}
+
+arms_status arms_pn_write(arms_t *a, int j, unsigned n, int v, bool confirmed)
+{
+    int index = arms_pn_index(n);
+    if (index < 0 || v < INT16_MIN || v > INT16_MAX) {
+        set_error("需要 Pn000..999 和 INT16 原始整数"); return ARMS_E_ARG;
+    }
+    uint8_t data[2];
+    kgu_put_u16(data, 0, (uint16_t)v);
+    return arms_sdo_write(a, j, (uint16_t)index, 0, data, sizeof(data), confirmed);
 }
 
 const char *arms_brake_mode_name(arms_brake_mode m)

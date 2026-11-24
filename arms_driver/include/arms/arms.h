@@ -410,7 +410,12 @@ arms_status arms_service(arms_t *arms, int joint, arms_service_op op, bool confi
 arms_status arms_sdo_read(arms_t *arms, int joint, uint16_t index, uint8_t sub, uint8_t *out, size_t cap,
                           size_t *size);
 
-/** @brief 写入手册参数的原始 INT16 值并回读。普通写要求已失能；Pn075/097/101 走专用流程。 */
+/** @brief 按给定字节下载一个 SDO，不查询手册目录；设备可以返回 SDO abort。
+ * 普通写需在线且失能，不抢写运行中的 PDO；成功指从站接受下载，不代表已回读或掉电保存。
+ * Pn075/097/101（子索引 0）沿用专用动作及反馈检查。 */
+arms_status arms_sdo_write(arms_t *arms, int joint, uint16_t index, uint8_t sub, const uint8_t *data,
+                           size_t size, bool confirmed);
+/** @brief Pn000..999 的 INT16 简写，与 arms_sdo_write 的语义相同。 */
 arms_status arms_pn_write(arms_t *arms, int joint, unsigned number, int value, bool confirmed);
 
 /** @brief Pn 参数号对应的对象字典索引（Pn075 → 0x2075），无效返回 -1 */

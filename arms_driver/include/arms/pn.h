@@ -17,8 +17,9 @@ typedef struct {
 } arms_pn_info;
 const arms_pn_info *arms_pn_catalog(size_t *count);
 const arms_pn_info *arms_pn_lookup(unsigned number);
+/* 元数据查询（兼容已有调用方），不决定设备读写权限。 */
 bool arms_pn_accepts(const arms_pn_info *p, int value);
-/* 仅反解 Pn000..199 的 BCD 地址；不是该字典的对象返回 -1。 */
+/* 反解 Pn000..999 的 BCD 地址；不查询手册目录。 */
 int arms_pn_from_index(unsigned index);
 
 #ifdef __cplusplus

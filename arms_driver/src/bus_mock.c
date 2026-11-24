@@ -20,7 +20,9 @@
 #include "arms/pn.h"
 
 struct bus {
-    uint16_t params[BUS_MAX_SLAVES][0x200];
+    /* 模拟设备自己的对象存储，不以主站 pn list 决定读写权限。 */
+    uint16_t params[BUS_MAX_SLAVES][200], extra_pn[BUS_MAX_SLAVES];
+    uint8_t test_record[BUS_MAX_SLAVES][2][8];
     bool pn075_unreadable, stuck_enabled;
     uint32_t revision;
     int slaves;
@@ -236,29 +238,39 @@ static int mock_sdo(bus_t *b, int slave, uint16_t index, uint8_t sub, uint8_t *d
 {
     if (slave < 0 || slave >= BUS_MAX_SLAVES)
         return -1;
-    if (index == 0x1018 && sub >= 1 && sub <= 4 && !write && *n >= 4) {
-        uint32_t x = sub == 1   ? KGU_VENDOR_ID
-                     : sub == 2 ? KGU_PRODUCT_CODE
-                     : sub == 3 ? b->revision
-                                : (uint32_t)(1 + slave + 16 * b->master);
-        for (unsigned k = 0; k < 4; k++)
-            data[k] = (uint8_t)(x >> (8 * k));
+    if (index == 0x1018 && sub >= 1 && sub <= 4) {
+        if (write) { *abort = 0x06010002; return -1; } /* read only */
+        if (*n < 4) { *abort = 0x06070010; return -1; }
+        uint32_t x = sub == 1 ? KGU_VENDOR_ID : sub == 2 ? KGU_PRODUCT_CODE :
+                     sub == 3 ? b->revision : (uint32_t)(1 + slave + 16 * b->master);
+        for (unsigned k = 0; k < 4; k++) data[k] = (uint8_t)(x >> (8 * k));
         *n = 4;
         return 0;
     }
-    if (!write && index == 0x2075 && b->pn075_unreadable) {
-        *abort = 0x08000000;
-        return -1;
+    /* 仅 mock 用：非 Pn 记录，:1=32 位读写，:2=8 位只写，:3=64 位读写。 */
+    if (index == 0x5ffe) {
+        if (sub < 1 || sub > 3) { *abort = 0x06090011; return -1; }
+        if (sub == 2 && !write) { *abort = 0x06010001; return -1; }
+        size_t width = sub == 1 ? 4 : sub == 2 ? 1 : 8;
+        if (write ? *n != width : *n < width) { *abort = 0x06070010; return -1; }
+        if (sub != 2) {
+            uint8_t *slot = b->test_record[slave][sub == 1 ? 0 : 1];
+            if (write) memcpy(slot, data, width); else memcpy(data, slot, width);
+        }
+        *n = width; return 0;
     }
-    if (sub || !arms_pn_lookup((unsigned)arms_pn_from_index(index)) || (write ? *n != 2 : *n < 2)) {
-        *abort = 0x06020000;
-        return -1;
-    }
-    uint16_t *v = &b->params[slave][index - 0x2000];
-    if (write)
-        *v = kgu_get_u16(data, 0);
-    else
-        kgu_put_u16(data, 0, *v);
+    int number = arms_pn_from_index(index);
+    if (number < 0 || (number >= 200 && number != 345)) { *abort = 0x06020000; return -1; }
+    if (sub) { *abort = 0x06090011; return -1; }
+    if (write ? *n != 2 : *n < 2) { *abort = 0x06070010; return -1; }
+    if (!write && number == 75 && b->pn075_unreadable) { *abort = 0x08000000; return -1; }
+    uint16_t *v = number == 345 ? &b->extra_pn[slave] : &b->params[slave][number];
+    if (write) {
+        uint16_t val = kgu_get_u16(data, 0);
+        /* 示范设备端真实拒绝，而非 CLI 阻止下载。 */
+        if (number == 26 && val > 24) { *abort = 0x06090030; return -1; }
+        *v = val;
+    } else kgu_put_u16(data, 0, *v);
     *n = 2;
     return 0;
 }

@@ -846,25 +846,78 @@ static int cmd_multi_service(int argc, char **argv)
 /* Pn 编号按十进制；对象索引可用 0x 前缀。别名也在同一目录中解析。 */
 static int pn_number(const char *key)
 {
+    const char *digits = !strncasecmp(key, "pn", 2) ? key + 2 : key;
+    if (*digits && strlen(digits) <= 3 && strspn(digits, "0123456789") == strlen(digits))
+        return (int)strtol(digits, NULL, 10);
     size_t count;
     const arms_pn_info *table = arms_pn_catalog(&count);
     for (size_t i = 0; i < count; i++)
         if (table[i].alias && !strcasecmp(key, table[i].alias)) return (int)table[i].number;
-    if (!strncasecmp(key, "pn", 2)) key += 2;
-    if (!*key || strlen(key) > 3 || strspn(key, "0123456789") != strlen(key)) return -1;
-    return (int)strtol(key, NULL, 10);
+    return -1;
 }
 
 static void pn_describe(const arms_pn_info *p)
 {
     printf("Pn%03u  0x%04x:00  %s", p->number, arms_pn_index(p->number), p->name);
     if (p->alias) printf(" [%s]", p->alias);
-    printf("  写值 ");
+    printf("  参考值 ");
     if (p->choices) {
         for (const int *c = p->choices; *c >= 0; c++) printf("%s%d", c == p->choices ? "" : "/", *c);
     } else if (p->min == p->max) printf("%d", p->min);
     else printf("%d..%d", p->min, p->max);
     printf("  %s\n", p->note);
+}
+
+static int hex_digit(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* 不试写、不先读对象猜类型：默认保持原来的 INT16，其他宽度由调用者明确指定。 */
+static bool encode_value(const char *arg, bool typed, uint8_t *out, size_t cap, size_t *len)
+{
+    if (typed && !strncmp(arg, "hex:", 4)) {
+        const char *hex = arg + 4;
+        size_t n = strlen(hex);
+        if (!n || n % 2 || n / 2 > cap) return false;
+        for (size_t i = 0; i < n / 2; ++i) {
+            int hi = hex_digit(hex[2*i]), lo = hex_digit(hex[2*i+1]);
+            if (hi < 0 || lo < 0) return false;
+            out[i] = (uint8_t)((hi << 4) | lo);
+        }
+        *len = n / 2; return true;
+    }
+    unsigned bits = 16;
+    bool sign = true;
+    if (typed && strchr(arg, ':')) {
+        if (*arg != 'u' && *arg != 'i') return false;
+        sign = *arg++ == 'i';
+        if (!strncmp(arg,"8:",2)) { bits = 8; arg += 2; }
+        else if (!strncmp(arg,"16:",3)) arg += 3;
+        else if (!strncmp(arg,"32:",3)) { bits = 32; arg += 3; }
+        else if (!strncmp(arg,"64:",3)) { bits = 64; arg += 3; }
+        else return false;
+    }
+    const char *digits = (*arg == '+' || *arg == '-') ? arg + 1 : arg;
+    int base = !strncasecmp(digits, "0x", 2) ? 16 : 10;
+    uint64_t u; char *end;
+    errno = 0;
+    if (sign) {
+        int64_t v = strtoll(arg, &end, base);
+        if (bits < 64 && (v < -(INT64_C(1) << (bits-1)) || v >= (INT64_C(1) << (bits-1)))) return false;
+        u = (uint64_t)v;
+    } else {
+        if (*arg == '-') return false;
+        u = strtoull(arg, &end, base);
+        if (bits < 64 && u >= (UINT64_C(1) << bits)) return false;
+    }
+    if (errno || end == arg || *end || bits/8 > cap) return false;
+    *len = bits/8;
+    for (size_t i = 0; i < *len; ++i) out[i] = (uint8_t)(u >> (8*i));
+    return true;
 }
 
 static int cmd_parameter(int argc, char **argv)
@@ -896,16 +949,14 @@ static int cmd_parameter(int argc, char **argv)
         if (number < 0) return failed("无效的参数号或别名");
         index = (unsigned)arms_pn_index((unsigned)number);
     }
-    const arms_pn_info *p = number < 0 ? NULL : arms_pn_lookup((unsigned)number);
     if (argc == base) {
-        uint8_t data[64]; size_t n;
+        uint8_t data[4096]; size_t n;
         if (arms_sdo_read(g_arms, j, index, sub, data, sizeof(data), &n) != ARMS_OK) return failed("%s", arms_last_error());
-        if (p && n != 2) return failed("Pn%03d 应为 2 字节，实际 %zu", number, n);
         printf("0x%04x:%02x =", index, sub);
         for (size_t i = 0; i < n; ++i) printf(" %02x", data[i]);
         if (n == 2) {
             int v = data[0] | (data[1] << 8);
-            if (number >= 0 && number < 200 && v >= 32768) v -= 65536;
+            if (number >= 0 && v >= 32768) v -= 65536;
             printf(" (%d)", v);
             if (number == 26) printf("  %d V", v);
             if (number == 82) printf("  %.1f A/N·m", v / 10.0);
@@ -913,23 +964,22 @@ static int cmd_parameter(int argc, char **argv)
         puts("");
         return ok();
     }
-    if (!p) return failed("该对象不是手册定义的可写 Pn；地址 0x%04x:%02x，未发送写请求", index, sub);
-    char *end; const char *arg = argv[base], *digits = (*arg == '+' || *arg == '-') ? arg + 1 : arg;
-    errno = 0;
-    long v = strtol(arg, &end, !strncasecmp(digits, "0x", 2) ? 16 : 10);
-    if (end == arg || *end || errno || v < INT16_MIN || v > INT16_MAX) return failed("需要 INT16 原始整数");
-    if (!arms_pn_accepts(p, (int)v)) { pn_describe(p); return failed("Pn%03d 不接受值 %ld", number, v); }
-    /* 与命名命令完全相同（包含动态指令取消、维护联锁及操作结果提示）。 */
-    if (number == 75) {
-        char *av[] = {"brake", argv[1], (char *)arms_brake_mode_name((arms_brake_mode)v)};
+    uint8_t payload[256]; size_t len;
+    if (!encode_value(argv[base], sdo, payload, sizeof(payload), &len))
+        return failed(sdo ? "SDO 值编码无效；用整数、i/u 位宽前缀或 hex:字节串" : "需要 INT16 原始整数");
+    unsigned word = len == 2 ? payload[0] | ((unsigned)payload[1] << 8) : UINT_MAX;
+    if (number == 75 && word <= 2) {
+        char *av[] = {"brake", argv[1], (char *)arms_brake_mode_name((arms_brake_mode)word)};
         return cmd_brake(3, av);
     }
-    if (number == 97 || number == 101) {
+    if ((number == 97 || number == 101) && word == 1) {
         char *av[] = {number == 97 ? "pn_save" : "zero", argv[1], "--hw"};
         return cmd_multi_service(number == 97 ? 2 : 3, av);
     }
-    if (arms_pn_write(g_arms, j, p->number, (int)v, true) != ARMS_OK) return failed("%s", arms_last_error());
-    printf("%d Pn%03d %s = %ld，已回读；%s\n", j, number, p->name, v, p->note);
+    arms_status st = sdo ? arms_sdo_write(g_arms, j, index, sub, payload, len, true)
+                         : arms_pn_write(g_arms, j, (unsigned)number, (int)word - (word >= 32768 ? 65536 : 0), true);
+    if (st != ARMS_OK) return failed("%s", arms_last_error());
+    printf("%d 0x%04x:%02x 驱动器已接受 %zu 字节写入（未回读）\n", j, index, sub, len);
     return ok();
 }
 
@@ -1061,11 +1111,11 @@ static const command commands[] = {
      "  先支撑负载。对选中关节按需失能，确认静止后发送 Pn097，不重新使能。\n"
      "  不检查或更改 Pn075；强制松闸时不能依靠抱闸承重。持久化结果须重新上电后验读。",
      "  pn_save 21\n  pn_save all", cmd_multi_service},
-    {"pn", "维护", "<关节> <编号|别名> [值] | list | help <编号|别名>", 1, 3, "读写手册参数或查询参数表",
-     "普通写要求失能并回读，不自动保存。Pn075/097/101 走 brake/pn_save/zero --hw 流程。",
+    {"pn", "维护", "<关节> <编号|别名> [值] | list | help <编号|别名>", 1, 3, "按编号读写；list 仅列手册参考项",
+     "普通写要求失能，不自动回读或保存。Pn075/097/101 走 brake/pn_save/zero --hw 流程。",
      "  pn list\n  pn help brake_voltage\n  pn 15 Pn026", cmd_parameter},
-    {"sdo", "维护", "<关节> <索引> <子索引> [值]", 3, 4, "读对象字典；Pn 写与 pn 共用处理流程",
-     "非 Pn 或非零子索引只读；Pn 值为有符号 16 位原始整数。", "  sdo 15 0x2026 0", cmd_parameter},
+    {"sdo", "维护", "<关节> <索引> <子索引> [值]", 3, 4, "按索引及子索引读写对象字典",
+     "写值默认 i16；可用 i8/u8/i16/u16/i32/u32/i64/u64:值 或 hex:小端字节串。", "  sdo 15 0x2026 0", cmd_parameter},
     {"brake_voltage", "维护", "<关节> [伏]", 1, 2, "Pn026：制动器保持电压，不切换抱闸",
      "等价于 pn <关节> Pn026 [值]。", "  brake_voltage 15", cmd_parameter},
     {"torque_scale", "维护", "<关节> [原始值]", 1, 2, "Pn082：转矩系数，10 表示 1 A/N·m",

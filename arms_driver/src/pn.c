@@ -79,6 +79,6 @@ bool arms_pn_accepts(const arms_pn_info *p, int v)
 }
 int arms_pn_from_index(unsigned index)
 {
-    if (index < 0x2000 || index > 0x2199 || (index & 15) > 9 || ((index >> 4) & 15) > 9) return -1;
-    return (int)(((index >> 8) & 1) * 100 + ((index >> 4) & 15) * 10 + (index & 15));
+    if (index < 0x2000 || index > 0x2999 || (index & 15) > 9 || ((index >> 4) & 15) > 9) return -1;
+    return (int)(((index >> 8) & 15) * 100 + ((index >> 4) & 15) * 10 + (index & 15));
 }
