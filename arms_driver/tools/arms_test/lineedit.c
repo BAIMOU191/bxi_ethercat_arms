@@ -112,7 +112,81 @@ static int plain_readline(const char *prompt, char *buf, size_t size, int stop_f
     return LE_OK;
 }
 
-int le_readline(const char *prompt, char *buf, size_t size, int stop_fd)
+void le_add_choice(le_choices *out, const char *word)
+{
+    if (!word || !*word || out->count >= sizeof(out->words) / sizeof(out->words[0]) ||
+        strlen(word) >= sizeof(out->words[0])) return;
+    strcpy(out->words[out->count++], word);
+}
+
+static void tab_complete(char *buf, size_t cap, size_t *len, size_t *pos, le_complete_fn complete)
+{
+    if (!complete) return;
+    size_t word = *pos, start, end = *pos, argc = 0;
+    while (word && buf[word - 1] != ' ' && buf[word - 1] != '\t') --word;
+    char before[512], *save = NULL;
+    const char *argv[16];
+    if (word >= sizeof(before)) return;
+    memcpy(before, buf, word);
+    before[word] = '\0';
+    for (char *p = strtok_r(before, " \t", &save); p; p = strtok_r(NULL, " \t", &save)) {
+        if (argc == sizeof(argv) / sizeof(argv[0])) return;
+        argv[argc++] = p;
+    }
+    le_choices candidates = {0};
+    complete(argc, argv, &candidates);
+    start = word;
+    if (candidates.joint_list) {
+        for (size_t i = word; i < *pos; ++i) if (buf[i] == ',') start = i + 1;
+    }
+    while (end < *len && buf[end] != ' ' && buf[end] != '\t' && !(candidates.joint_list && buf[end] == ',')) ++end;
+    /* 逗号列表的后续分量只能是关节选择，不补全 --help 或 --raw。 */
+    if (start != word) {
+        size_t kept = 0;
+        for (size_t i = 0; i < candidates.count; ++i) {
+            if (candidates.words[i][0] == '-') continue;
+            if (kept != i) strcpy(candidates.words[kept], candidates.words[i]);
+            ++kept;
+        }
+        candidates.count = kept;
+    }
+    size_t typed = *pos - start, common = 0, matches = 0;
+    const char *first = NULL;
+    for (size_t i = 0; i < candidates.count; ++i) {
+        const char *w = candidates.words[i];
+        if (strncmp(buf + start, w, typed)) continue;
+        if (!matches++) { first = w; common = strlen(w); }
+        else {
+            size_t n = typed;
+            while (n < common && first[n] == w[n]) ++n;
+            common = n;
+        }
+    }
+    if (!matches) { out_cstr("\a"); return; }
+    if (matches > 1 && common == typed) {
+        out_cstr("\r\n");
+        for (size_t i = 0; i < candidates.count; ++i)
+            if (!strncmp(buf + start, candidates.words[i], typed)) {
+                out_cstr(candidates.words[i]);
+                out_cstr("  ");
+            }
+        out_cstr("\r\n");
+        return;
+    }
+    /* 唯一匹配替换当前词，保留右侧其他参数；有歧义时不覆盖光标右侧已输入的词尾。 */
+    if (matches > 1 && end != *pos) return;
+    bool space = matches == 1 && end == *len;
+    size_t new_pos = start + common + space;
+    if (new_pos + (*len - end) >= cap) return;
+    memmove(buf + new_pos, buf + end, *len - end + 1);
+    memcpy(buf + start, first, common);
+    if (space) buf[start + common] = ' ';
+    *len = new_pos + (*len - end);
+    *pos = new_pos;
+    if (*pos < *len && buf[*pos] == ' ' && matches == 1) ++*pos;
+}
+
+int le_readline(const char *prompt, char *buf, size_t size, int stop_fd, le_complete_fn complete)
 {
     struct termios orig, raw;
     size_t len = 0, pos = 0;
@@ -144,7 +218,9 @@ int le_readline(const char *prompt, char *buf, size_t size, int stop_fd)
             break;
         }
         if (c == '\r' || c == '\n') break;
-        if (c == 4) { /* Ctrl+D */
+        if (c == '\t') {
+            tab_complete(buf, size, &len, &pos, complete);
+        } else if (c == 4) { /* Ctrl+D */
             if (len == 0) {
                 rc = LE_EOF;
                 break;

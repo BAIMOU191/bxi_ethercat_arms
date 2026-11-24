@@ -1517,10 +1517,10 @@ static bool brake_abnormal(arms_t *a, arms_mask mask, const char *what)
     arms_mask held = atomic_load(&a->brake_held) & mask;
     if (!rel && !held) return false;
     if (rel)
-        set_error("%s被拒绝: 关节 %d 处于强制松闸，先执行 brake %d normal --confirm", what, __builtin_ctz(rel),
+        set_error("%s被拒绝: 关节 %d 处于强制松闸，先执行 brake %d normal", what, __builtin_ctz(rel),
                   __builtin_ctz(rel));
     else
-        set_error("%s被拒绝: 关节 %d 处于强制抱闸，先执行 brake %d normal --confirm", what, __builtin_ctz(held),
+        set_error("%s被拒绝: 关节 %d 处于强制抱闸，先执行 brake %d normal", what, __builtin_ctz(held),
                   __builtin_ctz(held));
     return true;
 }
@@ -1685,29 +1685,43 @@ static arms_status verified(arms_t *a, int j, unsigned n, uint16_t value)
     }
     return ARMS_OK;
 }
-/* 维护操作前置条件：已确认、该关节所在臂通信正常；need_disabled 时还要求该关节驱动器失能 */
-static arms_status maintenance_ready_ex(arms_t *a, int j, bool confirmed, arms_joint_state *s, bool need_disabled)
+/* 从同一周期的快照取得状态与通信统计，不把失能请求当作驱动器反馈。 */
+static arms_status maintenance_read(arms_t *a, int j, bool confirmed, arms_joint_state *s, arms_bus_stats *stats)
 {
-    arms_bus_stats stats;
-    const arms_arm_stats *as;
     if (!a || !confirmed) {
-        set_error("维护操作需要明确确认（--confirm）");
+        set_error("维护接口需要调用方明确授权");
         return ARMS_E_STATE;
     }
-    if (j < ARMS_JOINT_FIRST || j > ARMS_JOINT_LAST || !(a->joints & ARMS_MASK_JOINT(j)) ||
-        arms_read_joint(a, j, s) != ARMS_OK) {
+    if (j < ARMS_JOINT_FIRST || j > ARMS_JOINT_LAST || !(a->joints & ARMS_MASK_JOINT(j))) {
         set_error("关节 %d 未打开", j);
         return ARMS_E_ARG;
     }
-    arms_get_stats(a, &stats);
-    as = &stats.arm[a->cfg.joint[j].arm];
-    if ((s->al_state & 0x0F) != 0x08 || as->comm_failed || !s->sample_ns ||
-        mono_ns() - s->sample_ns > 50000000ull) {
+    shared_snapshot snap;
+    read_snapshot(a, &snap);
+    *s = snap.s[j];
+    apply_brake_mode(a, s);
+    *stats = snap.stats;
+    const arms_arm_stats *as = &stats->arm[a->cfg.joint[j].arm];
+    if (s->al_state != 0x08 || !as->link_up || as->comm_failed || as->wkc_last != as->wkc_expected ||
+        !s->sample_ns || mono_ns() - s->sample_ns > 50000000ull) {
         set_error("关节 %d 不在线或反馈过期", j);
         return ARMS_E_STATE;
     }
-    if (need_disabled && ((s->mode != ARMS_JS_LOCKED && s->mode != ARMS_JS_RELEASED && s->mode != ARMS_JS_HELD) ||
-                          (s->status_word & 0x006f) != 0x0040)) {
+    return ARMS_OK;
+}
+
+static bool drive_disabled(const arms_joint_state *s)
+{
+    return (s->mode == ARMS_JS_LOCKED || s->mode == ARMS_JS_RELEASED || s->mode == ARMS_JS_HELD) &&
+           (s->status_word & 0x006f) == 0x0040;
+}
+
+static arms_status maintenance_ready_ex(arms_t *a, int j, bool confirmed, arms_joint_state *s, bool need_disabled)
+{
+    arms_bus_stats stats;
+    arms_status st = maintenance_read(a, j, confirmed, s, &stats);
+    if (st != ARMS_OK) return st;
+    if (need_disabled && !drive_disabled(s)) {
         set_error("关节 %d 未失能（当前 %s），先执行 disable", j, arms_joint_mode_name(s->mode));
         return ARMS_E_STATE;
     }
@@ -1827,10 +1841,50 @@ static double zero_value(const arms_t *a, int j, const arms_joint_state *s)
     return a->cfg.joint[j].direction * (double)kgu_get_f32(s->txpdo, KGU_IN_POS);
 }
 
+/* 校零不重新使能。以新 PDO 反馈验证失能和连续静止，而非固定延时后直接写入。 */
+static arms_status zero_ready(arms_t *a, int j, bool confirmed, arms_joint_state *s)
+{
+    const uint64_t deadline = mono_ns() + 1000000000ull;
+    uint64_t quiet_since = 0;
+    bool requested = false;
+    do {
+        arms_bus_stats stats;
+        arms_status st = maintenance_read(a, j, confirmed, s, &stats);
+        if (st != ARMS_OK) return st;
+        if (stats.tripped || stats.protect.reason != ARMS_PROTECT_NONE || s->error_code ||
+            s->mode == ARMS_JS_FAULT || !isfinite(s->position) || !isfinite(s->velocity)) {
+            set_error("关节 %d 故障、保护锁定或反馈无效，未校零", j);
+            return ARMS_E_STATE;
+        }
+        if (drive_disabled(s)) {
+            if (fabs(s->velocity) <= 0.01) {
+                if (!quiet_since) quiet_since = s->sample_ns;
+                if (s->sample_ns - quiet_since >= 50000000ull) return ARMS_OK;
+            } else quiet_since = 0;
+        } else {
+            quiet_since = 0;
+            if (!requested) {
+                if (s->mode != ARMS_JS_ENABLED) {
+                    set_error("关节 %d 状态字 0x%04x 不允许校零", j, s->status_word);
+                    return ARMS_E_STATE;
+                }
+                st = arms_disable(a, ARMS_MASK_JOINT(j));
+                if (st != ARMS_OK) return st;
+                requested = true;
+            }
+        }
+        usleep(2000);
+    } while (mono_ns() < deadline);
+    set_error("关节 %d 在 1 秒内未确认失能并静止，未校零（状态字 0x%04x，速度 %.4f rad/s）",
+              j, s->status_word, s->velocity);
+    return ARMS_E_TIMEOUT;
+}
+
 arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
 {
     arms_joint_state s;
-    arms_status st = maintenance_ready(a, j, confirmed, &s);
+    bool zero = op == ARMS_ZERO_SOFT || op == ARMS_ZERO_HW;
+    arms_status st = zero ? zero_ready(a, j, confirmed, &s) : maintenance_ready(a, j, confirmed, &s);
     if (st != ARMS_OK)
         return st;
     uint8_t data[2];
@@ -1838,10 +1892,6 @@ arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
     switch (op) {
     case ARMS_ZERO_SOFT: {
         double off = zero_value(a, j, &s);
-        if (fabs(s.velocity) > 0.01) {
-            set_error("关节 %d 未静止（速度 %.4f rad/s）", j, s.velocity);
-            return ARMS_E_STATE;
-        }
         if (!arms_store_offset(a->cfg.path, j, off)) {
             set_error("无法把关节 %d 的 offset_rad 写入 %s", j, a->cfg.path);
             return ARMS_E_SYSTEM;

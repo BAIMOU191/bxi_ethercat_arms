@@ -31,31 +31,43 @@ with tempfile.TemporaryDirectory() as tmp:
                  'normal  (Pn075=0'):
         assert word in out, word
     # release / lock 已由 brake 取代
-    run('release 21 --confirm', ok=False)
-    # 修改抱闸模式须带 --confirm
-    run('brake 21 release', ok=False)
+    run('release 21', ok=False)
+    run('brake 21 unknown', ok=False)
     # 任意关节组合，三种模式
-    out = run('brake 21 release --confirm', 'brake left 1 --confirm', 'status 15', 'brake all normal --confirm',
-              'brake right hold --confirm', 'status 22', 'brake all 0 --confirm', 'enable 15')
+    out = run('brake 21 release', 'brake left 1', 'status 15', 'brake all normal',
+              'brake right hold', 'status 22', 'brake all 0', 'enable 15')
     assert 'released' in out and 'held' in out, out
     # 非 normal 期间拒绝使能和零力矩拖动
-    run('brake 21 release --confirm', 'enable 22', ok=False)
-    run('brake 21 hold --confirm', 'free 22', ok=False)
+    run('brake 21 release', 'enable 22', ok=False)
+    run('brake 21 hold', 'free 22', ok=False)
     # 使能中的关节拒绝强制松闸
-    run('enable 21', 'brake 21 release --confirm', ok=False)
+    run('enable 21', 'brake 21 release', ok=False)
     # 零力矩拖动：kp = 0；kd 不超过上限
     out = run('free 21 0.2', 'status 21')
     row = next(l.split() for l in out.splitlines() if l.startswith('21 ') and 'L/6' in l)
     assert row[3] == 'enabled' and float(row[11]) == 0.0 and abs(float(row[12]) - 0.2) < 1e-9, row
     run('free 21 99', ok=False)
     # 参数读写、保存、硬件校零
-    out = run('pn 21 Pn075', 'pn 21 028 12 --confirm', 'pn 21 28', 'sdo 21 0x2028 0',
-              'pn_save all --confirm', 'zero 21 --hw --confirm')
+    out = run('pn 21 Pn075', 'pn 21 028 12', 'pn 21 28', 'sdo 21 0x2028 0',
+              'pn_save all', 'zero 21 --hw')
     assert '(12)' in out, out
-    run('sdo 21 0x6040 0 15 --confirm', ok=False)
+    assert '(13)' in run('sdo 21 0x2028 0 13', 'pn 21 28')
+    run('zero 21 --bad', ok=False)
+    run('enable 21', 'pn_save 21', ok=False)
+    run('brake 21 hold', 'zero 21 --hw', ok=False)
+    # 无失能反馈时不能校零或改文件；正常的硬件校零则按需失能。
+    before = config.read_bytes()
+    for cmd in ('zero 21', 'zero 21 --hw'):
+        result = run('free 21', cmd, env={'ARMS_MOCK_STUCK_ENABLED': '1'}, ok=False)
+        assert '未确认失能并静止' in result, result
+    assert config.read_bytes() == before
+    result = run('free 21', 'zero 21 --hw', 'status 21')
+    assert any(l.startswith('21 ') and 'locked' in l for l in result.splitlines()), result
+    run('sdo 21 0x6040 0 15', ok=False)
     # 软件校零：立即生效，只改动该关节的 offset_rad，保留其余文本
     before = config.read_text()
-    out = run('status 21', 'zero 21 --confirm', 'status 21')
+    out = run('free 21', 'zero 21', 'status 21')
+    assert any(l.startswith('21 ') and 'locked' in l for l in out.splitlines()), out
     assert abs(pos(out, 21)) < 1e-3, out
     after = config.read_text()
     diff = [(a, b) for a, b in zip(before.splitlines(), after.splitlines()) if a != b]
@@ -64,7 +76,10 @@ with tempfile.TemporaryDirectory() as tmp:
     out = run('status 21')
     assert abs(pos(out, 21)) < 1e-3, out
     # 多关节校零
-    run('zero left --confirm')
+    mixed = run('free 15,22', 'zero left', 'status 15,22')
+    assert any(l.startswith('15 ') and 'locked' in l for l in mixed.splitlines()), mixed
+    assert any(l.startswith('22 ') and 'enabled' in l for l in mixed.splitlines()), mixed
+    run('free 21', 'disable 21', 'zero 21')
     data = json.loads(config.read_text())
     assert all(j['offset_rad'] != 0.0 for j in data['joints'] if 15 <= j['joint'] <= 21), data
     # 字段顺序不影响校零，也不允许误改嵌套元数据或相邻关节。
@@ -73,13 +88,13 @@ with tempfile.TemporaryDirectory() as tmp:
     joint['metadata'] = {'joint': 21, 'offset_rad': 17.5}
     joint['joint'] = joint.pop('joint')  # joint 位于对象末尾
     config.write_text(json.dumps(data, indent=2))
-    run('zero 21 --confirm')
+    run('zero 21')
     joint['offset_rad'] = 0.7
     assert json.loads(config.read_text()) == data
     joint['joint'] = joint.pop('joint')  # offset_rad 在 joint 之前
     joint['offset_rad'] = -0.25
     config.write_text(json.dumps(data, indent=2))
-    run('zero 21 --confirm')
+    run('zero 21')
     joint['offset_rad'] = 0.7
     assert json.loads(config.read_text()) == data
     # SIGTERM 不能退回提示符，即便标准输入保持打开、命令只输入一半。
@@ -102,7 +117,7 @@ with tempfile.TemporaryDirectory() as tmp:
                 proc.kill()
     out = run('watch 21')
     assert 'l_wrist_z_joint' in out and '\x1b[' not in out, out
-    for cmd in ('enable 21', 'free 21', 'pn_save 21 --confirm', 'zero 21 --hw --confirm'):
+    for cmd in ('enable 21', 'free 21', 'pn_save 21', 'zero 21 --hw'):
         run(cmd, env={'ARMS_MOCK_PN075_UNREADABLE': '1'}, ok=False)
     # 修改副本中的安全字段类型时，启动必须报配置错误，而不能沿用默认值。
     valid = config.read_text()

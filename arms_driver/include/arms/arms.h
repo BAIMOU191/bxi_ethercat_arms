@@ -403,7 +403,7 @@ typedef enum {
     ARMS_SAVE,      /**< Pn097 参数保存脉冲；要求关节失能，且全部关节抱闸为正常模式 */
 } arms_service_op;
 
-/** @brief 执行维护操作（单个关节；多个关节由调用方逐个调用） */
+/** @brief 执行维护操作（单个关节；多个关节由调用方逐个调用）。两种校零会按需失能并等待静止，不重新使能；保存不会自动失能。 */
 arms_status arms_service(arms_t *arms, int joint, arms_service_op op, bool confirmed);
 
 /** @brief 读取对象字典 */

@@ -7,6 +7,7 @@
  *   ARMS_MOCK_DROP_PPM=<ppm>   每周期 WKC 为 0 的概率（故障注入）
  *   ARMS_MOCK_FAULT_CYCLE=<n>  第 n 周期后，主站 0 链上位置 0 的从站在使能状态下报故障
  *   ARMS_MOCK_OVERSPEED_CYCLE=<n> 第 n 周期后，主站 0 链上位置 0 的从站在使能状态下反馈速度 10 rad/s
+ *   ARMS_MOCK_STUCK_ENABLED=1    模拟已使能的驱动器不响应失能请求
  *   ARMS_MOCK_PN075_UNREADABLE=1  模拟抱闸参数读取失败
  *   ARMS_MOCK_POWER_OFF=<s>,<n> 主站 0 从第 s 周期起掉电 n 个周期，恢复后从站报同步丢失故障
  */
@@ -19,7 +20,7 @@
 
 struct bus {
     uint16_t params[BUS_MAX_SLAVES][0x200];
-    bool pn075_unreadable;
+    bool pn075_unreadable, stuck_enabled;
     int slaves;
     int configured;
     float cycle_hz;
@@ -53,6 +54,8 @@ static int mock_open(bus_t **out, const bus_open_params *p, char *err, size_t er
         snprintf(err, err_size, "内存不足");
         return -1;
     }
+    s = getenv("ARMS_MOCK_STUCK_ENABLED");
+    b->stuck_enabled = s && !strcmp(s, "1");
     s = getenv("ARMS_MOCK_PN075_UNREADABLE");
     b->pn075_unreadable = s && !strcmp(s, "1");
     b->cycle_hz = 1e9f / (float)p->cycle_ns;
@@ -151,6 +154,7 @@ static uint16_t mock_drive(bus_t *b, int i, uint16_t cw)
         b->sw[i] = 0x0218u;
         return b->sw[i];
     }
+    if (b->stuck_enabled && st == 0x0027u && cw == KGU_CW_DISABLE) return b->sw[i];
     switch (cw & 0x008Fu) {
     case 0x0006u: b->sw[i] = 0x0231u; break;
     case 0x0007u: if (st == 0x0021u || st == 0x0023u || st == 0x0027u) b->sw[i] = 0x0233u; break;

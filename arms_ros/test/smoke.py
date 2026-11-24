@@ -1,5 +1,5 @@
 """Run after sourcing the built overlay; launches an isolated mock node, never hardware."""
-import os, signal, subprocess, sys, tempfile, time
+import os, shutil, signal, subprocess, sys, tempfile, time
 from pathlib import Path
 os.environ.update(ROS_LOCALHOST_ONLY='1', ROS_DOMAIN_ID='197', ROS2CLI_NO_DAEMON='1')
 import rclpy
@@ -25,7 +25,10 @@ def call(name,confirm=False,joint=21):
     q=JointOperation.Request();q.joints=1<<joint;q.confirm=confirm
     f=cli.call_async(q);until(f.done);r=f.result();test.destroy_client(cli);return r
 try:
-    cmd=['ros2','run','arms_ros','arms_node','--ros-args','-r','__ns:='+ns,'-p','mock:=true','-p','config:='+str(Path(sys.argv[1]).resolve())]
+    config_dir = tempfile.TemporaryDirectory()
+    config = Path(config_dir.name) / 'arms.json'
+    shutil.copyfile(sys.argv[1], config)
+    cmd=['ros2','run','arms_ros','arms_node','--ros-args','-r','__ns:='+ns,'-p','mock:=true','-p','config:='+str(config)]
     proc=subprocess.Popen(cmd,start_new_session=True, env=dict(os.environ, ARMS_MOCK_FAULT_CYCLE="1"))
     try:
         until(lambda:len(seen)==3);assert len(seen['joint_states'].name)==14
@@ -39,6 +42,10 @@ try:
         assert not call('enable',True).success
         assert call('brake_normal',True).success
         # 零力矩拖动会使能关节
+        assert call('free',True).success
+        # free 后校零与已失能后校零共用驱动路径；ROS 的授权字段保持兼容。
+        assert not call('zero').success
+        assert call('zero',True).success and call('zero',True).success
         assert call('free',True).success
         # 使能中拒绝强制松闸
         assert not call('brake_release',True).success
@@ -58,6 +65,7 @@ try:
     finally:
         if proc.poll() is None: os.killpg(proc.pid,signal.SIGINT)
         proc.wait(timeout=15)
+        config_dir.cleanup()
 finally:
     test.destroy_node();rclpy.shutdown()
 print('PASS: ROS feedback, diagnostics, validated commands, explicit enable and brake interlocks')
