@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
 # rt_setup.sh - prepare (and undo) the realtime environment for arms_test / arms_node.
 #
-#   sudo scripts/rt_setup.sh apply  [--rt-cpu 5] [--irq-cpu 5] [--ifaces eth0,eth1]
+#   sudo scripts/rt_setup.sh apply  [--rt-cpu 5] [--irq-cpu 5] [--ifaces eth0,eth1] [--softirq-prio 70]
 #   sudo scripts/rt_setup.sh revert
 #   scripts/rt_setup.sh status
 #
 # apply:  EtherCAT NIC IRQs -> irq_cpu, ksoftirqd/<irq_cpu> -> SCHED_FIFO 80,
+#         (ksoftirqd stays below the 80 of the control thread),
 #         every other task and the unbound workqueues -> off rt_cpu/irq_cpu,
 #         cpufreq governor of those CPUs -> performance, kerneloops stopped.
 # revert: restores everything recorded in the state file.
 # These are runtime settings only; a reboot also restores the defaults.
 set -euo pipefail
+export LC_ALL=C   # taskset/chrt output is parsed below; the Chinese locale uses full-width colons
 
 STATE=/run/arms_rt_setup.state
 RT_CPU=5
 IRQ_CPU=5
 IFACES="eth0,eth1"
-FIFO_PRIO=80
+# ksoftirqd runs below the control thread (80): packet processing never delays a
+# cycle that is already running, and the control thread never waits for it.
+FIFO_PRIO=70
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
 
 need_root() { [[ $EUID -eq 0 ]] || { echo "需要 root：sudo $0 $*" >&2; exit 1; }; }
 
@@ -125,6 +129,7 @@ while [[ $# -gt 0 ]]; do
     --rt-cpu) RT_CPU=$2; shift 2 ;;
     --irq-cpu) IRQ_CPU=$2; shift 2 ;;
     --ifaces) IFACES=$2; shift 2 ;;
+    --softirq-prio) FIFO_PRIO=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数 $1" >&2; usage; exit 2 ;;
   esac
