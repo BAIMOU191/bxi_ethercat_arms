@@ -1034,6 +1034,10 @@ arms_status arms_open(const arms_options *options, arms_t **out)
             if (scan_rc == 0) {
                 logf_(a, "%s 臂: 总线稳定，发现 %d 个从站（预期 %d），用时 %.2f s", arms_arm_name(i), found, expected,
                       (double)(mono_ns() - t0) / 1e9);
+            } else if (strstr(err, "无法占用")) {
+                set_error("%s 臂: %s", arms_arm_name(i), err);
+                st = ARMS_E_MASTER;
+                goto fail;
             } else if (check || strstr(err, "DOWN")) {
                 set_error("%s 臂: %s", arms_arm_name(i), err);
                 st = strstr(err, "DOWN") ? ARMS_E_LINK : ARMS_E_TOPOLOGY;

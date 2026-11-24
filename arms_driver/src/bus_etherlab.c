@@ -120,11 +120,13 @@ static int el_open(bus_t **out, const bus_open_params *p, char *err, size_t err_
         snprintf(err, err_size, "内存不足");
         return -1;
     }
-    b->master = ecrt_request_master((unsigned int)index);
+    /*
+     * 只打开、不占用：主站保持空闲阶段，后台线程持续扫描，上电后陆续启动的从站才能被发现。
+     * 占用（ecrt_master_reserve）推迟到 scan 确认总线稳定之后。
+     */
+    b->master = ecrt_open_master((unsigned int)index);
     if (!b->master) {
-        snprintf(err, err_size,
-                 "无法获取主站 %d（%s）：可能已被 motor_console、hw_lib_test_* 或 ROS 节点占用，或权限不足（需要 sudo）",
-                 index, p->interface);
+        snprintf(err, err_size, "无法打开主站 %d（%s）：EtherLab 未启动或权限不足（需要 sudo）", index, p->interface);
         free(b);
         return -1;
     }
@@ -135,6 +137,18 @@ static int el_open(bus_t **out, const bus_open_params *p, char *err, size_t err_
     b->vendor_id = p->vendor_id;
     b->product_code = p->product_code;
     *out = b;
+    return 0;
+}
+
+/* 总线稳定后占用主站；占用后主站进入运行阶段，不再自动扫描 */
+static int reserve(bus_t *b, char *err, size_t err_size)
+{
+    if (ecrt_master_reserve(b->master) != 0) {
+        snprintf(err, err_size,
+                 "无法占用主站 %d（%s）：可能已被 motor_console、hw_lib_test_* 或 ROS 节点占用",
+                 b->master_index, b->interface);
+        return -1;
+    }
     return 0;
 }
 
@@ -176,7 +190,7 @@ static int el_scan(bus_t *b, bus_slave_info *infos, int max, int expected, int *
                 }
                 if (n >= expected && now - stable_since >= (uint64_t)BUS_SETTLE_MS * 1000000ull) {
                     *count = n;
-                    return 0;
+                    return reserve(b, err, err_size);
                 }
             } else {
                 last = -1;
@@ -189,7 +203,7 @@ static int el_scan(bus_t *b, bus_slave_info *infos, int max, int expected, int *
     if (last > 0) {
         /* 超时仍不足预期：返回当前结果，由调用方的启动检查给出缺失的关节 */
         *count = last;
-        return 0;
+        return reserve(b, err, err_size);
     }
     memset(&ms, 0, sizeof(ms));
     ecrt_master_state(b->master, &ms);
