@@ -53,13 +53,22 @@ with tempfile.TemporaryDirectory() as tmp:
     assert '(12)' in out, out
     assert '(13)' in run('sdo 21 0x2028 0 13', 'pn 21 28')
     run('zero 21 --bad', ok=False)
-    run('enable 21', 'pn_save 21', ok=False)
+    # 同批包含已失能且强制松闸的 20、正在使能的 21；未选中的 22 不能被失能。
+    before_save = config.read_bytes()
+    result = run('enable 21,22', 'brake 20 release', 'pn_save 20,21', 'status 20,21,22',
+                 'brake 20 hold', 'pn_save 20', 'brake 20')
+    states = {p[0]: p[3] for p in (line.split() for line in result.splitlines())
+              if len(p) >= 4 and p[2] in ('L/5', 'L/6', 'R/0')}
+    assert states == {'20': 'released', '21': 'locked', '22': 'enabled'}, result
+    assert result.count('已发送参数保存脉冲并回读（Pn097）') == 3 and 'hold    (Pn075=2' in result, result
+    run('free 21', 'disable 21', 'pn_save 21')
+    assert config.read_bytes() == before_save
     run('brake 21 hold', 'zero 21 --hw', ok=False)
     # 无失能反馈时不能校零或改文件；正常的硬件校零则按需失能。
     before = config.read_bytes()
-    for cmd in ('zero 21', 'zero 21 --hw'):
+    for cmd in ('zero 21', 'zero 21 --hw', 'pn_save 21'):
         result = run('free 21', cmd, env={'ARMS_MOCK_STUCK_ENABLED': '1'}, ok=False)
-        assert '未确认失能并静止' in result, result
+        assert '未确认失能并静止' in result and '已发送参数保存脉冲' not in result, result
     assert config.read_bytes() == before
     result = run('free 21', 'zero 21 --hw', 'status 21')
     assert any(l.startswith('21 ') and 'locked' in l for l in result.splitlines()), result
@@ -117,7 +126,8 @@ with tempfile.TemporaryDirectory() as tmp:
                 proc.kill()
     out = run('watch 21')
     assert 'l_wrist_z_joint' in out and '\x1b[' not in out, out
-    for cmd in ('enable 21', 'free 21', 'pn_save 21', 'zero 21 --hw'):
+    run('pn_save 21', env={'ARMS_MOCK_PN075_UNREADABLE': '1'})
+    for cmd in ('enable 21', 'free 21', 'zero 21 --hw'):
         run(cmd, env={'ARMS_MOCK_PN075_UNREADABLE': '1'}, ok=False)
     # 修改副本中的安全字段类型时，启动必须报配置错误，而不能沿用默认值。
     valid = config.read_text()

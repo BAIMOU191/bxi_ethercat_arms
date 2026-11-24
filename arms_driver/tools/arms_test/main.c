@@ -818,7 +818,7 @@ static int cmd_multi_service(int argc, char **argv)
     int j, failures = 0;
     if (need_session() || selection(argv[1], &m)) return -2;
     if (argc > 2 && !hw) return bad_args("zero 只接受可选参数 --hw");
-    if (zero) motion_cancel_refresh(m);
+    motion_cancel_refresh(m);
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_service_op op = !zero ? ARMS_SAVE : hw ? ARMS_ZERO_HW : ARMS_ZERO_SOFT;
         if (!(m & ARMS_MASK_JOINT(j))) continue;
@@ -834,7 +834,7 @@ static int cmd_multi_service(int argc, char **argv)
                    q.offset_rad);
         } else {
             printf("%d %-20s %s\n", j, arms_joint_name(g_arms, j),
-                   op == ARMS_ZERO_HW ? "已发出硬件清零脉冲（Pn101），重新上电后生效" : "参数已保存（Pn097）");
+                   op == ARMS_ZERO_HW ? "已发出硬件清零脉冲（Pn101），重新上电后生效" : "已发送参数保存脉冲并回读（Pn097）");
         }
     }
     if (hw && failures < __builtin_popcount(m))
@@ -992,8 +992,8 @@ static const command commands[] = {
      "  normal  (0) 正常控制：使能时松闸，失能时抱闸。任何状态都可设置。\n"
      "  release (1) 强制松闸：失能时抱闸不再提供保持；驱动器失能时电机阻尼很大，仍难以用手转动。\n"
      "  hold    (2) 强制抱闸：使能时也不松闸。\n"
-     "  release / hold 要求关节失能，期间拒绝 enable、free 和 pn_save。只临时修改，不保存；\n"
-     "  永久保存用 pn_save。quit 退出时本次改动过的关节恢复为 normal。",
+     "  release / hold 要求关节失能，期间拒绝 enable 和 free。brake 本身不触发参数保存。\n"
+     "  quit 时尝试恢复本次改动过的关节为 normal，但不改写已保存的参数。",
      "  brake all\n  brake 16 normal\n  brake left hold", cmd_brake},
     {"zero", "维护", "<关节> [--hw]", 1, 2, "以当前位置为零点",
      "  关节写法同 status，可一次校多个关节。使能关节先自动失能；已失能不重复操作，确认静止后校零，不重新使能。\n"
@@ -1002,7 +1002,8 @@ static const command commands[] = {
      "  流程: free <关节> → 托住并停在机械零位 → zero <关节>",
      "  zero 21\n  zero left\n  zero 21 --hw", cmd_multi_service},
     {"pn_save", "维护", "<关节>", 1, 1, "发送参数保存脉冲（Pn097），写入驱动器掉电保存区",
-     "  关节写法同 status。要求关节失能；有关节抱闸不是 normal 模式时拒绝执行。",
+     "  先支撑负载。对选中关节按需失能，确认静止后发送 Pn097，不重新使能。\n"
+     "  不检查或更改 Pn075；强制松闸时不能依靠抱闸承重。持久化结果须重新上电后验读。",
      "  pn_save 21\n  pn_save all", cmd_multi_service},
     {"pn", "维护", "<关节> <参数号> [值]", 2, 3, "读取参数；仅白名单参数可写",
      "参数号支持 75、075 或 Pn075。", "  pn 21 75", cmd_service},

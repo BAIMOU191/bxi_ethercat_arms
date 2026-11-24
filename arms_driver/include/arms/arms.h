@@ -378,7 +378,7 @@ const char *arms_brake_mode_name(arms_brake_mode mode);
  * @brief 临时设置抱闸模式（写 Pn075 并回读，不保存到驱动器）
  *
  * RELEASE / HOLD 要求该关节失能；NORMAL 不要求失能，但仍要求有效通信和明确确认。
- * 任一已打开关节不是 NORMAL 或无法确认模式时，arms_enable()、arms_free() 和 ARMS_SAVE 被拒绝。
+ * 任一已打开关节不是 NORMAL 或无法确认模式时，arms_enable() 和 arms_free() 被拒绝。
  * arms_close() 尝试将本次会话改动过的关节恢复为 NORMAL，不保证机械抱闸已闭合。
  */
 arms_status arms_set_brake(arms_t *arms, int joint, arms_brake_mode mode, bool confirmed);
@@ -400,10 +400,10 @@ arms_status arms_brake_scan(arms_t *arms, arms_mask *released, arms_mask *held, 
 typedef enum {
     ARMS_ZERO_SOFT, /**< 以当前位置为零点：写入配置 offset_rad 并立即生效；要求关节失能、静止 */
     ARMS_ZERO_HW,   /**< Pn101 清零脉冲，驱动器重新上电后生效；要求关节失能、静止、抱闸为正常模式 */
-    ARMS_SAVE,      /**< Pn097 参数保存脉冲；要求关节失能，且全部关节抱闸为正常模式 */
+    ARMS_SAVE,      /**< Pn097 参数保存脉冲；不检查或更改抱闸模式 */
 } arms_service_op;
 
-/** @brief 执行维护操作（单个关节；多个关节由调用方逐个调用）。两种校零会按需失能并等待静止，不重新使能；保存不会自动失能。 */
+/** @brief 执行维护操作（单个关节；多个关节由调用方逐个调用）。校零和参数保存均按需失能并等待静止，操作后不重新使能。 */
 arms_status arms_service(arms_t *arms, int joint, arms_service_op op, bool confirmed);
 
 /** @brief 读取对象字典 */

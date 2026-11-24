@@ -1841,8 +1841,8 @@ static double zero_value(const arms_t *a, int j, const arms_joint_state *s)
     return a->cfg.joint[j].direction * (double)kgu_get_f32(s->txpdo, KGU_IN_POS);
 }
 
-/* 校零不重新使能。以新 PDO 反馈验证失能和连续静止，而非固定延时后直接写入。 */
-static arms_status zero_ready(arms_t *a, int j, bool confirmed, arms_joint_state *s)
+/* 校零与保存共用：仅在需要时请求目标关节失能，以新 PDO 反馈验证静止，不重新使能。 */
+static arms_status prepare_stationary(arms_t *a, int j, bool confirmed, arms_joint_state *s, const char *operation)
 {
     const uint64_t deadline = mono_ns() + 1000000000ull;
     uint64_t quiet_since = 0;
@@ -1853,7 +1853,7 @@ static arms_status zero_ready(arms_t *a, int j, bool confirmed, arms_joint_state
         if (st != ARMS_OK) return st;
         if (stats.tripped || stats.protect.reason != ARMS_PROTECT_NONE || s->error_code ||
             s->mode == ARMS_JS_FAULT || !isfinite(s->position) || !isfinite(s->velocity)) {
-            set_error("关节 %d 故障、保护锁定或反馈无效，未校零", j);
+            set_error("关节 %d 故障、保护锁定或反馈无效，未%s", j, operation);
             return ARMS_E_STATE;
         }
         if (drive_disabled(s)) {
@@ -1865,7 +1865,7 @@ static arms_status zero_ready(arms_t *a, int j, bool confirmed, arms_joint_state
             quiet_since = 0;
             if (!requested) {
                 if (s->mode != ARMS_JS_ENABLED) {
-                    set_error("关节 %d 状态字 0x%04x 不允许校零", j, s->status_word);
+                    set_error("关节 %d 状态字 0x%04x 不允许%s", j, s->status_word, operation);
                     return ARMS_E_STATE;
                 }
                 st = arms_disable(a, ARMS_MASK_JOINT(j));
@@ -1875,16 +1875,16 @@ static arms_status zero_ready(arms_t *a, int j, bool confirmed, arms_joint_state
         }
         usleep(2000);
     } while (mono_ns() < deadline);
-    set_error("关节 %d 在 1 秒内未确认失能并静止，未校零（状态字 0x%04x，速度 %.4f rad/s）",
-              j, s->status_word, s->velocity);
+    set_error("关节 %d 在 1 秒内未确认失能并静止，未%s（状态字 0x%04x，速度 %.4f rad/s）",
+              j, operation, s->status_word, s->velocity);
     return ARMS_E_TIMEOUT;
 }
 
 arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
 {
     arms_joint_state s;
-    bool zero = op == ARMS_ZERO_SOFT || op == ARMS_ZERO_HW;
-    arms_status st = zero ? zero_ready(a, j, confirmed, &s) : maintenance_ready(a, j, confirmed, &s);
+    if (op != ARMS_ZERO_SOFT && op != ARMS_ZERO_HW && op != ARMS_SAVE) return ARMS_E_ARG;
+    arms_status st = prepare_stationary(a, j, confirmed, &s, op == ARMS_SAVE ? "保存参数" : "校零");
     if (st != ARMS_OK)
         return st;
     uint8_t data[2];
@@ -1904,12 +1904,7 @@ arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
     case ARMS_ZERO_HW:
     case ARMS_SAVE: {
         unsigned pn = op == ARMS_SAVE ? 97 : 101;
-        if (brake_abnormal(a, op == ARMS_SAVE ? a->joints : ARMS_MASK_JOINT(j),
-                           op == ARMS_SAVE ? "参数保存" : "硬件校零")) return ARMS_E_STATE;
-        if (fabs(s.velocity) > 0.01) {
-            set_error("关节 %d 未静止（速度 %.4f rad/s）", j, s.velocity);
-            return ARMS_E_STATE;
-        }
+        if (op == ARMS_ZERO_HW && brake_abnormal(a, ARMS_MASK_JOINT(j), "硬件校零")) return ARMS_E_STATE;
         st = arms_sdo_read(a, j, arms_pn_index(pn), 0, data, 2, &n);
         if (st != ARMS_OK)
             return st;
