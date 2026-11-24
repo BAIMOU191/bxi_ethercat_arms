@@ -23,7 +23,7 @@ while [[ $# -gt 0 ]]; do
     -t) DURATION=$2; shift 2 ;;
     -f) FREQS=$2; shift 2 ;;
     -r) RT_CPU=$2; shift 2 ;;
-    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数 $1（-h 查看用法）" >&2; exit 2 ;;
   esac
 done

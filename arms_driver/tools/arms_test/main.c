@@ -528,7 +528,7 @@ int main(int argc, char **argv)
         powered = true;
         opt.scan_timeout_ms = 20000;
     }
-    printf("启动: %s 后端，扫描并预热，全部关节保持伺服失能\n", opt.backend == ARMS_BACKEND_MOCK ? "模拟" : "EtherLab");
+    printf("启动: %s后端，扫描并预热，全部关节保持伺服失能\n", opt.backend == ARMS_BACKEND_MOCK ? "模拟" : "EtherLab ");
     st = arms_open(&opt, &g_arms);
     if (st != ARMS_OK) {
         fprintf(stderr, "启动失败: %s\n  原因: %s\n", arms_strerror(st), arms_last_error());

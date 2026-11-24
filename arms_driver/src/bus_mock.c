@@ -38,7 +38,6 @@ static int mock_open(bus_t **out, const bus_open_params *p, char *err, size_t er
 {
     bus_t *b = calloc(1, sizeof(*b));
     const char *s;
-    (void)p;
     if (!b) {
         snprintf(err, err_size, "内存不足");
         return -1;
@@ -52,7 +51,11 @@ static int mock_open(bus_t **out, const bus_open_params *p, char *err, size_t er
     s = getenv("ARMS_MOCK_DROP_PPM");
     b->drop_ppm = s ? strtoul(s, NULL, 10) : 0;
     b->rng = 0x12345678u;
-    b->master = p->master >= 0 ? p->master : 0;
+    b->master = p->master;
+    if (b->master < 0) {
+        size_t n = p->interface ? strlen(p->interface) : 0;
+        b->master = (n > 0 && p->interface[n - 1] >= '0' && p->interface[n - 1] <= '9') ? p->interface[n - 1] - '0' : 0;
+    }
     *out = b;
     return 0;
 }
