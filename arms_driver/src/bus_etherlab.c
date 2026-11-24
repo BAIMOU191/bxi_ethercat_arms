@@ -289,7 +289,16 @@ static void el_close(bus_t *b)
     free(b);
 }
 
+static int el_sdo(bus_t *b, int slave, uint16_t index, uint8_t sub, uint8_t *data, size_t *n, bool write,
+                  uint32_t *abort)
+{
+    if (write)
+        return ecrt_master_sdo_download(b->master, slave, index, sub, data, *n, abort);
+    size_t cap = *n;
+    return ecrt_master_sdo_upload(b->master, slave, index, sub, data, cap, n, abort);
+}
+
 const bus_ops bus_etherlab_ops = {
-    "etherlab", el_open, el_scan, el_configure, el_activate, el_receive, el_send,
-    el_inputs, el_outputs, el_update_states, el_expected_wkc, el_master_index, el_close,
+    "etherlab", el_open,    el_scan,          el_configure,    el_activate,     el_receive, el_send,
+    el_inputs,  el_outputs, el_update_states, el_expected_wkc, el_master_index, el_close,   el_sdo,
 };

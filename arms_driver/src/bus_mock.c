@@ -16,6 +16,7 @@
 #include "bus.h"
 
 struct bus {
+    uint16_t params[BUS_MAX_SLAVES][0x200];
     int slaves;
     int configured;
     int positions[BUS_MAX_SLAVES];
@@ -208,7 +209,36 @@ static uint32_t mock_expected_wkc(bus_t *b) { return (uint32_t)(3 * b->configure
 static int mock_master_index(bus_t *b) { return b->master; }
 static void mock_close(bus_t *b) { free(b); }
 
+static int mock_sdo(bus_t *b, int slave, uint16_t index, uint8_t sub, uint8_t *data, size_t *n, bool write,
+                    uint32_t *abort)
+{
+    if (slave < 0 || slave >= BUS_MAX_SLAVES)
+        return -1;
+    if (index == 0x1018 && sub >= 1 && sub <= 4 && !write && *n >= 4) {
+        uint32_t x = sub == 1   ? KGU_VENDOR_ID
+                     : sub == 2 ? KGU_PRODUCT_CODE
+                     : sub == 3 ? 1u
+                                : (uint32_t)(1 + slave + 16 * b->master);
+        for (unsigned k = 0; k < 4; k++)
+            data[k] = (uint8_t)(x >> (8 * k));
+        *n = 4;
+        return 0;
+    }
+    if (sub || index < 0x2000 || index >= 0x2200 || *n < 2) {
+        *abort = 0x06020000;
+        return -1;
+    }
+    uint16_t *v = &b->params[slave][index - 0x2000];
+    if (write)
+        *v = kgu_get_u16(data, 0);
+    else
+        kgu_put_u16(data, 0, *v);
+    *n = 2;
+    return 0;
+}
+
 const bus_ops bus_mock_ops = {
-    "mock", mock_open, mock_scan, mock_configure, mock_activate, mock_receive, mock_send,
-    mock_inputs, mock_outputs, mock_update_states, mock_expected_wkc, mock_master_index, mock_close,
+    "mock",     mock_open,   mock_scan,    mock_configure,     mock_activate,     mock_receive,
+    mock_send,  mock_inputs, mock_outputs, mock_update_states, mock_expected_wkc, mock_master_index,
+    mock_close, mock_sdo,
 };

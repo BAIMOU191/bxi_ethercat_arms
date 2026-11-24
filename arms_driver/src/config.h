@@ -20,6 +20,7 @@ typedef struct {
     int arm;
     int slave;
     char model[24];
+    uint32_t serial;        /* 0 = 尚未现场确认 */
     int direction;          /* +1 / -1 */
     double offset_rad;
     double pos_min, pos_max;
@@ -57,6 +58,8 @@ typedef struct {
 
 /* Standard BXI joint names, indexed by joint number 0..30. */
 extern const char *const arms_standard_joint_names[31];
+
+bool arms_store_offset(const char *path, int joint, double value);
 
 bool arms_cycle_hz_supported(unsigned int hz);
 

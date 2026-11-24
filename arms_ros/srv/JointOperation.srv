@@ -1,0 +1,7 @@
+# Bits 15..28. Zero is accepted only for selftest. Maintenance selects one bit.
+uint32 joints
+bool confirm
+bool hardware_zero
+---
+bool success
+string message

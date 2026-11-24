@@ -60,6 +60,8 @@ typedef struct {
     uint32_t (*expected_wkc)(bus_t *bus);
     int (*master_index)(bus_t *bus);
     void (*close)(bus_t *bus);
+    int (*sdo)(bus_t *, int slave, uint16_t index, uint8_t sub, uint8_t *, size_t *, bool write,
+               uint32_t *abort);
 } bus_ops;
 
 extern const bus_ops bus_mock_ops;

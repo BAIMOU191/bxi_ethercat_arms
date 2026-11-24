@@ -86,6 +86,7 @@ typedef struct {
     int rt_cpu;                   /**< 实时线程 CPU，-2 表示使用配置值，-1 表示不绑定 */
     arms_mask joints;             /**< 参与的关节，0 表示配置中的全部关节 */
     unsigned int scan_timeout_ms; /**< 扫描超时，0 表示 10000 ms */
+    bool maintenance;             /**< 专用维护会话：禁止伺服使能 */
     int check_motors;             /**< 1: 未屏蔽关节必须全部在线，否则打开失败；0: 跳过不在线的关节；-1 取配置 */
     int64_t ignore_mask;          /**< 屏蔽掩码，第 n 位对应关节 n，屏蔽的关节不打开、不检查；-1 取配置 */
     arms_log_fn log;              /**< 启动过程日志 */
@@ -118,6 +119,7 @@ typedef struct {
     int slave;              /**< 链上位置，从 0 开始 */
     arms_joint_mode mode;
     uint8_t al_state;       /**< EtherCAT AL 状态 */
+    uint8_t txpdo[16], rxpdo[23]; /**< 最近采样的原始从站输入和主站输出 */
     uint16_t status_word;   /**< 0x6041 */
     uint16_t error_code;    /**< 0x603F */
     double position;        /**< 输出端位置 [rad]，已计入方向和零位偏置 */
@@ -242,6 +244,8 @@ arms_mask arms_opened_joints(const arms_t *arms);
 arms_mask arms_ignored_joints(const arms_t *arms);
 /** @brief 启动时未屏蔽但不在线、因而未打开的关节（check_motors = 0 时可能非空） */
 arms_mask arms_missing_joints(const arms_t *arms);
+/** @brief 本次会话的有效启动检查策略 */
+bool arms_startup_check_enabled(const arms_t *arms);
 /** @brief 是否在关节离线时触发下电保护（safety.offline_action = power_off） */
 bool arms_offline_power_off(const arms_t *arms);
 
@@ -324,6 +328,23 @@ arms_status arms_set_command(arms_t *arms, int joint, const arms_command *comman
 /** @brief 关节保持当前指令位置：速度与前馈清零，增益不变 */
 arms_status arms_hold(arms_t *arms, arms_mask joints);
 
+/* 以下维护接口仅由同一个非实时管理线程调用。写操作要求维护模式、在线且失能。 */
+typedef enum { ARMS_RELEASE, ARMS_LOCK, ARMS_ZERO_SOFT, ARMS_ZERO_HW, ARMS_SAVE } arms_service_op;
+arms_status arms_service(arms_t *, int joint, arms_service_op op, bool confirmed);
+arms_status arms_sdo_read(arms_t *, int joint, uint16_t index, uint8_t sub, uint8_t *out, size_t cap,
+                          size_t *size);
+arms_status arms_pn_write(arms_t *, int joint, unsigned number, unsigned value, bool confirmed);
+typedef struct {
+    const char *model;
+    int direction;
+    double offset_rad;
+    uint32_t serial;
+    int pn082;
+} arms_joint_info;
+arms_status arms_get_joint_info(const arms_t *, int joint, arms_joint_info *);
+int arms_pn_index(unsigned number);
+/* 检查当前设备与配置；strict 要求实机序列号和型号已确认。 */
+arms_status arms_verify_joint(arms_t *, int joint, bool strict);
 /** @brief 版本字符串 */
 const char *arms_version(void);
 

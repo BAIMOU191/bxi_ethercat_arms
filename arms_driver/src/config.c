@@ -103,7 +103,8 @@ static bool get_str(const cJSON *parent, const char *key, char *out, size_t size
 static bool get_u32_hex(const cJSON *parent, const char *key, uint32_t *out)
 {
     const cJSON *item = cJSON_GetObjectItemCaseSensitive(parent, key);
-    if (cJSON_IsNumber(item) && item->valuedouble >= 0 && item->valuedouble <= 4294967295.0) {
+    if (cJSON_IsNumber(item) && item->valuedouble >= 0 && item->valuedouble <= 4294967295.0 &&
+        floor(item->valuedouble) == item->valuedouble) {
         *out = (uint32_t)item->valuedouble;
         return true;
     }
@@ -112,7 +113,8 @@ static bool get_u32_hex(const cJSON *parent, const char *key, uint32_t *out)
         unsigned long v;
         errno = 0;
         v = strtoul(item->valuestring, &end, 0);
-        if (errno == 0 && end && *end == '\0' && v <= 0xFFFFFFFFul) {
+        if (errno == 0 && end && end != item->valuestring && item->valuestring[0] != '-' && *end == '\0' &&
+            v <= 0xFFFFFFFFul) {
             *out = (uint32_t)v;
             return true;
         }
@@ -270,6 +272,10 @@ static bool parse_joint(const cJSON *node, arms_config *c, int idx, char *error,
     j->home = get_num(node, "home", &v) ? v : 0.0;
     if (j->home < j->pos_min || j->home > j->pos_max) {
         fail(error, size, "关节 %ld 的 home %.3f 超出 limit.pos [%.3f, %.3f]", joint, j->home, j->pos_min, j->pos_max);
+        return false;
+    }
+    if (cJSON_GetObjectItemCaseSensitive(node, "serial") && !get_u32_hex(node, "serial", &j->serial)) {
+        fail(error, size, "关节 %ld 的 serial 必须是 32 位无符号整数", joint);
         return false;
     }
     j->pn082_expected = -1;

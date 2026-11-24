@@ -3,3 +3,6 @@ install/
 log/
 *.o
 *.a
+
+!arms_driver/third_party/bxi_pci_drv/arm64/libbxi_pci_drv.a
+__pycache__/

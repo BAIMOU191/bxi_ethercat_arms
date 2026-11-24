@@ -1,0 +1,55 @@
+"""Run after sourcing the built overlay; launches an isolated mock node, never hardware."""
+import os, signal, subprocess, sys, tempfile, time
+from pathlib import Path
+os.environ.update(ROS_LOCALHOST_ONLY='1', ROS_DOMAIN_ID='197', ROS2CLI_NO_DAEMON='1')
+import rclpy
+from rclpy.qos import qos_profile_sensor_data
+from communication.msg import ActuatorCmds, ActuatorStates
+from sensor_msgs.msg import JointState
+from diagnostic_msgs.msg import DiagnosticArray
+from arms_ros.srv import JointOperation
+
+rclpy.init(); test=rclpy.create_node('arms_smoke'); ns='/arms_test_'+str(os.getpid())
+seen={}; subs=[]
+for cls,key in [(JointState,'joint_states'),(ActuatorStates,'actuator_states'),(DiagnosticArray,'arms/diagnostics')]:
+    subs.append(test.create_subscription(cls,ns+'/hardware/'+key,lambda msg,k=key:seen.update({k:msg}),qos_profile_sensor_data))
+pub=test.create_publisher(ActuatorCmds,ns+'/hardware/actuators_cmds',qos_profile_sensor_data)
+def until(predicate):
+    end=time.monotonic()+12
+    while not predicate():
+        assert time.monotonic()<end,'ROS condition timed out'
+        rclpy.spin_once(test,timeout_sec=.04)
+def call(name,confirm=False):
+    cli=test.create_client(JointOperation,ns+'/arms/'+name)
+    assert cli.wait_for_service(timeout_sec=12),name
+    q=JointOperation.Request();q.joints=1<<21;q.confirm=confirm
+    f=cli.call_async(q);until(f.done);r=f.result();test.destroy_client(cli);return r
+try:
+    for maintenance in (False,True):
+        seen.clear()
+        cmd=['ros2','run','arms_ros','arms_node','--ros-args','-r','__ns:='+ns,'-p','mock:=true','-p','config:='+str(Path(sys.argv[1]).resolve()),'-p','maintenance:='+str(maintenance).lower()]
+        proc=subprocess.Popen(cmd,start_new_session=True)
+        try:
+            until(lambda:len(seen)==3);assert len(seen['joint_states'].name)==14
+            assert seen['arms/diagnostics'].status[0].level in (0,b'\x00'),seen['arms/diagnostics']
+            assert call('selftest').success and not call('enable').success
+            if maintenance:
+                assert not call('enable',True).success
+                assert call('brake_release',True).success and call('brake_lock',True).success
+            else:
+                assert not call('brake_release',True).success
+                assert call('enable',True).success
+                m=ActuatorCmds();m.actuators_name=['l_wrist_z_joint'];m.pos=[.1];m.vel=[0.];m.kp=[5.];m.kd=[0.];m.torque=[0.]
+                def moved():
+                    m.header.stamp=test.get_clock().now().to_msg();pub.publish(m)
+                    s=seen['joint_states'];return abs(s.position[s.name.index('l_wrist_z_joint')]-.1)<.02
+                until(moved)
+                m.pos=[];pub.publish(m)
+                until(lambda:any(k.key=='rejected_commands' and int(k.value)>0 for k in seen['arms/diagnostics'].status[0].values))
+                assert call('disable').success
+        finally:
+            if proc.poll() is None: os.killpg(proc.pid,signal.SIGINT)
+            proc.wait(timeout=15)
+finally:
+    test.destroy_node();rclpy.shutdown()
+print('PASS: ROS feedback, diagnostics, validated commands, explicit enable and maintenance interlocks')

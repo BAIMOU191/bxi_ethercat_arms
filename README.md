@@ -6,7 +6,7 @@ BXI 双臂 EtherCAT 驱动。RK3588 主控，左右臂共 14 个 KGU 执行器�
 | 目录 | 内容 |
 |---|---|
 | `arms_driver/` | C 库 `libarms_driver.a`、测试工具 `arms_test`、脚本与单元测试 |
-| `arms_ros/` | ROS2 节点 |
+| `arms_ros/` | ROS 2 节点、消息桥接、关节服务与隔离域测试 |
 
 ## 关节编号
 
@@ -118,3 +118,15 @@ for (;;) {
 ```
 
 `arms_ready()` 返回 true 表示全部关节已进入 OP 且通信稳定。
+
+## 启动检查、维护和 ROS 集成
+
+检查开关支持显式开启和关闭：
+
+```bash
+cd arms_driver
+./arms_test --mock --check-motor 1 --motor-disable 0x10200000 -e check
+./arms_test --mock --maintenance -e 'help' -e 'identify 21' -e 'status 21 --raw'
+```
+
+维护、自检、校零、设备身份校验和现场验收见 [阶段 4/5 使用说明](docs/phase4-5.md)。ROS 构建、服务和话题见 [arms_ros](arms_ros/README.md)。开机服务模板在 deploy/，不会在构建或安装源码时启用。

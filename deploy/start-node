@@ -1,0 +1,6 @@
+#!/bin/bash
+set -eo pipefail
+source "$ROS_BASE/setup.bash"
+source "$ROBOT_PREFIX/local_setup.bash"
+source "$ARMS_PREFIX/local_setup.bash"
+exec ros2 run arms_ros arms_node --ros-args -p "config:=$ARMS_CONFIG" -p setup_rt:=true -p "manage_power:=$ARMS_MANAGE_POWER"

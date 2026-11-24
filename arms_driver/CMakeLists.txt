@@ -36,7 +36,9 @@ if(GIT_FOUND)
 endif()
 
 add_library(arms_driver STATIC
+  src/lease.c
   src/arms.c
+  src/calibration.c
   src/config.c
   src/bus_mock.c
   third_party/cjson/cJSON.c)
@@ -86,12 +88,22 @@ if(BUILD_TESTING)
   add_executable(test_check tests/test_check.c)
   target_link_libraries(test_check PRIVATE arms_driver)
   add_test(NAME startup_check COMMAND test_check ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
+  add_test(NAME help_lists_check COMMAND arms_test --mock -c ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json -e "help")
+  set_tests_properties(help_lists_check PROPERTIES PASS_REGULAR_EXPRESSION "  check +检查已打开关节")
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME maintenance_cli COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_maintenance.py
+    $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
   add_test(NAME mock_session COMMAND arms_test --mock -c ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json
            -e "status" -e "bus" -e "enable all" -e "mit 17 0.1 -m 0.3" -e "home all -m 0.5"
            -e "swing 17 0.05 1 1" -e "mit 18 0.1 2 0.1 0.05" -e "hold" -e "commtest 2 --enabled"
            -e "disable" -e "status" -e "help")
 endif()
 
+if(ARMS_HAVE_ETHERLAB)
+  get_filename_component(ETHERLAB_LIBDIR "${ETHERLAB_LIBRARY}" DIRECTORY)
+  set_property(TARGET arms_test APPEND PROPERTY INSTALL_RPATH "${ETHERLAB_LIBDIR}")
+endif()
+install(PROGRAMS scripts/rt_setup.sh DESTINATION share/arms_driver/scripts)
 install(TARGETS arms_test RUNTIME DESTINATION bin)
 install(TARGETS arms_driver ARCHIVE DESTINATION lib)
 install(DIRECTORY include/ DESTINATION include)

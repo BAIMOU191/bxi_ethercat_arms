@@ -1,0 +1,19 @@
+[Unit]
+Description=BXI dual arm EtherCAT ROS 2 node
+After=network.target ethercat.service
+Requires=ethercat.service
+ConditionPathExists=/etc/bxi/arms.json
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/bxi/arms-node.env
+ExecStart=/usr/local/libexec/bxi-arms-node
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=no
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
