@@ -1,0 +1,21 @@
+Test project /tmp/arms-release-N5SaOP/build
+    Start 1: config
+1/8 Test #1: config ...........................   Passed    0.01 sec
+    Start 2: external_mode
+2/8 Test #2: external_mode ....................   Passed    1.83 sec
+    Start 3: control
+3/8 Test #3: control ..........................   Passed    3.15 sec
+    Start 4: recover
+4/8 Test #4: recover ..........................   Passed    4.78 sec
+    Start 5: startup_check
+5/8 Test #5: startup_check ....................   Passed    2.59 sec
+    Start 6: help_lists_check
+6/8 Test #6: help_lists_check .................   Passed    0.89 sec
+    Start 7: maintenance_cli
+7/8 Test #7: maintenance_cli ..................   Passed    9.20 sec
+    Start 8: mock_session
+8/8 Test #8: mock_session .....................   Passed    4.48 sec
+
+100% tests passed, 0 tests failed out of 8
+
+Total Test time (real) =  26.93 sec

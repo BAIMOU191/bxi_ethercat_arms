@@ -1,0 +1,6 @@
+[INFO] [1795505354.948177117] [arms_test_68850.arms_node]: Startup checks passed; servos disabled.
+[WARN] [1795505355.633983926] [arms_test_68850.arms_node]: command rejected: array lengths
+[INFO] [1795505355.950121634] [rclcpp]: signal_handler(SIGINT/SIGTERM)
+[INFO] [1795505357.374138286] [arms_test_68850.arms_node]: Startup checks passed; servos disabled.
+[INFO] [1795505357.893984133] [rclcpp]: signal_handler(SIGINT/SIGTERM)
+PASS: ROS feedback, diagnostics, validated commands, explicit enable and maintenance interlocks
