@@ -38,6 +38,7 @@ endif()
 add_library(arms_driver STATIC
   src/lease.c
   src/arms.c
+  src/pn.c
   src/calibration.c
   src/config.c
   src/bus_mock.c
@@ -100,6 +101,8 @@ if(BUILD_TESTING)
   add_test(NAME help_lists_check COMMAND arms_test --mock -c ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json -e "help")
   set_tests_properties(help_lists_check PROPERTIES PASS_REGULAR_EXPRESSION "  check +检查已打开关节")
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME parameter_cli COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_parameters.py
+    $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
   add_test(NAME tab_completion COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_completion.py
     $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
   add_test(NAME maintenance_cli COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_maintenance.py

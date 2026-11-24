@@ -410,8 +410,8 @@ arms_status arms_service(arms_t *arms, int joint, arms_service_op op, bool confi
 arms_status arms_sdo_read(arms_t *arms, int joint, uint16_t index, uint8_t sub, uint8_t *out, size_t cap,
                           size_t *size);
 
-/** @brief 写入白名单内的 Pn 参数并回读校验 */
-arms_status arms_pn_write(arms_t *arms, int joint, unsigned number, unsigned value, bool confirmed);
+/** @brief 写入手册参数的原始 INT16 值并回读。普通写要求已失能；Pn075/097/101 走专用流程。 */
+arms_status arms_pn_write(arms_t *arms, int joint, unsigned number, int value, bool confirmed);
 
 /** @brief Pn 参数号对应的对象字典索引（Pn075 → 0x2075），无效返回 -1 */
 int arms_pn_index(unsigned number);

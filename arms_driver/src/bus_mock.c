@@ -17,10 +17,12 @@
 #include <time.h>
 
 #include "bus.h"
+#include "arms/pn.h"
 
 struct bus {
     uint16_t params[BUS_MAX_SLAVES][0x200];
     bool pn075_unreadable, stuck_enabled;
+    uint32_t revision;
     int slaves;
     int configured;
     float cycle_hz;
@@ -60,6 +62,8 @@ static int mock_open(bus_t **out, const bus_open_params *p, char *err, size_t er
     b->pn075_unreadable = s && !strcmp(s, "1");
     b->cycle_hz = 1e9f / (float)p->cycle_ns;
     b->slaves = 7;
+    s = getenv("ARMS_MOCK_REVISION");
+    b->revision = s ? (uint32_t)strtoul(s, NULL, 0) : KGU_PN_REVISION;
     s = getenv("ARMS_MOCK_SLAVES");
     if (s) {
         int n = atoi(s);
@@ -94,7 +98,7 @@ static int mock_scan(bus_t *b, bus_slave_info *infos, int max, int expected, int
     for (i = 0; i < b->slaves && i < max; ++i) {
         infos[i].vendor_id = KGU_VENDOR_ID;
         infos[i].product_code = KGU_PRODUCT_CODE;
-        infos[i].revision = 0x00050012u;
+        infos[i].revision = b->revision;
         snprintf(infos[i].name, sizeof(infos[i].name), "MOCK KDE EtherCAT Drive");
     }
     *count = i;
@@ -235,7 +239,7 @@ static int mock_sdo(bus_t *b, int slave, uint16_t index, uint8_t sub, uint8_t *d
     if (index == 0x1018 && sub >= 1 && sub <= 4 && !write && *n >= 4) {
         uint32_t x = sub == 1   ? KGU_VENDOR_ID
                      : sub == 2 ? KGU_PRODUCT_CODE
-                     : sub == 3 ? 1u
+                     : sub == 3 ? b->revision
                                 : (uint32_t)(1 + slave + 16 * b->master);
         for (unsigned k = 0; k < 4; k++)
             data[k] = (uint8_t)(x >> (8 * k));
@@ -246,7 +250,7 @@ static int mock_sdo(bus_t *b, int slave, uint16_t index, uint8_t sub, uint8_t *d
         *abort = 0x08000000;
         return -1;
     }
-    if (sub || index < 0x2000 || index >= 0x2200 || *n < 2) {
+    if (sub || !arms_pn_lookup((unsigned)arms_pn_from_index(index)) || (write ? *n != 2 : *n < 2)) {
         *abort = 0x06020000;
         return -1;
     }

@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "arms/arms.h"
+#include "arms/pn.h"
 #include "arms/lease.h"
 #include "joint_select.h"
 #include "lineedit.h"
@@ -842,6 +843,96 @@ static int cmd_multi_service(int argc, char **argv)
     return failures ? failed("%d 个关节未完成", failures) : ok();
 }
 
+/* Pn 编号按十进制；对象索引可用 0x 前缀。别名也在同一目录中解析。 */
+static int pn_number(const char *key)
+{
+    size_t count;
+    const arms_pn_info *table = arms_pn_catalog(&count);
+    for (size_t i = 0; i < count; i++)
+        if (table[i].alias && !strcasecmp(key, table[i].alias)) return (int)table[i].number;
+    if (!strncasecmp(key, "pn", 2)) key += 2;
+    if (!*key || strlen(key) > 3 || strspn(key, "0123456789") != strlen(key)) return -1;
+    return (int)strtol(key, NULL, 10);
+}
+
+static void pn_describe(const arms_pn_info *p)
+{
+    printf("Pn%03u  0x%04x:00  %s", p->number, arms_pn_index(p->number), p->name);
+    if (p->alias) printf(" [%s]", p->alias);
+    printf("  写值 ");
+    if (p->choices) {
+        for (const int *c = p->choices; *c >= 0; c++) printf("%s%d", c == p->choices ? "" : "/", *c);
+    } else if (p->min == p->max) printf("%d", p->min);
+    else printf("%d..%d", p->min, p->max);
+    printf("  %s\n", p->note);
+}
+
+static int cmd_parameter(int argc, char **argv)
+{
+    bool pn = !strcmp(argv[0], "pn"), sdo = !strcmp(argv[0], "sdo");
+    if (pn && (!strcmp(argv[1], "list") || !strcmp(argv[1], "help"))) {
+        if (!strcmp(argv[1], "list") && argc == 2) {
+            size_t n; const arms_pn_info *t = arms_pn_catalog(&n);
+            for (size_t i = 0; i < n; ++i) pn_describe(&t[i]);
+        } else if (!strcmp(argv[1], "help") && argc == 3) {
+            const arms_pn_info *p = arms_pn_lookup((unsigned)pn_number(argv[2]));
+            if (!p) return failed("未收录的参数：%s", argv[2]);
+            pn_describe(p);
+        } else return -2;
+        return ok();
+    }
+    int base = sdo ? 4 : pn ? 3 : 2;
+    if (argc != base && argc != base + 1) return -2;
+    arms_mask mask;
+    if (need_session() || selection(argv[1], &mask)) return -1;
+    if (__builtin_popcount(mask) != 1) return failed("参数读写一次只选一个关节");
+    int j = __builtin_ctz(mask), number;
+    unsigned index, sub = 0;
+    if (sdo) {
+        if (!uint_arg(argv[2], UINT16_MAX, &index) || !uint_arg(argv[3], UINT8_MAX, &sub)) return -2;
+        number = sub ? -1 : arms_pn_from_index(index);
+    } else {
+        number = pn_number(pn ? argv[2] : argv[0]);
+        if (number < 0) return failed("无效的参数号或别名");
+        index = (unsigned)arms_pn_index((unsigned)number);
+    }
+    const arms_pn_info *p = number < 0 ? NULL : arms_pn_lookup((unsigned)number);
+    if (argc == base) {
+        uint8_t data[64]; size_t n;
+        if (arms_sdo_read(g_arms, j, index, sub, data, sizeof(data), &n) != ARMS_OK) return failed("%s", arms_last_error());
+        if (p && n != 2) return failed("Pn%03d 应为 2 字节，实际 %zu", number, n);
+        printf("0x%04x:%02x =", index, sub);
+        for (size_t i = 0; i < n; ++i) printf(" %02x", data[i]);
+        if (n == 2) {
+            int v = data[0] | (data[1] << 8);
+            if (number >= 0 && number < 200 && v >= 32768) v -= 65536;
+            printf(" (%d)", v);
+            if (number == 26) printf("  %d V", v);
+            if (number == 82) printf("  %.1f A/N·m", v / 10.0);
+        }
+        puts("");
+        return ok();
+    }
+    if (!p) return failed("该对象不是手册定义的可写 Pn；地址 0x%04x:%02x，未发送写请求", index, sub);
+    char *end; const char *arg = argv[base], *digits = (*arg == '+' || *arg == '-') ? arg + 1 : arg;
+    errno = 0;
+    long v = strtol(arg, &end, !strncasecmp(digits, "0x", 2) ? 16 : 10);
+    if (end == arg || *end || errno || v < INT16_MIN || v > INT16_MAX) return failed("需要 INT16 原始整数");
+    if (!arms_pn_accepts(p, (int)v)) { pn_describe(p); return failed("Pn%03d 不接受值 %ld", number, v); }
+    /* 与命名命令完全相同（包含动态指令取消、维护联锁及操作结果提示）。 */
+    if (number == 75) {
+        char *av[] = {"brake", argv[1], (char *)arms_brake_mode_name((arms_brake_mode)v)};
+        return cmd_brake(3, av);
+    }
+    if (number == 97 || number == 101) {
+        char *av[] = {number == 97 ? "pn_save" : "zero", argv[1], "--hw"};
+        return cmd_multi_service(number == 97 ? 2 : 3, av);
+    }
+    if (arms_pn_write(g_arms, j, p->number, (int)v, true) != ARMS_OK) return failed("%s", arms_last_error());
+    printf("%d Pn%03d %s = %ld，已回读；%s\n", j, number, p->name, v, p->note);
+    return ok();
+}
+
 static int cmd_service(int argc, char **argv)
 {
     arms_mask m;
@@ -852,7 +943,7 @@ static int cmd_service(int argc, char **argv)
     int j = __builtin_ctz(m);
     const char *op = argv[0];
     arms_status rc = ARMS_OK;
-    unsigned a = 0, b = 0, v = 0;
+    unsigned a = 0, b = 0;
     uint8_t bytes[64];
     size_t n = 0;
     if (!strcmp(op, "identify")) {
@@ -900,41 +991,6 @@ static int cmd_service(int argc, char **argv)
                     return failed("等待 reg_read 失败");
             if (!WIFEXITED(status) || WEXITSTATUS(status))
                 return failed("寄存器读取失败");
-        }
-    } else if (!strcmp(op, "pn") || !strcmp(op, "sdo")) {
-        bool pn = !strcmp(op, "pn");
-        int base = pn ? 3 : 4;
-        if (pn) {
-            const char *p = argv[2];
-            if (!strncasecmp(p, "pn", 2))
-                p += 2;
-            if (!*p || strspn(p, "0123456789") != strlen(p) || strlen(p) > 3)
-                return -2;
-            a = (unsigned)strtoul(p, NULL, 10);
-        } else if (!uint_arg(argv[2], 65535, &a) || !uint_arg(argv[3], 255, &b))
-            return -2;
-        unsigned idx = pn ? (unsigned)arms_pn_index(a) : a;
-        if (argc == base) {
-            rc = arms_sdo_read(g_arms, j, idx, b, bytes, sizeof(bytes), &n);
-            if (rc == ARMS_OK) {
-                printf("0x%04x:%02x =", idx, b);
-                for (size_t i = 0; i < n; i++)
-                    printf(" %02x", bytes[i]);
-                if (n == 2)
-                    printf(" (%u)", bytes[0] + 256u * bytes[1]);
-                puts("");
-            }
-        } else {
-            if (argc != base + 1 || !uint_arg(argv[base], 65535, &v))
-                return -2;
-            if (!pn) {
-                for (a = 0; a <= 999; a++)
-                    if ((unsigned)arms_pn_index(a) == idx)
-                        break;
-                if (b || a > 999)
-                    return failed("对象不在可写参数表中");
-            }
-            rc = arms_pn_write(g_arms, j, a, v, true);
         }
     }
     return rc == ARMS_OK ? ok() : failed("%s", arms_last_error());
@@ -1005,10 +1061,15 @@ static const command commands[] = {
      "  先支撑负载。对选中关节按需失能，确认静止后发送 Pn097，不重新使能。\n"
      "  不检查或更改 Pn075；强制松闸时不能依靠抱闸承重。持久化结果须重新上电后验读。",
      "  pn_save 21\n  pn_save all", cmd_multi_service},
-    {"pn", "维护", "<关节> <参数号> [值]", 2, 3, "读取参数；仅白名单参数可写",
-     "参数号支持 75、075 或 Pn075。", "  pn 21 75", cmd_service},
-    {"sdo", "维护", "<关节> <索引> <子索引> [值]", 3, 4, "读对象字典或写白名单参数",
-     "值按小端字节显示。", "  sdo 21 0x1018 1", cmd_service},
+    {"pn", "维护", "<关节> <编号|别名> [值] | list | help <编号|别名>", 1, 3, "读写手册参数或查询参数表",
+     "普通写要求失能并回读，不自动保存。Pn075/097/101 走 brake/pn_save/zero --hw 流程。",
+     "  pn list\n  pn help brake_voltage\n  pn 15 Pn026", cmd_parameter},
+    {"sdo", "维护", "<关节> <索引> <子索引> [值]", 3, 4, "读对象字典；Pn 写与 pn 共用处理流程",
+     "非 Pn 或非零子索引只读；Pn 值为有符号 16 位原始整数。", "  sdo 15 0x2026 0", cmd_parameter},
+    {"brake_voltage", "维护", "<关节> [伏]", 1, 2, "Pn026：制动器保持电压，不切换抱闸",
+     "等价于 pn <关节> Pn026 [值]。", "  brake_voltage 15", cmd_parameter},
+    {"torque_scale", "维护", "<关节> [原始值]", 1, 2, "Pn082：转矩系数，10 表示 1 A/N·m",
+     "等价于 pn <关节> Pn082 [值]；写标定原始值，不执行自动标定。", "  torque_scale 15", cmd_parameter},
     {"reg", "维护", "<关节> <地址> [1|2|4]", 2, 3, "只读 ESC 寄存器", "不提供原始寄存器写入。",
      "  reg 21 0x130 2", cmd_service},
     {"check", "查看", "", 0, 0, "检查已打开关节是否全部在线，并显示屏蔽掩码与离线保护状态",
@@ -1052,10 +1113,10 @@ static void complete_command(size_t argc, const char *const argv[], le_choices *
     const cmd_fn fn = c->fn;
     bool takes_joints = fn == cmd_status || fn == cmd_watch || fn == cmd_info || fn == cmd_enable ||
                         fn == cmd_disable || fn == cmd_reset || fn == cmd_hold || fn == cmd_mit || fn == cmd_home ||
-                        fn == cmd_swing || fn == cmd_free || fn == cmd_brake || fn == cmd_multi_service || fn == cmd_service;
+                        fn == cmd_swing || fn == cmd_free || fn == cmd_brake || fn == cmd_multi_service || fn == cmd_service || fn == cmd_parameter;
     if ((argc == 1 && takes_joints) ||
         (argc == 2 && c->fn == cmd_status && !strcmp(argv[1], "--raw"))) {
-        bool single = c->fn == cmd_service;
+        bool single = fn == cmd_service || fn == cmd_parameter;
         arms_mask mask = arms_opened_joints(g_arms);
         if (c->fn == cmd_status) mask |= arms_ignored_joints(g_arms) | arms_missing_joints(g_arms);
         if (!single) {
@@ -1070,6 +1131,17 @@ static void complete_command(size_t argc, const char *const argv[], le_choices *
             snprintf(id, sizeof(id), "%d", j);
             le_add_choice(out, id);
             le_add_choice(out, arms_joint_name(g_arms, j));
+        }
+    }
+    if (!strcmp(c->name, "pn")) {
+        if (argc == 1) { le_add_choice(out, "list"); le_add_choice(out, "help"); }
+        if (argc == 2 && strcmp(argv[1], "list")) {
+            size_t n; const arms_pn_info *t = arms_pn_catalog(&n);
+            for (size_t i = 0; i < n; ++i) {
+                char key[12]; snprintf(key, sizeof(key), "Pn%03u", t[i].number);
+                le_add_choice(out, key);
+                if (t[i].alias) le_add_choice(out, t[i].alias);
+            }
         }
     }
     if (argc == 1 && c->fn == cmd_bus) le_add_choice(out, "reset");

@@ -29,7 +29,9 @@ with tempfile.TemporaryDirectory() as tmp:
     os.close(slave)
     try:
         expect(master, b'> \x1b[0K')
-        for typed, shown in [(b'ze\t', b'> zero '), (b'help bra\t', b'> help brake '),
+        for typed, shown in [(b'ze\t', b'> zero '), (b'help brake_v\t', b'> help brake_voltage '),
+                             (b'pn help torque_s\t', b'> pn help torque_scale '),
+                             (b'pn 15 Pn14\t', b'> pn 15 Pn148 '),
                              (b'brake 15 rel\t', b'> brake 15 release '),
                              (b'zero l_shoulder_y\t', b'> zero l_shoulder_y_joint '),
                              (b'status 15,rig\t', b'> status 15,right '),
