@@ -45,6 +45,36 @@ static bool trip_seen;
 
 void motion_set_trip_handler(void (*fn)(void)) { trip_handler = fn; }
 
+static bool protect_seen;
+static int take_snapshot(snapshot *s);
+
+/* 超速/超力矩保护：驱动已失能全部关节，这里停止指令刷新并打印诊断快照 */
+static void check_protect(const arms_bus_stats *st)
+{
+    size_t i;
+    snapshot s;
+    if (st->protect.reason == ARMS_PROTECT_NONE) {
+        protect_seen = false;
+        return;
+    }
+    if (protect_seen) return;
+    protect_seen = true;
+    pthread_mutex_lock(&lock);
+    refreshing = 0;
+    pthread_mutex_unlock(&lock);
+    tlog_err("超限保护触发: 关节 %d(%s) %s %.4f 超过阈值 %.4f；全部关节已失能，执行 reset 清除",
+             st->protect.joint, arms_joint_name(bus, st->protect.joint),
+             st->protect.reason == ARMS_PROTECT_OVERSPEED ? "速度(rad/s)" : "力矩(N.m)", st->protect.value,
+             st->protect.limit);
+    if (!take_snapshot(&s)) return;
+    for (i = 0; i < s.count; ++i) {
+        const arms_joint_state *j = &s.joints[i];
+        tlog_err("  %d %-8s pos=%.4f vel=%.4f tor=%.4f cmd=%.4f kp=%.2f kd=%.2f", j->joint,
+                 arms_joint_mode_name(j->mode), j->position, j->velocity, j->torque, j->cmd_position, j->cmd_kp,
+                 j->cmd_kd);
+    }
+}
+
 /* 离线保护：驱动在周期内已失能全部关节，这里打印触发关节并调用下电处理 */
 static void check_trip(void)
 {
@@ -53,6 +83,7 @@ static void check_trip(void)
     size_t len = 0;
     int j;
     if (arms_get_stats(bus, &st) != ARMS_OK) return;
+    check_protect(&st);
     if (!st.tripped) {
         trip_seen = false;
         return;

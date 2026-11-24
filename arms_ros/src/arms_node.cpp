@@ -133,14 +133,13 @@ class ArmsNode final : public rclcpp::Node
             return false;
         arms_bus_stats b{};
         arms_get_stats(dev.driver, &b);
-        if (b.tripped)
+        if (b.tripped || b.protect.reason != ARMS_PROTECT_NONE)
             return false;
         arms_joint_state s[14];
         size_t n = 0;
         arms_read(dev.driver, s, 14, &n);
         for (size_t i = 0; i < n; i++)
-            if (s[i].mode == ARMS_JS_FAULT || s[i].error_code ||
-                arms_verify_joint(dev.driver, s[i].joint, false) != ARMS_OK)
+            if (s[i].mode == ARMS_JS_FAULT || s[i].error_code)
                 return false;
         return n > 0;
     }
@@ -163,11 +162,6 @@ class ArmsNode final : public rclcpp::Node
         }
         arms_status st = ARMS_E_ARG;
         if (name == "enable") {
-            for (int j = 15; j <= 28; j++)
-                if ((m & ARMS_MASK_JOINT(j)) && arms_verify_joint(dev.driver, j, true) != ARMS_OK) {
-                    r.message = arms_last_error();
-                    return;
-                }
             st = arms_enable(dev.driver, m, 0);
         } else if (name == "disable")
             st = arms_disable(dev.driver, m);
@@ -225,9 +219,15 @@ class ArmsNode final : public rclcpp::Node
             diagnostic_msgs::msg::DiagnosticStatus d;
             d.name = std::string("arms/") + arms_arm_name(i);
             d.hardware_id = a.interface;
-            d.level =
-                (dev.cut || b.tripped || a.comm_failed || !a.link_up || a.wkc_last != a.wkc_expected) ? 2 : 0;
-            d.message = d.level ? "communication fault or trip" : "online";
+            const bool prot = b.protect.reason != ARMS_PROTECT_NONE;
+            d.level = (dev.cut || b.tripped || prot || a.comm_failed || !a.link_up ||
+                       a.wkc_last != a.wkc_expected)
+                          ? 2
+                          : 0;
+            d.message = prot ? (b.protect.reason == ARMS_PROTECT_OVERSPEED ? "overspeed protection latched"
+                                                                           : "overtorque protection latched")
+                        : d.level ? "communication fault or trip"
+                                  : "online";
             auto add = [&](const char *k, auto value) {
                 diagnostic_msgs::msg::KeyValue kv;
                 kv.key = k;
@@ -239,6 +239,8 @@ class ArmsNode final : public rclcpp::Node
             add("trip_joints", b.trip_joints);
             add("ignored", arms_ignored_joints(dev.driver));
             add("missing", arms_missing_joints(dev.driver));
+            add("protect_joint", b.protect.joint);
+            add("protect_value", b.protect.value);
             add("rejected_commands", rejected);
             msg.status.push_back(d);
         }
@@ -280,6 +282,18 @@ class ArmsNode final : public rclcpp::Node
         }
         if (arms_open(&opt, &dev.driver) != ARMS_OK)
             throw std::runtime_error(arms_last_error());
+        {
+            /* 上电后驱动器残留的故障先复位一次 */
+            arms_joint_state s[14];
+            size_t n = 0;
+            arms_mask faulted = 0;
+            arms_read(dev.driver, s, 14, &n);
+            for (size_t i = 0; i < n; i++)
+                if (s[i].mode == ARMS_JS_FAULT || s[i].error_code)
+                    faulted |= ARMS_MASK_JOINT(s[i].joint);
+            if (faulted && arms_reset(dev.driver, faulted, 0) != ARMS_OK)
+                RCLCPP_WARN(get_logger(), "startup fault reset incomplete: %s", arms_last_error());
+        }
         if (!healthy())
             throw std::runtime_error("startup selftest failed");
         auto qos = rclcpp::SensorDataQoS().keep_last(1);

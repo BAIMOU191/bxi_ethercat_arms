@@ -138,8 +138,8 @@ static void set_defaults(arms_config *c)
     c->check_motors = true;
     c->ignore_mask = 0;
     snprintf(c->offline_action, sizeof(c->offline_action), "power_off");
-    c->release_max_joints = 1;
-    c->power_managed = false;
+    c->overspeed_ms = 500;
+    c->overtorque_ms = 100;
     c->op_timeout_ms = 30000;
     c->vendor_id = KGU_VENDOR_ID;
     c->product_code = KGU_PRODUCT_CODE;
@@ -182,10 +182,10 @@ static bool parse_pair(const cJSON *arr, double *a, double *b)
 
 static bool parse_joint(const cJSON *node, arms_config *c, int idx, char *error, size_t size)
 {
-    long joint, slave, direction, pn082;
+    long joint, slave, direction;
     char arm_name[16], name[ARMS_NAME_LEN];
     arms_joint_config *j;
-    const cJSON *limit, *gmax, *gdef, *pn;
+    const cJSON *limit, *gmax, *gdef;
     double v;
 
     if (!cJSON_IsObject(node)) {
@@ -239,10 +239,10 @@ static bool parse_joint(const cJSON *node, arms_config *c, int idx, char *error,
     snprintf(j->name, sizeof(j->name), "%s", name);
     j->slave = (int)slave;
     j->direction = (int)direction;
-    if (!get_str(node, "model", j->model, sizeof(j->model))) snprintf(j->model, sizeof(j->model), "UNVERIFIED");
     j->offset_rad = get_num(node, "offset_rad", &v) ? v : 0.0;
 
     j->pos_min = -0.5; j->pos_max = 0.5; j->vel_max = 0.5; j->tff_max = 1.0;
+    j->vel_fault = 3.0; j->tor_fault = 30.0;
     j->kp_max = 5; j->kd_max = 1; j->kp_default = 5; j->kd_default = 0;
     limit = obj(node, "limit");
     if (limit) {
@@ -253,6 +253,12 @@ static bool parse_joint(const cJSON *node, arms_config *c, int idx, char *error,
         }
         if (get_num(limit, "vel", &v)) j->vel_max = v;
         if (get_num(limit, "tff", &v)) j->tff_max = v;
+        if (get_num(limit, "vel_fault", &v)) j->vel_fault = v;
+        if (get_num(limit, "torque_fault", &v)) j->tor_fault = v;
+    }
+    if (j->vel_fault <= 0 || j->tor_fault <= 0) {
+        fail(error, size, "关节 %ld 的 limit.vel_fault / limit.torque_fault 必须大于 0", joint);
+        return false;
     }
     gmax = obj(node, "gain_max");
     if (gmax) {
@@ -274,24 +280,6 @@ static bool parse_joint(const cJSON *node, arms_config *c, int idx, char *error,
         fail(error, size, "关节 %ld 的 home %.3f 超出 limit.pos [%.3f, %.3f]", joint, j->home, j->pos_min, j->pos_max);
         return false;
     }
-    if (cJSON_GetObjectItemCaseSensitive(node, "serial") && !get_u32_hex(node, "serial", &j->serial)) {
-        fail(error, size, "关节 %ld 的 serial 必须是 32 位无符号整数", joint);
-        return false;
-    }
-    j->pn082_expected = -1;
-    pn = cJSON_GetObjectItemCaseSensitive(node, "pn082");
-    if (pn && !cJSON_IsNull(pn)) {
-        if (!get_int(node, "pn082", 0, 32767, &pn082)) {
-            fail(error, size, "关节 %ld 的 pn082 必须是整数或 null", joint);
-            return false;
-        }
-        j->pn082_expected = (int)pn082;
-    }
-    if (!get_str(node, "brake", j->brake, sizeof(j->brake))) snprintf(j->brake, sizeof(j->brake), "normal");
-    if (strcmp(j->brake, "normal") != 0 && strcmp(j->brake, "release") != 0 && strcmp(j->brake, "lock") != 0) {
-        fail(error, size, "关节 %ld 的 brake 只能是 normal/release/lock", joint);
-        return false;
-    }
     return true;
 }
 
@@ -299,7 +287,7 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
 {
     char *text;
     cJSON *root;
-    const cJSON *rt, *safety, *power, *arms, *joints, *drive;
+    const cJSON *rt, *safety, *arms, *joints, *drive;
     long v;
     int i, a, n;
     bool ok = false;
@@ -392,12 +380,19 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
             }
             c->op_timeout_ms = (unsigned int)v;
         }
-        if (cJSON_GetObjectItemCaseSensitive(safety, "release_max_joints")) {
-            if (!get_int(safety, "release_max_joints", 1, ARMS_JOINT_COUNT, &v)) {
-                fail(error, size, "safety.release_max_joints 必须是 1..14");
+        if (cJSON_GetObjectItemCaseSensitive(safety, "overspeed_ms")) {
+            if (!get_int(safety, "overspeed_ms", 1, 10000, &v)) {
+                fail(error, size, "safety.overspeed_ms 必须是 1..10000");
                 goto out;
             }
-            c->release_max_joints = (unsigned int)v;
+            c->overspeed_ms = (unsigned int)v;
+        }
+        if (cJSON_GetObjectItemCaseSensitive(safety, "overtorque_ms")) {
+            if (!get_int(safety, "overtorque_ms", 1, 10000, &v)) {
+                fail(error, size, "safety.overtorque_ms 必须是 1..10000");
+                goto out;
+            }
+            c->overtorque_ms = (unsigned int)v;
         }
         if (cJSON_GetObjectItemCaseSensitive(safety, "timeout_action") &&
             (!get_str(safety, "timeout_action", c->timeout_action, sizeof(c->timeout_action)) ||
@@ -424,15 +419,6 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
             fail(error, size, "safety.offline_action 只能是 power_off 或 disable");
             goto out;
         }
-    }
-    power = obj(root, "power");
-    if (power) {
-        const cJSON *m = cJSON_GetObjectItemCaseSensitive(power, "managed");
-        if (m && !cJSON_IsBool(m)) {
-            fail(error, size, "power.managed 必须是 true/false");
-            goto out;
-        }
-        c->power_managed = m && cJSON_IsTrue(m);
     }
     drive = obj(root, "drive");
     if (drive) {

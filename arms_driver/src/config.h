@@ -19,17 +19,14 @@ typedef struct {
     char name[ARMS_NAME_LEN];
     int arm;
     int slave;
-    char model[24];
-    uint32_t serial;        /* 0 = 尚未现场确认 */
     int direction;          /* +1 / -1 */
     double offset_rad;
     double pos_min, pos_max;
-    double vel_max, tff_max;
+    double vel_max, tff_max;    /* 指令限幅 */
+    double vel_fault, tor_fault;/* 反馈超限保护阈值 */
     double kp_max, kd_max;
     double kp_default, kd_default;
     double home;            /* 回零目标位置 [rad] */
-    int pn082_expected;    /* -1 = not checked */
-    char brake[16];         /* "normal" | "release" | "lock" */
 } arms_joint_config;
 
 typedef struct {
@@ -47,8 +44,8 @@ typedef struct {
     bool check_motors;      /* 启动时要求全部未屏蔽关节在线 */
     uint32_t ignore_mask;   /* 第 n 位对应关节 n：不打开、不检查 */
     char offline_action[16];/* "power_off" | "disable" */
-    unsigned int release_max_joints;
-    bool power_managed;
+    unsigned int overspeed_ms;  /* 速度持续超过 vel_fault 的累计时长阈值 */
+    unsigned int overtorque_ms; /* 力矩持续超过 torque_fault 的累计时长阈值 */
     unsigned int op_timeout_ms;
     uint32_t vendor_id;
     uint32_t product_code;

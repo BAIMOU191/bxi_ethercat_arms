@@ -34,7 +34,7 @@
 enum { REQ_NONE = 0, REQ_ENABLE, REQ_DISABLE, REQ_RESET, REQ_HOLD };
 
 /* 请求结果，由周期上下文写入 */
-enum { RES_PENDING = 0, RES_OK, RES_TIMEOUT, RES_FAULT, RES_STATE, RES_COMM, RES_TRIP };
+enum { RES_PENDING = 0, RES_OK, RES_TIMEOUT, RES_FAULT, RES_STATE, RES_COMM, RES_TRIP, RES_PROTECT };
 
 /* 关节控制阶段 */
 enum { CTL_OFF = 0, CTL_ENABLING, CTL_ON, CTL_RESETTING };
@@ -165,6 +165,7 @@ typedef struct {
     bool timed_out;
     bool was_fault;
     uint32_t fault_count;
+    uint32_t over_vel, over_tor;      /* 超限累计周期数：超限 +1，未超限 -1 */
 } joint_ctl;
 
 struct arms {
@@ -183,6 +184,7 @@ struct arms {
     bool power_off_action;            /* safety.offline_action = power_off */
     arm_rt arm[ARMS_ARM_COUNT];
     atomic_bool clear_trip;
+    atomic_bool clear_protect;
 
     pthread_t thread;
     bool thread_started;
@@ -202,6 +204,8 @@ struct arms {
     /* 以下仅在周期上下文中访问 */
     joint_ctl ctl[ARMS_JOINT_LAST + 1];
     bool tripped;
+    arms_protect protect;
+    uint64_t overspeed_cycles, overtorque_cycles;
     arms_mask trip_joints, offline_joints;
     uint64_t timeout_cycles;
     uint64_t reset_pulse_cycles;
@@ -289,6 +293,7 @@ static void publish(arms_t *a)
     a->snap.stats.offline_joints = a->offline_joints;
     a->snap.stats.tripped = a->tripped;
     a->snap.stats.trip_joints = a->trip_joints;
+    a->snap.stats.protect = a->protect;
     a->snap.stats.wake_late_us_max = a->wake_late_max / 1000.0;
     a->snap.stats.work_us_max = a->work_max / 1000.0;
     for (i = 0; i < ARMS_ARM_COUNT; ++i) {
@@ -340,6 +345,38 @@ static void do_reset_stats(arms_t *a)
         r->cycles = r->wkc_bad = r->send_errors = 0;
         r->consecutive_max = 0;
         r->recv_us_max = r->send_us_max = 0;
+    }
+}
+
+/*
+ * 反馈超限保护（仅对使能中的关节）：速度或力矩超过阈值时计数加 1，否则减 1，
+ * 计数达到 safety.overspeed_ms / overtorque_ms 对应的周期数时锁定保护，全部关节失能。
+ */
+static void check_limits(arms_t *a, int j, const arms_joint_state *s)
+{
+    const arms_joint_config *jc = &a->cfg.joint[j];
+    joint_ctl *c = &a->ctl[j];
+    bool ov, ot;
+
+    if (c->phase != CTL_ON) {
+        c->over_vel = c->over_tor = 0;
+        return;
+    }
+    ov = fabs(s->velocity) > jc->vel_fault;
+    ot = fabs(s->torque) > jc->tor_fault;
+    c->over_vel = ov ? c->over_vel + 1 : (c->over_vel ? c->over_vel - 1 : 0);
+    c->over_tor = ot ? c->over_tor + 1 : (c->over_tor ? c->over_tor - 1 : 0);
+    if (a->protect.reason != ARMS_PROTECT_NONE) return;
+    if (c->over_vel >= a->overspeed_cycles) {
+        a->protect.reason = ARMS_PROTECT_OVERSPEED;
+        a->protect.joint = j;
+        a->protect.value = s->velocity;
+        a->protect.limit = jc->vel_fault;
+    } else if (c->over_tor >= a->overtorque_cycles) {
+        a->protect.reason = ARMS_PROTECT_OVERTORQUE;
+        a->protect.joint = j;
+        a->protect.value = s->torque;
+        a->protect.limit = jc->tor_fault;
     }
 }
 
@@ -404,6 +441,7 @@ static void cycle_rx(arms_t *a, uint64_t now)
                 s->velocity = jc->direction * (double)f.vel;
                 s->torque = jc->direction * (double)f.torque;
                 s->sample_ns = t1;
+                check_limits(a, j, s);
             }
             s->al_state = r->al[k];
             s->mode = mode_from(r->al[k], s->status_word);
@@ -443,6 +481,11 @@ static void cycle_rx(arms_t *a, uint64_t now)
         a->offline_joints = offline;
         if (atomic_exchange_explicit(&a->clear_trip, false, memory_order_acq_rel) && !offline && !failed)
             a->tripped = false;
+        if (atomic_exchange_explicit(&a->clear_protect, false, memory_order_acq_rel)) {
+            a->protect.reason = ARMS_PROTECT_NONE;
+            a->protect.joint = -1;
+            a->protect.value = a->protect.limit = 0.0;
+        }
         if (ready && a->power_off_action && !a->tripped && (offline || failed)) {
             a->tripped = true;
             a->trip_joints = offline ? offline : failed;
@@ -523,6 +566,8 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
     case REQ_ENABLE:
         if (a->tripped) {
             finish(a, j, RES_TRIP);
+        } else if (a->protect.reason != ARMS_PROTECT_NONE) {
+            finish(a, j, RES_PROTECT);
         } else if (c->phase == CTL_ON) {
             finish(a, j, RES_OK);
         } else if (!ready || !comm_ok) {
@@ -564,9 +609,14 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
         break;
     }
 
-    if ((c->phase == CTL_ENABLING || c->phase == CTL_ON) && (fault || !op || r->comm_failed || a->tripped)) {
-        if (c->phase == CTL_ENABLING) finish(a, j, a->tripped ? RES_TRIP : fault ? RES_FAULT : RES_COMM);
-        c->phase = CTL_OFF;
+    {
+        bool protect = a->protect.reason != ARMS_PROTECT_NONE;
+        if ((c->phase == CTL_ENABLING || c->phase == CTL_ON) &&
+            (fault || !op || r->comm_failed || a->tripped || protect)) {
+            if (c->phase == CTL_ENABLING)
+                finish(a, j, a->tripped ? RES_TRIP : protect ? RES_PROTECT : fault ? RES_FAULT : RES_COMM);
+            c->phase = CTL_OFF;
+        }
     }
 
     out->mode = KGU_MODE_MIT;
@@ -865,6 +915,11 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     a->timeout_cycles = (uint64_t)a->cfg.command_timeout_ms * a->cycle_hz / 1000u;
     a->reset_pulse_cycles = (uint64_t)RESET_PULSE_MS * a->cycle_hz / 1000u;
     a->recover_cycles = (uint64_t)RECOVER_STABLE_MS * a->cycle_hz / 1000u;
+    a->overspeed_cycles = (uint64_t)a->cfg.overspeed_ms * a->cycle_hz / 1000u;
+    a->overtorque_cycles = (uint64_t)a->cfg.overtorque_ms * a->cycle_hz / 1000u;
+    if (a->overspeed_cycles == 0) a->overspeed_cycles = 1;
+    if (a->overtorque_cycles == 0) a->overtorque_cycles = 1;
+    a->protect.joint = -1;
     atomic_store(&a->enable_timeout_cycles, DEFAULT_WAIT_MS * a->cycle_hz / 1000u);
     pthread_mutex_init(&a->cmd_lock, NULL);
     a->mode = options->mode != ARMS_MODE_CONFIG ? options->mode : a->cfg.mode;
@@ -1271,6 +1326,8 @@ arms_status arms_get_limits(const arms_t *a, int joint, arms_joint_limits *l)
     l->kp_default = jc->kp_default;
     l->kd_default = jc->kd_default;
     l->home = jc->home;
+    l->vel_fault = jc->vel_fault;
+    l->torque_fault = jc->tor_fault;
     return ARMS_OK;
 }
 
@@ -1289,6 +1346,7 @@ static const char *result_text(unsigned int r)
     case RES_STATE: return "从站不在 OP 或请求被取消";
     case RES_COMM: return "通信未就绪或已失败";
     case RES_TRIP: return "离线保护已触发，需重新上电并通过在线检查";
+    case RES_PROTECT: return "超速/超力矩保护已触发，需先 reset";
     case RES_PENDING: return "未响应";
     }
     return "?";
@@ -1376,6 +1434,7 @@ arms_status arms_reset(arms_t *a, arms_mask joints, unsigned int timeout_ms)
     if (!a) return ARMS_E_ARG;
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j)
         if ((joints & a->joints & ARMS_MASK_JOINT(j))) atomic_store(&a->clear_comm[a->cfg.joint[j].arm], true);
+    atomic_store(&a->clear_protect, true);
     return request_and_wait(a, joints, REQ_RESET, timeout_ms, "复位");
 }
 
@@ -1429,7 +1488,8 @@ arms_status arms_get_joint_info(const arms_t *a, int j, arms_joint_info *out)
     if (!a || !out || j < 15 || j > 28 || !a->cfg.joint[j].present)
         return ARMS_E_ARG;
     const arms_joint_config *c = &a->cfg.joint[j];
-    *out = (arms_joint_info){c->model, c->direction, c->offset_rad, c->serial, c->pn082_expected};
+    out->direction = c->direction;
+    out->offset_rad = c->offset_rad;
     return ARMS_OK;
 }
 int arms_pn_index(unsigned n)
@@ -1477,40 +1537,6 @@ static arms_status verified(arms_t *a, int j, unsigned n, uint16_t value)
     }
     return ARMS_OK;
 }
-arms_status arms_verify_joint(arms_t *a, int j, bool strict)
-{
-    if (!a || j < 15 || j > 28 || !(a->joints & ARMS_MASK_JOINT(j)))
-        return ARMS_E_ARG;
-    const arms_joint_config *c = &a->cfg.joint[j];
-    uint8_t data[4];
-    size_t n;
-    if (strict && a->opt.backend != ARMS_BACKEND_MOCK && (!c->serial || !strcmp(c->model, "UNVERIFIED"))) {
-        set_error("关节 %d 的 serial/model 尚未现场确认", j);
-        return ARMS_E_CONFIG;
-    }
-    if (c->serial) {
-        arms_status st = arms_sdo_read(a, j, 0x1018, 4, data, 4, &n);
-        if (st != ARMS_OK)
-            return st;
-        uint32_t serial = n == 4 ? ((uint32_t)data[3] << 24) | ((uint32_t)data[2] << 16) |
-                                       ((uint32_t)data[1] << 8) | data[0]
-                                 : 0;
-        if (serial != c->serial) {
-            set_error("关节 %d 从站序列号与配置不一致", j);
-            return ARMS_E_TOPOLOGY;
-        }
-    }
-    if (c->pn082_expected >= 0) {
-        arms_status st = arms_sdo_read(a, j, 0x2082, 0, data, 4, &n);
-        if (st != ARMS_OK)
-            return st;
-        if (n != 2 || kgu_get_u16(data, 0) != c->pn082_expected) {
-            set_error("关节 %d Pn082 与配置不一致", j);
-            return ARMS_E_CONFIG;
-        }
-    }
-    return ARMS_OK;
-}
 static arms_status maintenance_ready(arms_t *a, int j, bool confirmed, arms_joint_state *s)
 {
     if (!a || !a->opt.maintenance || !confirmed) {
@@ -1527,7 +1553,7 @@ static arms_status maintenance_ready(arms_t *a, int j, bool confirmed, arms_join
         set_error("要求反馈新鲜、通信正常、未触发保护、驱动器已失能");
         return ARMS_E_STATE;
     }
-    return arms_verify_joint(a, j, true);
+    return ARMS_OK;
 }
 arms_status arms_pn_write(arms_t *a, int j, unsigned n, unsigned v, bool confirmed)
 {
@@ -1557,7 +1583,7 @@ arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
     size_t n = 0;
     switch (op) {
     case ARMS_RELEASE:
-        if (a->released & ~bit || a->cfg.release_max_joints < 1) {
+        if (a->released & ~bit) {
             set_error("请先锁回已释放关节");
             return ARMS_E_STATE;
         }

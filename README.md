@@ -97,6 +97,9 @@ ctest --test-dir build --output-on-failure
 | `check_motors` | `true`：启动时未屏蔽的关节必须全部在线，否则打开失败（`arms_test` 随即下电）；`false`：不在线的关节本次不使用 |
 | `ignore_mask` | 31 位屏蔽掩码，第 n 位对应关节 n。被屏蔽的关节不打开、不检查，掉线不触发保护。`arms_test -m` 可覆盖 |
 | `offline_action` | `power_off`：运行中未屏蔽的关节掉线时全部失能并锁定保护（`arms_test` 同时下电），`power on` 重新上电并检查后解除；`disable`：只失能，恢复后自动重连 |
+| `overspeed_ms` / `overtorque_ms` | 反馈超限保护的累计时长，默认 500 / 100 ms。使能中的关节反馈速度超过 `limit.vel_fault` 或力矩超过 `limit.torque_fault` 时计数加 1，否则减 1，达到该时长即全部关节失能并锁定，`reset` 清除 |
+
+每个关节的配置项：`joint`、`name`、`arm`、`slave` 必填；`direction`、`offset_rad`、`home`、`limit`（`pos`、`vel`、`tff` 为指令限幅，`vel_fault`、`torque_fault` 为反馈保护阈值）、`gain_max`、`gain_default` 可选。
 
 EtherCAT 为串联链路，链中一个电机断电通常会使其后的电机一并离线，屏蔽链中间的关节不能避免保护触发。
 

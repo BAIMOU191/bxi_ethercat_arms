@@ -166,6 +166,24 @@ typedef struct {
     double send_us_max;
 } arms_arm_stats;
 
+/** 保护原因 */
+typedef enum {
+    ARMS_PROTECT_NONE = 0,
+    ARMS_PROTECT_OVERSPEED,  /**< 反馈速度超过 limit.vel_fault 累计 safety.overspeed_ms */
+    ARMS_PROTECT_OVERTORQUE, /**< 反馈力矩超过 limit.torque_fault 累计 safety.overtorque_ms */
+} arms_protect_reason;
+
+/**
+ * 超速/超力矩保护：任一使能关节触发后，全部关节失能并锁定，
+ * 拒绝使能，直到 arms_reset() 清除。
+ */
+typedef struct {
+    arms_protect_reason reason;
+    int joint;        /**< 触发关节，无则 -1 */
+    double value;     /**< 触发时的反馈速度 [rad/s] 或力矩 [N.m] */
+    double limit;     /**< 对应阈值 */
+} arms_protect;
+
 /** 总线与周期统计 */
 typedef struct {
     unsigned int cycle_hz;
@@ -179,6 +197,7 @@ typedef struct {
     arms_mask offline_joints;        /**< 当前不在线（AL 未响应）的已打开关节 */
     bool tripped;                    /**< 离线保护已触发（safety.offline_action = power_off），需 arms_clear_trip() */
     arms_mask trip_joints;           /**< 触发保护时不在线的关节 */
+    arms_protect protect;            /**< 超速/超力矩保护状态 */
 } arms_bus_stats;
 
 /**
@@ -278,6 +297,8 @@ typedef struct {
     double kp_max, kd_max;
     double kp_default, kd_default;
     double home;              /**< 回零位置 [rad] */
+    double vel_fault;         /**< 反馈速度保护阈值 [rad/s] */
+    double torque_fault;      /**< 反馈力矩保护阈值 [N.m] */
 } arms_joint_limits;
 
 /** @brief 读取关节限位，关节未打开时返回 ARMS_E_ARG */
@@ -301,7 +322,7 @@ arms_status arms_disable(arms_t *arms, arms_mask joints);
  * @brief 故障复位（控制字 0x0080 脉冲），复位后关节处于失能
  * @param timeout_ms 等待故障位清除的超时，0 表示 1000 ms
  *
- * 同时清除所属臂的通信失败标志（当前通信须已恢复）。
+ * 同时清除所属臂的通信失败标志（当前通信须已恢复）和超速/超力矩保护。
  */
 arms_status arms_reset(arms_t *arms, arms_mask joints, unsigned int timeout_ms);
 
@@ -328,23 +349,41 @@ arms_status arms_set_command(arms_t *arms, int joint, const arms_command *comman
 /** @brief 关节保持当前指令位置：速度与前馈清零，增益不变 */
 arms_status arms_hold(arms_t *arms, arms_mask joints);
 
-/* 以下维护接口仅由同一个非实时管理线程调用。写操作要求维护模式、在线且失能。 */
-typedef enum { ARMS_RELEASE, ARMS_LOCK, ARMS_ZERO_SOFT, ARMS_ZERO_HW, ARMS_SAVE } arms_service_op;
-arms_status arms_service(arms_t *, int joint, arms_service_op op, bool confirmed);
-arms_status arms_sdo_read(arms_t *, int joint, uint16_t index, uint8_t sub, uint8_t *out, size_t cap,
+/*
+ * 维护接口：只能在同一个非实时管理线程中调用（内部使用阻塞的 SDO 访问）。
+ * 写操作要求 arms_options.maintenance 会话、通信正常、未触发保护、驱动器失能，且 confirmed 为 true。
+ */
+
+/** 维护操作 */
+typedef enum {
+    ARMS_RELEASE,   /**< Pn075 = 1，强制松开抱闸；同一时间只允许一个关节 */
+    ARMS_LOCK,      /**< Pn075 = 0，恢复正常抱闸控制 */
+    ARMS_ZERO_SOFT, /**< 以当前位置为零点，写入配置 offset_rad，下次启动生效 */
+    ARMS_ZERO_HW,   /**< Pn101 清零脉冲，需重新上电生效 */
+    ARMS_SAVE,      /**< Pn097 参数保存脉冲 */
+} arms_service_op;
+
+/** @brief 执行维护操作 */
+arms_status arms_service(arms_t *arms, int joint, arms_service_op op, bool confirmed);
+
+/** @brief 读取对象字典 */
+arms_status arms_sdo_read(arms_t *arms, int joint, uint16_t index, uint8_t sub, uint8_t *out, size_t cap,
                           size_t *size);
-arms_status arms_pn_write(arms_t *, int joint, unsigned number, unsigned value, bool confirmed);
-typedef struct {
-    const char *model;
-    int direction;
-    double offset_rad;
-    uint32_t serial;
-    int pn082;
-} arms_joint_info;
-arms_status arms_get_joint_info(const arms_t *, int joint, arms_joint_info *);
+
+/** @brief 写入白名单内的 Pn 参数并回读校验 */
+arms_status arms_pn_write(arms_t *arms, int joint, unsigned number, unsigned value, bool confirmed);
+
+/** @brief Pn 参数号对应的对象字典索引（Pn075 → 0x2075），无效返回 -1 */
 int arms_pn_index(unsigned number);
-/* 检查当前设备与配置；strict 要求实机序列号和型号已确认。 */
-arms_status arms_verify_joint(arms_t *, int joint, bool strict);
+
+/** 关节的配置映射 */
+typedef struct {
+    int direction;     /**< +1 / -1 */
+    double offset_rad; /**< 零位偏置 */
+} arms_joint_info;
+
+/** @brief 读取关节的方向与零位偏置 */
+arms_status arms_get_joint_info(const arms_t *arms, int joint, arms_joint_info *info);
 /** @brief 版本字符串 */
 const char *arms_version(void);
 

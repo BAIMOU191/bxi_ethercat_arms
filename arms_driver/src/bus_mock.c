@@ -6,6 +6,7 @@
  *   ARMS_MOCK_SLAVES=<n>       每条臂的从站数（默认 7）
  *   ARMS_MOCK_DROP_PPM=<ppm>   每周期 WKC 为 0 的概率（故障注入）
  *   ARMS_MOCK_FAULT_CYCLE=<n>  第 n 周期后，主站 0 链上位置 0 的从站在使能状态下报故障
+ *   ARMS_MOCK_OVERSPEED_CYCLE=<n> 第 n 周期后，主站 0 链上位置 0 的从站在使能状态下反馈速度 10 rad/s
  *   ARMS_MOCK_POWER_OFF=<s>,<n> 主站 0 从第 s 周期起掉电 n 个周期，恢复后从站报同步丢失故障
  */
 #include <stdio.h>
@@ -25,6 +26,7 @@ struct bus {
     float pos[BUS_MAX_SLAVES];
     uint16_t sw[BUS_MAX_SLAVES];
     uint64_t fault_cycle;
+    uint64_t overspeed_cycle;
     uint64_t off_start, off_len;
     uint64_t activated_ns;
     uint64_t cycles;
@@ -60,6 +62,8 @@ static int mock_open(bus_t **out, const bus_open_params *p, char *err, size_t er
     if (s) sscanf(s, "%llu,%llu", (unsigned long long *)&b->off_start, (unsigned long long *)&b->off_len);
     s = getenv("ARMS_MOCK_FAULT_CYCLE");
     b->fault_cycle = s ? strtoull(s, NULL, 10) : 0;
+    s = getenv("ARMS_MOCK_OVERSPEED_CYCLE");
+    b->overspeed_cycle = s ? strtoull(s, NULL, 10) : 0;
     b->rng = 0x12345678u;
     b->master = p->master;
     if (b->master < 0) {
@@ -168,6 +172,9 @@ static int mock_receive(bus_t *b)
         if ((f.statusword & 0x006Fu) == 0x0027u && c.kp > 0.0f) b->pos[i] += (c.pos - b->pos[i]) * 0.02f;
         f.pos = b->pos[i];
         f.vel = (b->pos[i] - prev) * 1000.0f;
+        if (b->overspeed_cycle && b->master == 0 && b->positions[i] == 0 && b->cycles >= b->overspeed_cycle &&
+            (f.statusword & 0x006Fu) == 0x0027u)
+            f.vel = 10.0f;
         f.torque = 0.0f;
         f.error = (f.statusword & 0x0008u) ? 0x7500u : 0;
         memset(tmp, 0, sizeof(tmp));

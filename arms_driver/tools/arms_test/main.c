@@ -205,6 +205,12 @@ static void print_protection(const arms_bus_stats *st)
     if (st->tripped) print_mask_line("  [保护已触发] 触发关节", st->trip_joints);
     else printf("\n");
     if (st->offline_joints) print_mask_line("当前不在线", st->offline_joints);
+    if (st->protect.reason != ARMS_PROTECT_NONE)
+        printf("超限保护: [已触发] 关节 %d %s %.4f 超过阈值 %.4f，执行 reset 清除\n", st->protect.joint,
+               st->protect.reason == ARMS_PROTECT_OVERSPEED ? "速度(rad/s)" : "力矩(N.m)", st->protect.value,
+               st->protect.limit);
+    else
+        printf("超限保护: 正常\n");
 }
 
 /* ---- check ---- */
@@ -603,10 +609,10 @@ static int cmd_info(int argc, char **argv)
             arms_joint_limits l;
             arms_get_joint_info(g_arms, j, &q);
             arms_get_limits(g_arms, j, &l);
-            printf("    型号 %s 方向 %+d 偏置 %.6f rad 配置序列号 0x%08x Pn082期望 %d\n", q.model,
-                   q.direction, q.offset_rad, q.serial, q.pn082);
-            printf("    位置 [%.3f, %.3f] rad 速度 %.3f rad/s 前馈 %.3f N.m Kp/Kd上限 %.2f/%.2f\n", l.pos_min,
-                   l.pos_max, l.vel_max, l.tff_max, l.kp_max, l.kd_max);
+            printf("    方向 %+d 偏置 %.6f rad 回零位置 %.4f rad\n", q.direction, q.offset_rad, l.home);
+            printf("    指令限幅: 位置 [%.3f, %.3f] rad 速度 %.3f rad/s 前馈 %.3f N.m Kp/Kd上限 %.2f/%.2f\n",
+                   l.pos_min, l.pos_max, l.vel_max, l.tff_max, l.kp_max, l.kd_max);
+            printf("    反馈保护: 速度 %.3f rad/s 力矩 %.3f N.m\n", l.vel_fault, l.torque_fault);
         }
     }
     return ok();
@@ -638,17 +644,33 @@ static int cmd_selftest(int argc, char **argv)
     arms_bus_stats st;
     arms_get_stats(g_arms, &st);
     if (st.tripped)
-        return failed("保护已锁定");
+        return failed("离线保护已锁定");
+    if (st.protect.reason != ARMS_PROTECT_NONE)
+        return failed("超速/超力矩保护已锁定（关节 %d），执行 reset 清除", st.protect.joint);
     for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; j++)
         if (arms_opened_joints(g_arms) & ARMS_MASK_JOINT(j)) {
             arms_joint_state s;
             arms_read_joint(g_arms, j, &s);
-            if (arms_verify_joint(g_arms, j, false) != ARMS_OK)
-                return failed("%s", arms_last_error());
             if (s.error_code || s.mode == ARMS_JS_FAULT)
                 return failed("关节 %d 故障 0x%04x", j, s.error_code);
         }
     return ok();
+}
+
+/* 启动自检：在线检查已在打开时完成；驱动器残留故障先自动复位一次，仍有故障只告警 */
+static void startup_selftest(void)
+{
+    arms_mask faulted = 0;
+    for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; j++)
+        if (arms_opened_joints(g_arms) & ARMS_MASK_JOINT(j)) {
+            arms_joint_state s;
+            arms_read_joint(g_arms, j, &s);
+            if (s.mode == ARMS_JS_FAULT || s.error_code) faulted |= ARMS_MASK_JOINT(j);
+        }
+    if (!faulted) return;
+    tlog("自检: 发现驱动器故障，自动复位一次");
+    if (arms_reset(g_arms, faulted, 0) != ARMS_OK)
+        tlog_err("自检: 复位未完成: %s；可手动执行 reset 或查看 status", arms_last_error());
 }
 static bool uint_arg(const char *s, unsigned max, unsigned *out)
 {
@@ -958,6 +980,7 @@ static void build_prompt(char *buf, size_t size)
     {
         char state[32] = "";
         if (fault >= 0) snprintf(state, sizeof(state), " FAULT:%d", fault);
+        else if (st.protect.reason != ARMS_PROTECT_NONE) snprintf(state, sizeof(state), " PROT:%d", st.protect.joint);
         snprintf(buf, size, "arms %s L%d/%d R%d/%d E%d%s%s%s> ", hz, st.arm[0].slaves_op, st.arm[0].slaves_expected,
                  st.arm[1].slaves_op, st.arm[1].slaves_expected, enabled, state,
                  (st.arm[0].comm_failed || st.arm[1].comm_failed) ? " COMM!" : "", st.tripped ? " TRIP" : "");
@@ -1187,10 +1210,7 @@ int main(int argc, char **argv)
         arms_get_stats(g_arms, &bs);
         print_stats(&bs);
     }
-    if (cmd_selftest(0, NULL)) {
-        rc = 1;
-        goto close_session;
-    }
+    startup_selftest();
     motion_set_trip_handler(on_trip);
     if (motion_start(g_arms, &g_interrupted, nexec > 0) != 0) {
         rc = 1;
