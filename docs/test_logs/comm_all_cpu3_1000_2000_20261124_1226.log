@@ -1,0 +1,196 @@
+== 通信测试 2026-11-24 12:26:26  关节 all  每轮 300s  频率 1000 2000
+-- 主站绑定: 72:fa:76:be:f3:0e,a2:b2:41:5f:5c:5f
+配置: /home/bxi/bxi_ws/bxi_ethercat_arms/arms_driver/config/arms.json  实时 CPU 3  中断 CPU 3  网口 eth0,eth1
+  中断 83 (eth0) -> CPU 3
+  中断 84 (eth0) -> CPU 3
+  中断 105 (eth1) -> CPU 3
+  中断 106 (eth1) -> CPU 3
+  ksoftirqd/3 -> SCHED_FIFO 70
+  745 个线程限制到 CPU 0,1,2,4,5,6,7
+  kerneloops 已暂停
+完成
+
+== 1000 Hz
+arms_test 0.1.0-e48f914 (Nov 24 2026 12:25:42)
+电源: 已请求上电，等待驱动器启动 3000 ms
+启动: EtherLab 后端，扫描并预热，全部关节保持伺服失能
+  配置: /home/bxi/bxi_ws/bxi_ethercat_arms/arms_driver/config/arms.json
+  left 臂: 网口 eth0, 主站 0, 扫描中
+  left 臂: 发现 7 个从站, 使用 7 个
+  right 臂: 网口 eth1, 主站 1, 扫描中
+  right 臂: 发现 7 个从站, 使用 7 个
+  实时线程: SCHED_FIFO 80, CPU 3, 1000 Hz
+  预热中: OP 从站 左 2/7, 右 2/7
+  预热中: OP 从站 左 4/7, 右 4/7
+  预热中: OP 从站 左 5/7, 右 6/7
+  预热中: OP 从站 左 5/7, 右 6/7
+  预热中: OP 从站 左 6/7, 右 7/7
+  预热中: OP 从站 左 7/7, 右 7/7
+  预热完成: 14 个关节处于 OP, 伺服失能
+周期 1000 Hz  已运行 3 周期  平均 1000.4 us  最短 1000.4  最长 1000.4  抖动RMS 0.42 us
+唤醒最大延迟 13.2 us  单周期最大耗时 70.0 us  超时(>1.5T) 0  跳过周期 0
+left  eth0 主站0 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 8.2 us 发 21.3 us
+right eth1 主站1 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 5.5 us 发 17.5 us
+>> info
+版本     0.1.0-e48f914 (Nov 24 2026 12:25:42)
+配置     /home/bxi/bxi_ws/bxi_ethercat_arms/arms_driver/config/arms.json
+后端     etherlab
+周期     1kHz
+实时 CPU 3
+关节映射:
+  15 l_shoulder_y_joint   left 臂 slave 0
+  16 l_shoulder_x_joint   left 臂 slave 1
+  17 l_shoulder_z_joint   left 臂 slave 2
+  18 l_elbow_y_joint      left 臂 slave 3
+  19 l_wrist_x_joint      left 臂 slave 4
+  20 l_wrist_y_joint      left 臂 slave 5
+  21 l_wrist_z_joint      left 臂 slave 6
+  22 r_shoulder_y_joint   right 臂 slave 0
+  23 r_shoulder_x_joint   right 臂 slave 1
+  24 r_shoulder_z_joint   right 臂 slave 2
+  25 r_elbow_y_joint      right 臂 slave 3
+  26 r_wrist_x_joint      right 臂 slave 4
+  27 r_wrist_y_joint      right 臂 slave 5
+  28 r_wrist_z_joint      right 臂 slave 6
+OK
+>> commtest 300
+失能通信测试 300 秒，回车或 Ctrl+C 提前结束...
+   10 s  周期 10029  WKC异常 左 0 右 0  周期最长 1002.8 us
+   20 s  周期 20040  WKC异常 左 0 右 0  周期最长 1003.3 us
+   30 s  周期 30051  WKC异常 左 0 右 0  周期最长 1003.6 us
+   40 s  周期 40059  WKC异常 左 0 右 0  周期最长 1005.7 us
+   50 s  周期 50070  WKC异常 左 0 右 0  周期最长 1005.7 us
+   60 s  周期 60080  WKC异常 左 0 右 0  周期最长 1005.7 us
+   70 s  周期 70089  WKC异常 左 0 右 0  周期最长 1008.0 us
+   80 s  周期 80099  WKC异常 左 0 右 0  周期最长 1008.3 us
+   90 s  周期 90110  WKC异常 左 0 右 0  周期最长 1008.3 us
+  100 s  周期 100120  WKC异常 左 0 右 0  周期最长 1008.3 us
+  110 s  周期 110129  WKC异常 左 0 右 0  周期最长 1008.3 us
+  120 s  周期 120140  WKC异常 左 0 右 0  周期最长 1008.3 us
+  130 s  周期 130151  WKC异常 左 0 右 0  周期最长 1009.2 us
+  140 s  周期 140161  WKC异常 左 0 右 0  周期最长 1009.2 us
+  150 s  周期 150170  WKC异常 左 0 右 0  周期最长 1009.2 us
+  160 s  周期 160180  WKC异常 左 0 右 0  周期最长 1009.2 us
+  170 s  周期 170190  WKC异常 左 0 右 0  周期最长 1009.2 us
+  180 s  周期 180198  WKC异常 左 0 右 0  周期最长 1009.2 us
+  190 s  周期 190208  WKC异常 左 0 右 0  周期最长 1010.3 us
+  200 s  周期 200218  WKC异常 左 0 右 0  周期最长 1010.3 us
+  210 s  周期 210228  WKC异常 左 0 右 0  周期最长 1010.3 us
+  220 s  周期 220238  WKC异常 左 0 右 0  周期最长 1010.3 us
+  230 s  周期 230248  WKC异常 左 0 右 0  周期最长 1010.3 us
+  240 s  周期 240258  WKC异常 左 0 右 0  周期最长 1010.3 us
+  250 s  周期 250269  WKC异常 左 0 右 0  周期最长 1010.3 us
+  260 s  周期 260278  WKC异常 左 0 右 0  周期最长 1010.3 us
+  270 s  周期 270288  WKC异常 左 0 右 0  周期最长 1010.3 us
+  280 s  周期 280298  WKC异常 左 0 右 0  周期最长 1010.3 us
+  290 s  周期 290308  WKC异常 左 0 右 0  周期最长 1010.4 us
+  300 s  周期 300319  WKC异常 左 0 右 0  周期最长 1010.4 us
+周期 1000 Hz  已运行 300319 周期  平均 1000.0 us  最短 989.3  最长 1010.4  抖动RMS 0.63 us
+唤醒最大延迟 23.4 us  单周期最大耗时 100.0 us  超时(>1.5T) 0  跳过周期 0
+left  eth0 主站0 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 23.6 us 发 48.4 us
+right eth1 主站1 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 38.2 us 发 33.5 us
+结果: 通过（无 WKC 异常、无发送错误、无超时周期）
+OK
+>> bus
+周期 1000 Hz  已运行 300319 周期  平均 1000.0 us  最短 989.3  最长 1010.4  抖动RMS 0.63 us
+唤醒最大延迟 23.4 us  单周期最大耗时 100.0 us  超时(>1.5T) 0  跳过周期 0
+left  eth0 主站0 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 23.6 us 发 48.4 us
+right eth1 主站1 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 38.2 us 发 33.5 us
+OK
+退出: 停止通信并释放主站
+电源: 已请求断电（实际断电请以现场指示为准）
+已退出
+
+== 2000 Hz
+arms_test 0.1.0-e48f914 (Nov 24 2026 12:25:42)
+电源: 已请求上电，等待驱动器启动 3000 ms
+启动: EtherLab 后端，扫描并预热，全部关节保持伺服失能
+  配置: /home/bxi/bxi_ws/bxi_ethercat_arms/arms_driver/config/arms.json
+  left 臂: 网口 eth0, 主站 0, 扫描中
+  left 臂: 发现 7 个从站, 使用 7 个
+  right 臂: 网口 eth1, 主站 1, 扫描中
+  right 臂: 发现 7 个从站, 使用 7 个
+  实时线程: SCHED_FIFO 80, CPU 3, 2000 Hz
+  预热中: OP 从站 左 2/7, 右 2/7
+  预热中: OP 从站 左 4/7, 右 4/7
+  预热中: OP 从站 左 6/7, 右 6/7
+  预热完成: 14 个关节处于 OP, 伺服失能
+周期 2000 Hz  已运行 4 周期  平均 499.8 us  最短 499.6  最长 499.9  抖动RMS 0.26 us
+唤醒最大延迟 13.3 us  单周期最大耗时 65.6 us  超时(>1.5T) 0  跳过周期 0
+left  eth0 主站0 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 8.2 us 发 17.5 us
+right eth1 主站1 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 5.0 us 发 14.0 us
+>> info
+版本     0.1.0-e48f914 (Nov 24 2026 12:25:42)
+配置     /home/bxi/bxi_ws/bxi_ethercat_arms/arms_driver/config/arms.json
+后端     etherlab
+周期     2kHz
+实时 CPU 3
+关节映射:
+  15 l_shoulder_y_joint   left 臂 slave 0
+  16 l_shoulder_x_joint   left 臂 slave 1
+  17 l_shoulder_z_joint   left 臂 slave 2
+  18 l_elbow_y_joint      left 臂 slave 3
+  19 l_wrist_x_joint      left 臂 slave 4
+  20 l_wrist_y_joint      left 臂 slave 5
+  21 l_wrist_z_joint      left 臂 slave 6
+  22 r_shoulder_y_joint   right 臂 slave 0
+  23 r_shoulder_x_joint   right 臂 slave 1
+  24 r_shoulder_z_joint   right 臂 slave 2
+  25 r_elbow_y_joint      right 臂 slave 3
+  26 r_wrist_x_joint      right 臂 slave 4
+  27 r_wrist_y_joint      right 臂 slave 5
+  28 r_wrist_z_joint      right 臂 slave 6
+OK
+>> commtest 300
+失能通信测试 300 秒，回车或 Ctrl+C 提前结束...
+   10 s  周期 20059  WKC异常 左 0 右 0  周期最长 518.9 us
+   20 s  周期 40077  WKC异常 左 0 右 0  周期最长 518.9 us
+   30 s  周期 60095  WKC异常 左 0 右 0  周期最长 518.9 us
+   40 s  周期 80115  WKC异常 左 0 右 0  周期最长 518.9 us
+   50 s  周期 100135  WKC异常 左 0 右 0  周期最长 518.9 us
+   60 s  周期 120154  WKC异常 左 0 右 0  周期最长 554.8 us
+   70 s  周期 140172  WKC异常 左 0 右 0  周期最长 554.8 us
+   80 s  周期 160193  WKC异常 左 0 右 0  周期最长 554.8 us
+   90 s  周期 180212  WKC异常 左 0 右 0  周期最长 554.8 us
+  100 s  周期 200232  WKC异常 左 0 右 0  周期最长 554.8 us
+  110 s  周期 220250  WKC异常 左 0 右 0  周期最长 554.8 us
+  120 s  周期 240270  WKC异常 左 0 右 0  周期最长 554.8 us
+  130 s  周期 260285  WKC异常 左 0 右 0  周期最长 554.8 us
+  140 s  周期 280303  WKC异常 左 0 右 0  周期最长 554.8 us
+  150 s  周期 300321  WKC异常 左 0 右 0  周期最长 554.8 us
+  160 s  周期 320340  WKC异常 左 0 右 0  周期最长 554.8 us
+  170 s  周期 340355  WKC异常 左 0 右 0  周期最长 554.8 us
+  180 s  周期 360374  WKC异常 左 0 右 0  周期最长 554.8 us
+  190 s  周期 380395  WKC异常 左 0 右 0  周期最长 554.8 us
+  200 s  周期 400414  WKC异常 左 0 右 0  周期最长 554.8 us
+  210 s  周期 420430  WKC异常 左 0 右 0  周期最长 554.8 us
+  220 s  周期 440450  WKC异常 左 0 右 0  周期最长 554.8 us
+  230 s  周期 460468  WKC异常 左 0 右 0  周期最长 554.8 us
+  240 s  周期 480488  WKC异常 左 0 右 0  周期最长 554.8 us
+  250 s  周期 500509  WKC异常 左 0 右 0  周期最长 554.8 us
+  260 s  周期 520530  WKC异常 左 0 右 0  周期最长 554.8 us
+  270 s  周期 540547  WKC异常 左 0 右 0  周期最长 554.8 us
+  280 s  周期 560567  WKC异常 左 0 右 0  周期最长 554.8 us
+  290 s  周期 580585  WKC异常 左 0 右 0  周期最长 554.8 us
+  300 s  周期 600606  WKC异常 左 0 右 0  周期最长 554.8 us
+周期 2000 Hz  已运行 600606 周期  平均 500.0 us  最短 445.7  最长 554.8  抖动RMS 0.64 us
+唤醒最大延迟 67.9 us  单周期最大耗时 76.7 us  超时(>1.5T) 0  跳过周期 0
+left  eth0 主站0 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 18.4 us 发 39.7 us
+right eth1 主站1 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 26.8 us 发 32.1 us
+结果: 通过（无 WKC 异常、无发送错误、无超时周期）
+OK
+>> bus
+周期 2000 Hz  已运行 600606 周期  平均 500.0 us  最短 445.7  最长 554.8  抖动RMS 0.64 us
+唤醒最大延迟 67.9 us  单周期最大耗时 76.7 us  超时(>1.5T) 0  跳过周期 0
+left  eth0 主站0 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 18.4 us 发 39.7 us
+right eth1 主站1 链路UP  从站 OP 7/7(总线上 7)  WKC 21/21  异常 0 (最长连续 0)  发送错误 0  收 26.8 us 发 32.1 us
+OK
+退出: 停止通信并释放主站
+电源: 已请求断电（实际断电请以现场指示为准）
+已退出
+
+== 结论
+  1000 Hz: 通过
+  2000 Hz: 通过
+日志: /tmp/arms_comm_20261124_122626.log
+已还原（线程 738 个，已退出 7 个）
