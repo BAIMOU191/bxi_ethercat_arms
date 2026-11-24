@@ -18,7 +18,7 @@ ros2 run arms_ros arms_node --ros-args -p mock:=true -p config:=$(realpath arms_
 | hardware/joint_states | sensor_msgs/msg/JointState，100 Hz，仅发布本会话已打开关节 |
 | hardware/actuator_states | communication/msg/ActuatorStates，100 Hz；PDO 不含温度，温度用 NaN 表示未知，不用零伪装有效值 |
 | hardware/arms/diagnostics | diagnostic_msgs/msg/DiagnosticArray，2 Hz，按臂报告链路、WKC、保护关节、屏蔽、启动缺失和被拒绝的命令计数 |
-| arms/enable、disable、reset、selftest、brake_release、brake_lock、zero | arms_ros/srv/JointOperation：joints 是关节位掩码，confirm 是操作确认；hardware_zero 仅对 zero 有效。brake_release / brake_lock 接受任意关节组合（brake_release 要求关节失能），zero 只接受单个关节；有关节松闸时 enable 被拒绝。 |
+| arms/enable、disable、reset、selftest、free、brake_normal、brake_release、brake_hold、zero | arms_ros/srv/JointOperation：joints 是关节位掩码，confirm 是操作确认（disable 和 selftest 除外）；hardware_zero 仅对 zero 有效。free 为零力矩拖动（kp=0、kd=0）。brake_* 临时设置 Pn075 = 0/1/2，不保存；brake_release / brake_hold 要求关节失能，任一关节不是 normal 时 enable 和 free 被拒绝。zero 要求关节失能、静止，软件校零立即生效。 |
 
 状态和目标使用 SensorDataQoS / depth 1，诊断使用可靠 QoS。发生 power_off 保护时，独立监视线程请求失能；如节点拥有电源则请求断电，并保持会话锁定。恢复接线并确认安全后重新启动节点，不自动恢复使能。运行中丢失上位机目标时沿用驱动配置的超时保持或失能策略。
 

@@ -80,6 +80,7 @@ const char *arms_joint_mode_name(arms_joint_mode m)
     case ARMS_JS_SAFEOP: return "safeop";
     case ARMS_JS_LOCKED: return "locked";
     case ARMS_JS_RELEASED: return "released";
+    case ARMS_JS_HELD: return "held";
     case ARMS_JS_ENABLED: return "enabled";
     case ARMS_JS_FAULT: return "FAULT";
     }
@@ -169,8 +170,10 @@ typedef struct {
 } joint_ctl;
 
 struct arms {
-    atomic_uint brake_confirmed;
-    arms_mask released; /* 管理线程独占；含尚未确认锁回的关节 */
+    /* 抱闸模式记录（Pn075），由管理线程更新；掩码用原子量供读取接口显示 */
+    atomic_uint brake_released;       /* Pn075 = 1 的关节 */
+    atomic_uint brake_held;           /* Pn075 = 2 的关节 */
+    arms_mask brake_touched;          /* 本次会话改动过抱闸模式的关节 */
     arms_config cfg;
     arms_options opt;
     const bus_ops *ops;
@@ -1122,10 +1125,11 @@ fail:
 void arms_close(arms_t *a)
 {
     if (a) {
+        arms_mask abnormal = atomic_load(&a->brake_released) | atomic_load(&a->brake_held);
         for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; j++)
-            if (a->released & ARMS_MASK_JOINT(j)) {
-                if (arms_service(a, j, ARMS_LOCK, true) != ARMS_OK)
-                    logf_(a, "警告：关节 %d 未能确认锁闸，请保持机械支撑", j);
+            if (a->brake_touched & abnormal & ARMS_MASK_JOINT(j)) {
+                if (arms_set_brake(a, j, ARMS_BRAKE_NORMAL, true) != ARMS_OK)
+                    logf_(a, "警告：关节 %d 未能恢复正常抱闸控制，请保持机械支撑", j);
             }
         stop_and_free(a);
     }
@@ -1187,6 +1191,15 @@ arms_status arms_wait_ready(arms_t *a, unsigned int timeout_ms)
 
 uint64_t arms_period_ns(const arms_t *a) { return a ? a->period_ns : 0; }
 
+/* 失能关节按抱闸模式显示为 released / held */
+static void apply_brake_mode(arms_t *a, arms_joint_state *s)
+{
+    arms_mask bit = ARMS_MASK_JOINT(s->joint);
+    if (s->mode != ARMS_JS_LOCKED) return;
+    if (atomic_load(&a->brake_released) & bit) s->mode = ARMS_JS_RELEASED;
+    else if (atomic_load(&a->brake_held) & bit) s->mode = ARMS_JS_HELD;
+}
+
 arms_status arms_read(arms_t *a, arms_joint_state *states, size_t count, size_t *written)
 {
     shared_snapshot s;
@@ -1197,8 +1210,7 @@ arms_status arms_read(arms_t *a, arms_joint_state *states, size_t count, size_t 
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST && n < count; ++j)
         if (a->joints & ARMS_MASK_JOINT(j)) {
             states[n] = s.s[j];
-            if (states[n].mode == ARMS_JS_LOCKED && (atomic_load(&a->brake_confirmed) & ARMS_MASK_JOINT(j)))
-                states[n].mode = ARMS_JS_RELEASED;
+            apply_brake_mode(a, &states[n]);
             n++;
         }
     if (written) *written = n;
@@ -1211,8 +1223,7 @@ arms_status arms_read_joint(arms_t *a, int joint, arms_joint_state *state)
     if (!a || !state || joint < ARMS_JOINT_FIRST || joint > ARMS_JOINT_LAST) return ARMS_E_ARG;
     read_snapshot(a, &s);
     *state = s.s[joint];
-    if (state->mode == ARMS_JS_LOCKED && (atomic_load(&a->brake_confirmed) & ARMS_MASK_JOINT(joint)))
-        state->mode = ARMS_JS_RELEASED;
+    apply_brake_mode(a, state);
     return ARMS_OK;
 }
 
@@ -1429,15 +1440,81 @@ static arms_status request_and_wait(arms_t *a, arms_mask mask, unsigned int req,
     return ARMS_E_STATE;
 }
 
+/* 等待周期上下文发布两次快照，使随后的读取接口看到刚生效的指令或偏置（最长 100 ms） */
+static void wait_snapshot(arms_t *a)
+{
+    unsigned int s0 = atomic_load(&a->seq);
+    uint64_t until = mono_ns() + 100000000ull;
+    while (atomic_load(&a->seq) - s0 < 4u && mono_ns() < until) usleep(500);
+}
+
+/*
+ * 抱闸不是正常控制模式时拒绝使能：强制松闸下失能后抱闸不闭合，关节失去保持；
+ * 强制抱闸下电机会顶着抱闸出力。
+ */
+static bool brake_abnormal(arms_t *a, const char *what)
+{
+    arms_mask rel = atomic_load(&a->brake_released) & a->joints;
+    arms_mask held = atomic_load(&a->brake_held) & a->joints;
+    if (!rel && !held) return false;
+    if (rel)
+        set_error("%s被拒绝: 关节 %d 处于强制松闸，先执行 brake %d normal --confirm", what, __builtin_ctz(rel),
+                  __builtin_ctz(rel));
+    else
+        set_error("%s被拒绝: 关节 %d 处于强制抱闸，先执行 brake %d normal --confirm", what, __builtin_ctz(held),
+                  __builtin_ctz(held));
+    return true;
+}
+
 arms_status arms_enable(arms_t *a, arms_mask joints, unsigned int timeout_ms)
 {
     if (!a) return ARMS_E_ARG;
-    if (a->released) {
-        /* 松闸状态下使能后再失能，抱闸不会闭合，关节会失去保持 */
-        set_error("关节 %d 处于松闸状态，先执行 lock 再使能", __builtin_ctz(a->released));
-        return ARMS_E_STATE;
-    }
+    if (brake_abnormal(a, "使能")) return ARMS_E_STATE;
     return request_and_wait(a, joints, REQ_ENABLE, timeout_ms, "使能");
+}
+
+arms_status arms_free(arms_t *a, arms_mask joints, double kd)
+{
+    arms_mask todo = 0;
+    arms_status st;
+    int j;
+    if (!a) return ARMS_E_ARG;
+    joints &= a->joints;
+    if (!joints) {
+        set_error("零力矩拖动: 没有选中已打开的关节");
+        return ARMS_E_ARG;
+    }
+    if (!isfinite(kd) || kd < 0.0) {
+        set_error("零力矩拖动: kd 必须是非负数");
+        return ARMS_E_ARG;
+    }
+    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j)
+        if ((joints & ARMS_MASK_JOINT(j)) && kd > a->cfg.joint[j].kd_max) {
+            set_error("零力矩拖动: kd %.3f 超过关节 %d 的 gain_max.kd %.3f", kd, j, a->cfg.joint[j].kd_max);
+            return ARMS_E_ARG;
+        }
+    if (brake_abnormal(a, "零力矩拖动")) return ARMS_E_STATE;
+    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        arms_joint_state s;
+        if (!(joints & ARMS_MASK_JOINT(j))) continue;
+        arms_read_joint(a, j, &s);
+        if (s.mode != ARMS_JS_ENABLED) todo |= ARMS_MASK_JOINT(j);
+    }
+    if (todo && (st = request_and_wait(a, todo, REQ_ENABLE, 0, "使能")) != ARMS_OK) return st;
+    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        arms_joint_state s;
+        arms_command c;
+        if (!(joints & ARMS_MASK_JOINT(j))) continue;
+        arms_read_joint(a, j, &s);
+        c.position = s.cmd_position; /* kp = 0 时不起作用，取当前指令以通过限位 */
+        c.velocity = 0.0;
+        c.torque = 0.0;
+        c.kp = 0.0;
+        c.kd = kd;
+        if ((st = arms_set_command(a, j, &c, 0.0)) != ARMS_OK) return st;
+    }
+    wait_snapshot(a);
+    return ARMS_OK;
 }
 
 arms_status arms_reset(arms_t *a, arms_mask joints, unsigned int timeout_ms)
@@ -1570,7 +1647,7 @@ static arms_status maintenance_ready_ex(arms_t *a, int j, bool confirmed, arms_j
         set_error("关节 %d 不在线或反馈过期", j);
         return ARMS_E_STATE;
     }
-    if (need_disabled && ((s->mode != ARMS_JS_LOCKED && s->mode != ARMS_JS_RELEASED) ||
+    if (need_disabled && ((s->mode != ARMS_JS_LOCKED && s->mode != ARMS_JS_RELEASED && s->mode != ARMS_JS_HELD) ||
                           (s->status_word & 0x006f) != 0x0040)) {
         set_error("关节 %d 未失能（当前 %s），先执行 disable", j, arms_joint_mode_name(s->mode));
         return ARMS_E_STATE;
@@ -1588,92 +1665,148 @@ arms_status arms_pn_write(arms_t *a, int j, unsigned n, unsigned v, bool confirm
     arms_status st = maintenance_ready(a, j, confirmed, &s);
     if (st != ARMS_OK)
         return st;
-    if (a->released) {
-        set_error("请先锁回抱闸，再修改参数");
-        return ARMS_E_STATE;
-    }
     const unsigned allowed[][2] = {{28, 5000}, {44, 9}, {82, 32767}, {106, 300}, {107, 1}};
     for (size_t i = 0; i < sizeof(allowed) / sizeof(*allowed); i++)
         if (n == allowed[i][0] && v <= allowed[i][1])
             return verified(a, j, n, v);
-    set_error("Pn 不在可写范围内；抱闸、校零、参数保存请使用 release/lock、zero、pn_save 命令");
+    set_error("Pn 不在可写范围内；抱闸、校零、参数保存请使用 brake、zero、pn_save 命令");
     return ARMS_E_ARG;
 }
-arms_status arms_brake_scan(arms_t *a, arms_mask *released, arms_mask *unknown)
+
+const char *arms_brake_mode_name(arms_brake_mode m)
 {
-    arms_mask rel = 0, unk = 0;
+    switch (m) {
+    case ARMS_BRAKE_NORMAL: return "normal";
+    case ARMS_BRAKE_RELEASE: return "release";
+    case ARMS_BRAKE_HOLD: return "hold";
+    default: return "unknown";
+    }
+}
+
+static void record_brake(arms_t *a, int j, arms_brake_mode m)
+{
+    arms_mask bit = ARMS_MASK_JOINT(j);
+    if (m == ARMS_BRAKE_RELEASE) atomic_fetch_or(&a->brake_released, bit);
+    else atomic_fetch_and(&a->brake_released, ~bit);
+    if (m == ARMS_BRAKE_HOLD) atomic_fetch_or(&a->brake_held, bit);
+    else atomic_fetch_and(&a->brake_held, ~bit);
+}
+
+arms_status arms_get_brake(arms_t *a, int j, arms_brake_mode *mode)
+{
+    uint8_t data[4];
+    size_t n = 0;
+    unsigned v;
+    arms_status st;
+    if (!a || !mode) return ARMS_E_ARG;
+    *mode = ARMS_BRAKE_UNKNOWN;
+    st = arms_sdo_read(a, j, (uint16_t)arms_pn_index(75), 0, data, sizeof(data), &n);
+    if (st != ARMS_OK) return st;
+    if (n != 2) {
+        set_error("关节 %d 的 Pn075 读回 %zu 字节", j, n);
+        return ARMS_E_COMM;
+    }
+    v = kgu_get_u16(data, 0);
+    if (v > 2) {
+        set_error("关节 %d 的 Pn075 = %u，不是有效的抱闸模式", j, v);
+        return ARMS_E_STATE;
+    }
+    *mode = (arms_brake_mode)v;
+    record_brake(a, j, *mode);
+    return ARMS_OK;
+}
+
+arms_status arms_brake_scan(arms_t *a, arms_mask *released, arms_mask *held, arms_mask *unknown)
+{
+    arms_mask rel = 0, hld = 0, unk = 0;
     int j;
     if (!a) return ARMS_E_ARG;
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
-        uint8_t data[4];
-        size_t n = 0;
-        unsigned v;
+        arms_brake_mode m;
         if (!(a->joints & ARMS_MASK_JOINT(j))) continue;
-        if (arms_sdo_read(a, j, (uint16_t)arms_pn_index(75), 0, data, sizeof(data), &n) != ARMS_OK || n != 2) {
-            unk |= ARMS_MASK_JOINT(j);
-            continue;
-        }
-        v = kgu_get_u16(data, 0);
-        if (v == 0) {
-            a->released &= ~ARMS_MASK_JOINT(j);
-            atomic_fetch_and(&a->brake_confirmed, ~ARMS_MASK_JOINT(j));
-        } else if (v == 1) {
-            rel |= ARMS_MASK_JOINT(j);
-            a->released |= ARMS_MASK_JOINT(j);
-            atomic_fetch_or(&a->brake_confirmed, ARMS_MASK_JOINT(j));
-        } else {
-            unk |= ARMS_MASK_JOINT(j); /* 2 = 强制锁闸，使能时抱闸也不会松开 */
-        }
+        if (arms_get_brake(a, j, &m) != ARMS_OK) unk |= ARMS_MASK_JOINT(j);
+        else if (m == ARMS_BRAKE_RELEASE) rel |= ARMS_MASK_JOINT(j);
+        else if (m == ARMS_BRAKE_HOLD) hld |= ARMS_MASK_JOINT(j);
     }
     if (released) *released = rel;
+    if (held) *held = hld;
     if (unknown) *unknown = unk;
     return ARMS_OK;
+}
+
+arms_status arms_set_brake(arms_t *a, int j, arms_brake_mode mode, bool confirmed)
+{
+    arms_joint_state s;
+    arms_status st;
+    if (!a) return ARMS_E_ARG;
+    if (mode != ARMS_BRAKE_NORMAL && mode != ARMS_BRAKE_RELEASE && mode != ARMS_BRAKE_HOLD) {
+        set_error("无效的抱闸模式");
+        return ARMS_E_ARG;
+    }
+    /* 恢复正常控制不要求失能；强制松闸/抱闸要求失能 */
+    st = maintenance_ready_ex(a, j, confirmed, &s, mode != ARMS_BRAKE_NORMAL);
+    if (st != ARMS_OK) return st;
+    a->brake_touched |= ARMS_MASK_JOINT(j);
+    st = verified(a, j, 75, (uint16_t)mode);
+    if (st == ARMS_OK) {
+        record_brake(a, j, mode);
+    } else {
+        /* 写入结果不确定时重新读取，以驱动器实际值为准；读取失败则保留原记录 */
+        arms_brake_mode now;
+        char saved[sizeof(last_error)];
+        snprintf(saved, sizeof(saved), "%s", last_error);
+        arms_get_brake(a, j, &now);
+        snprintf(last_error, sizeof(last_error), "%s", saved);
+    }
+    return st;
+}
+
+static double zero_value(const arms_t *a, int j, const arms_joint_state *s)
+{
+    return a->cfg.joint[j].direction * (double)kgu_get_f32(s->txpdo, KGU_IN_POS);
 }
 
 arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
 {
     arms_joint_state s;
-    /* 锁回不要求失能，任何状态下都允许恢复抱闸控制 */
-    arms_status st = maintenance_ready_ex(a, j, confirmed, &s, op != ARMS_LOCK);
+    arms_status st = maintenance_ready(a, j, confirmed, &s);
     if (st != ARMS_OK)
         return st;
-    arms_mask bit = ARMS_MASK_JOINT(j);
     uint8_t data[2];
     size_t n = 0;
     switch (op) {
-    case ARMS_RELEASE:
-        a->released |= bit; /* 写入失败时无法确认抱闸已闭合，按松闸处理，直到 lock 成功 */
-        st = verified(a, j, 75, 1);
-        if (st == ARMS_OK)
-            atomic_fetch_or(&a->brake_confirmed, bit);
-        return st;
-    case ARMS_LOCK:
-        st = verified(a, j, 75, 0);
-        if (st == ARMS_OK) {
-            a->released &= ~bit;
-            atomic_fetch_and(&a->brake_confirmed, ~bit);
-        }
-        return st;
-    case ARMS_ZERO_SOFT:
-        if (fabs(s.velocity) > 0.01 ||
-            !arms_store_offset(a->cfg.path, j,
-                               a->cfg.joint[j].direction * (double)kgu_get_f32(s.txpdo, KGU_IN_POS))) {
-            set_error("关节未静止或无法保存偏置");
+    case ARMS_ZERO_SOFT: {
+        double off = zero_value(a, j, &s);
+        if (fabs(s.velocity) > 0.01) {
+            set_error("关节 %d 未静止（速度 %.4f rad/s）", j, s.velocity);
             return ARMS_E_STATE;
         }
-        return ARMS_OK; /* next session reloads the calibrated frame */
+        if (!arms_store_offset(a->cfg.path, j, off)) {
+            set_error("无法把关节 %d 的 offset_rad 写入 %s", j, a->cfg.path);
+            return ARMS_E_SYSTEM;
+        }
+        /* 立即生效：周期上下文下一周期按新偏置换算位置（关节已失能，不影响指令） */
+        a->cfg.joint[j].offset_rad = off;
+        wait_snapshot(a);
+        return ARMS_OK;
+    }
     case ARMS_ZERO_HW:
     case ARMS_SAVE: {
-        if (a->released || fabs(s.velocity) > 0.01) {
-            set_error("请先锁回抱闸并保持静止");
+        unsigned pn = op == ARMS_SAVE ? 97 : 101;
+        if (op == ARMS_SAVE ? brake_abnormal(a, "参数保存")
+                            : (atomic_load(&a->brake_released) | atomic_load(&a->brake_held)) & ARMS_MASK_JOINT(j)) {
+            if (op != ARMS_SAVE) set_error("关节 %d 的抱闸不是正常模式，先执行 brake %d normal --confirm", j, j);
             return ARMS_E_STATE;
         }
-        unsigned pn = op == ARMS_SAVE ? 97 : 101;
+        if (fabs(s.velocity) > 0.01) {
+            set_error("关节 %d 未静止（速度 %.4f rad/s）", j, s.velocity);
+            return ARMS_E_STATE;
+        }
         st = arms_sdo_read(a, j, arms_pn_index(pn), 0, data, 2, &n);
         if (st != ARMS_OK)
             return st;
         if (n != 2 || kgu_get_u16(data, 0) != 0) {
-            set_error("触发参数未处于初始零状态");
+            set_error("关节 %d 的 Pn%03u 未处于初始值 0", j, pn);
             return ARMS_E_STATE;
         }
         st = verified(a, j, pn, 1);

@@ -105,6 +105,7 @@ typedef enum {
     ARMS_JS_RELEASED,   /**< OP，伺服失能，抱闸强制松开 */
     ARMS_JS_ENABLED,    /**< OP，伺服使能 */
     ARMS_JS_FAULT,      /**< 驱动器故障或 AL 错误 */
+    ARMS_JS_HELD,       /**< OP，伺服失能，抱闸强制锁闸（Pn075=2） */
 } arms_joint_mode;
 
 /** @brief 关节状态名称 */
@@ -348,33 +349,62 @@ arms_status arms_set_command(arms_t *arms, int joint, const arms_command *comman
 /** @brief 关节保持当前指令位置：速度与前馈清零，增益不变 */
 arms_status arms_hold(arms_t *arms, arms_mask joints);
 
+/**
+ * @brief 零力矩拖动：使能关节（已使能的保持使能），下发 kp = 0、速度 0、前馈 0、阻尼 kd
+ * @param kd 阻尼，0 表示完全自由，须不超过 gain_max.kd
+ *
+ * 关节没有保持力，会受重力下落。退出拖动用 arms_disable()、arms_hold() 或新的指令。
+ * 有关节的抱闸不是正常控制模式时拒绝执行。
+ */
+arms_status arms_free(arms_t *arms, arms_mask joints, double kd);
+
 /*
  * 维护接口：只能在同一个非实时管理线程中调用（内部使用阻塞的 SDO 访问）。
- * 写操作要求该关节所在臂通信正常、confirmed 为 true；除 ARMS_LOCK 外还要求该关节驱动器失能。
- * 有关节处于松闸状态（ARMS_RELEASE 之后、ARMS_LOCK 之前）时，arms_enable() 被拒绝。
+ * 写操作要求该关节所在臂通信正常、confirmed 为 true，其余条件见各接口。
  */
+
+/** 抱闸模式（Pn075） */
+typedef enum {
+    ARMS_BRAKE_UNKNOWN = -1, /**< 未读取或读取失败 */
+    ARMS_BRAKE_NORMAL = 0,   /**< 正常控制：使能时松闸，失能时抱闸 */
+    ARMS_BRAKE_RELEASE = 1,  /**< 强制松闸 */
+    ARMS_BRAKE_HOLD = 2,     /**< 强制抱闸 */
+} arms_brake_mode;
+
+/** @brief 抱闸模式名称 normal / release / hold / unknown */
+const char *arms_brake_mode_name(arms_brake_mode mode);
+
+/**
+ * @brief 临时设置抱闸模式（写 Pn075 并回读，不保存到驱动器）
+ *
+ * RELEASE / HOLD 要求该关节失能；NORMAL 任何状态都可执行。
+ * 任一关节不是 NORMAL 时，arms_enable()、arms_free() 和 ARMS_SAVE 被拒绝。
+ * arms_close() 会把本次会话改动过的关节恢复为 NORMAL。
+ */
+arms_status arms_set_brake(arms_t *arms, int joint, arms_brake_mode mode, bool confirmed);
+
+/** @brief 读取单个关节的 Pn075 并更新内部记录 */
+arms_status arms_get_brake(arms_t *arms, int joint, arms_brake_mode *mode);
+
+/**
+ * @brief 读取全部已打开关节的 Pn075
+ * @param released 返回强制松闸的关节，可为 NULL
+ * @param held     返回强制抱闸的关节，可为 NULL
+ * @param unknown  返回读取失败的关节，可为 NULL
+ *
+ * 启动后调用一次，用于发现驱动器中保存的或其他工具遗留的非正常抱闸模式。
+ */
+arms_status arms_brake_scan(arms_t *arms, arms_mask *released, arms_mask *held, arms_mask *unknown);
 
 /** 维护操作 */
 typedef enum {
-    ARMS_RELEASE,   /**< Pn075 = 1，强制松开抱闸；要求该关节失能 */
-    ARMS_LOCK,      /**< Pn075 = 0，恢复正常抱闸控制 */
-    ARMS_ZERO_SOFT, /**< 以当前位置为零点，写入配置 offset_rad，下次启动生效 */
-    ARMS_ZERO_HW,   /**< Pn101 清零脉冲，需重新上电生效 */
-    ARMS_SAVE,      /**< Pn097 参数保存脉冲 */
+    ARMS_ZERO_SOFT, /**< 以当前位置为零点：写入配置 offset_rad 并立即生效；要求关节失能、静止 */
+    ARMS_ZERO_HW,   /**< Pn101 清零脉冲，驱动器重新上电后生效；要求关节失能、静止、抱闸为正常模式 */
+    ARMS_SAVE,      /**< Pn097 参数保存脉冲；要求关节失能，且全部关节抱闸为正常模式 */
 } arms_service_op;
 
 /** @brief 执行维护操作（单个关节；多个关节由调用方逐个调用） */
 arms_status arms_service(arms_t *arms, int joint, arms_service_op op, bool confirmed);
-
-/**
- * @brief 读取全部已打开关节的 Pn075，同步松闸状态
- * @param released 返回 Pn075 = 1（强制松闸）的关节，可为 NULL
- * @param unknown  返回读取失败或 Pn075 为其他非 0 值的关节，可为 NULL
- *
- * 强制松闸的关节在 arms_read() 中显示为 ARMS_JS_RELEASED，并阻止 arms_enable()，直到 ARMS_LOCK。
- * 启动后调用一次，用于发现上次会话或其他工具遗留的松闸状态。
- */
-arms_status arms_brake_scan(arms_t *arms, arms_mask *released, arms_mask *unknown);
 
 /** @brief 读取对象字典 */
 arms_status arms_sdo_read(arms_t *arms, int joint, uint16_t index, uint8_t sub, uint8_t *out, size_t cap,

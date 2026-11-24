@@ -31,13 +31,16 @@ try:
         until(lambda:len(seen)==3);assert len(seen['joint_states'].name)==14
         assert seen['arms/diagnostics'].status[0].level in (0,b'\x00'),seen['arms/diagnostics']
         assert call('selftest').success and not call('enable').success
-        # 维护操作需要确认；松闸期间拒绝使能
+        # 抱闸模式需要确认；非 normal 期间拒绝使能和零力矩拖动
         assert not call('brake_release').success
         assert call('brake_release',True).success
+        assert not call('enable',True).success and not call('free',True).success
+        assert call('brake_hold',True).success
         assert not call('enable',True).success
-        assert call('brake_lock',True).success
-        assert call('enable',True).success
-        # 使能中拒绝松闸
+        assert call('brake_normal',True).success
+        # 零力矩拖动会使能关节
+        assert call('free',True).success
+        # 使能中拒绝强制松闸
         assert not call('brake_release',True).success
         m=ActuatorCmds();m.actuators_name=['l_wrist_z_joint'];m.pos=[.1];m.vel=[0.];m.kp=[5.];m.kd=[0.];m.torque=[0.]
         def moved():

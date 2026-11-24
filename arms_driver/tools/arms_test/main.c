@@ -658,6 +658,16 @@ static int cmd_selftest(int argc, char **argv)
     return ok();
 }
 
+/* 关节掩码转为 " 15 16 21" 形式 */
+static const char *mask_list(arms_mask m, char *buf, size_t size)
+{
+    size_t len = 0;
+    buf[0] = '\0';
+    for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST && len < size; j++)
+        if (m & ARMS_MASK_JOINT(j)) len += (size_t)snprintf(buf + len, size - len, " %d", j);
+    return buf;
+}
+
 /* 启动自检：在线检查已在打开时完成；驱动器残留故障先自动复位一次，仍有故障只告警 */
 static void startup_selftest(void)
 {
@@ -674,18 +684,18 @@ static void startup_selftest(void)
             tlog_err("自检: 复位未完成: %s；可手动执行 reset 或查看 status", arms_last_error());
     }
     {
-        arms_mask released = 0, unknown = 0;
-        arms_brake_scan(g_arms, &released, &unknown);
-        if (released) {
-            char list[256];
-            size_t len = 0;
-            list[0] = '\0';
-            for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST && len < sizeof(list); j++)
-                if (released & ARMS_MASK_JOINT(j)) len += (size_t)snprintf(list + len, sizeof(list) - len, " %d", j);
-            tlog_err("自检: 关节%s 的抱闸处于强制松开（Pn075=1），失能时没有保持力；需要时执行 lock <关节> --confirm",
-                     list);
-        }
-        if (unknown) tlog_err("自检: 有关节的 Pn075 无法读取或为强制锁闸（2），可用 pn <关节> 75 查看");
+        arms_mask released = 0, held = 0, unknown = 0;
+        char list[256];
+        arms_brake_scan(g_arms, &released, &held, &unknown);
+        if (released)
+            tlog_err("自检: 关节%s 的抱闸为强制松闸（Pn075=1），失能时没有保持力，且拒绝使能；"
+                     "执行 brake <关节> normal --confirm 恢复",
+                     mask_list(released, list, sizeof(list)));
+        if (held)
+            tlog_err("自检: 关节%s 的抱闸为强制抱闸（Pn075=2），拒绝使能；执行 brake <关节> normal --confirm 恢复",
+                     mask_list(held, list, sizeof(list)));
+        if (unknown)
+            tlog_err("自检: 关节%s 的 Pn075 读取失败，可用 brake <关节> 查看", mask_list(unknown, list, sizeof(list)));
     }
 }
 static bool uint_arg(const char *s, unsigned max, unsigned *out)
@@ -698,25 +708,105 @@ static bool uint_arg(const char *s, unsigned max, unsigned *out)
     *out = (unsigned)v;
     return true;
 }
-/* release / lock：可选择任意关节组合，逐个执行并汇总 */
+static const char *brake_text(arms_brake_mode m)
+{
+    switch (m) {
+    case ARMS_BRAKE_NORMAL: return "normal  (Pn075=0，正常控制)";
+    case ARMS_BRAKE_RELEASE: return "release (Pn075=1，强制松闸)";
+    case ARMS_BRAKE_HOLD: return "hold    (Pn075=2，强制抱闸)";
+    default: return "unknown";
+    }
+}
+
+static bool parse_brake_mode(const char *s, arms_brake_mode *m)
+{
+    if (!strcmp(s, "normal") || !strcmp(s, "0")) *m = ARMS_BRAKE_NORMAL;
+    else if (!strcmp(s, "release") || !strcmp(s, "1")) *m = ARMS_BRAKE_RELEASE;
+    else if (!strcmp(s, "hold") || !strcmp(s, "2")) *m = ARMS_BRAKE_HOLD;
+    else return false;
+    return true;
+}
+
+/* brake：查看或临时设置抱闸模式（Pn075），可选择任意关节组合 */
 static int cmd_brake(int argc, char **argv)
 {
-    arms_mask m, done = 0;
-    bool release = !strcmp(argv[0], "release");
+    arms_mask m;
+    arms_brake_mode mode;
     int j, failures = 0;
     if (need_session() || selection(argv[1], &m)) return -2;
-    if (argc != 3 || strcmp(argv[2], "--confirm")) return bad_args("须带 --confirm");
+    if (argc == 2) {
+        for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+            arms_brake_mode cur;
+            if (!(m & ARMS_MASK_JOINT(j))) continue;
+            if (arms_get_brake(g_arms, j, &cur) == ARMS_OK)
+                printf("%d %-20s %s\n", j, arms_joint_name(g_arms, j), brake_text(cur));
+            else
+                printf("%d %-20s 读取失败: %s\n", j, arms_joint_name(g_arms, j), arms_last_error());
+        }
+        return ok();
+    }
+    if (!parse_brake_mode(argv[2], &mode)) return bad_args("模式只能是 normal | release | hold（或 0 | 1 | 2）");
+    if (argc != 4 || strcmp(argv[3], "--confirm")) return bad_args("修改抱闸模式须带 --confirm");
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         if (!(m & ARMS_MASK_JOINT(j))) continue;
-        if (arms_service(g_arms, j, release ? ARMS_RELEASE : ARMS_LOCK, true) == ARMS_OK) {
-            done |= ARMS_MASK_JOINT(j);
-            printf("%d %-20s %s\n", j, arms_joint_name(g_arms, j), release ? "已松闸 (Pn075=1)" : "已锁回 (Pn075=0)");
+        if (arms_set_brake(g_arms, j, mode, true) == ARMS_OK) {
+            printf("%d %-20s %s\n", j, arms_joint_name(g_arms, j), brake_text(mode));
         } else {
             failures++;
             printf("%d %-20s 失败: %s\n", j, arms_joint_name(g_arms, j), arms_last_error());
         }
     }
-    if (release && done) tlog("松闸关节没有保持力，完成后执行 lock；松闸期间 enable 会被拒绝");
+    if (mode == ARMS_BRAKE_RELEASE)
+        tlog("强制松闸的关节失能时没有保持力；用手拖动请用 free。恢复执行 brake <关节> normal --confirm");
+    else if (mode == ARMS_BRAKE_HOLD)
+        tlog("强制抱闸期间拒绝使能；恢复执行 brake <关节> normal --confirm");
+    return failures ? failed("%d 个关节未完成", failures) : ok();
+}
+
+/* free：零力矩拖动 */
+static int cmd_free(int argc, char **argv)
+{
+    arms_mask m;
+    double kd = 0.0;
+    char list[256];
+    if (need_session() || selection(argv[1], &m)) return -2;
+    if (argc > 2 && !number(argv[2], &kd)) return bad_args("kd 必须是非负数值");
+    motion_cancel_refresh(m);
+    if (arms_free(g_arms, m, kd) != ARMS_OK) return failed("%s", arms_last_error());
+    tlog("零力矩拖动:%s，kd=%.3f。关节没有保持力，注意托住；结束用 disable 或 hold", mask_list(m, list, sizeof(list)),
+         kd);
+    return ok();
+}
+
+/* zero / pn_save：可选择任意关节组合，逐个执行 */
+static int cmd_multi_service(int argc, char **argv)
+{
+    arms_mask m;
+    bool zero = !strcmp(argv[0], "zero");
+    bool hw = zero && argc == 4 && !strcmp(argv[2], "--hw");
+    int j, failures = 0;
+    if (need_session() || selection(argv[1], &m)) return -2;
+    if (strcmp(argv[argc - 1], "--confirm") || (argc != 3 && !hw)) return bad_args("须带 --confirm");
+    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        arms_service_op op = !zero ? ARMS_SAVE : hw ? ARMS_ZERO_HW : ARMS_ZERO_SOFT;
+        if (!(m & ARMS_MASK_JOINT(j))) continue;
+        if (arms_service(g_arms, j, op, true) != ARMS_OK) {
+            failures++;
+            printf("%d %-20s 失败: %s\n", j, arms_joint_name(g_arms, j), arms_last_error());
+            continue;
+        }
+        if (op == ARMS_ZERO_SOFT) {
+            arms_joint_info q;
+            arms_get_joint_info(g_arms, j, &q);
+            printf("%d %-20s 零位偏置 offset_rad = %.6f，已生效并写入配置\n", j, arms_joint_name(g_arms, j),
+                   q.offset_rad);
+        } else {
+            printf("%d %-20s %s\n", j, arms_joint_name(g_arms, j),
+                   op == ARMS_ZERO_HW ? "已发出硬件清零脉冲（Pn101），重新上电后生效" : "参数已保存（Pn097）");
+        }
+    }
+    if (hw && failures < __builtin_popcount(m))
+        tlog("硬件校零后请把这些关节配置中的 offset_rad 改为 0，避免与软件偏置叠加");
     return failures ? failed("%d 个关节未完成", failures) : ok();
 }
 
@@ -815,19 +905,6 @@ static int cmd_service(int argc, char **argv)
             }
             rc = arms_pn_write(g_arms, j, a, v, true);
         }
-    } else {
-        bool hw = !strcmp(op, "zero") && argc == 4 && !strcmp(argv[2], "--hw");
-        if (!confirm || (argc != 3 && !hw))
-            return -2;
-        rc = arms_service(g_arms, j,
-                          !strcmp(op, "release")   ? ARMS_RELEASE
-                          : !strcmp(op, "lock")    ? ARMS_LOCK
-                          : !strcmp(op, "pn_save") ? ARMS_SAVE
-                          : hw                     ? ARMS_ZERO_HW
-                                                   : ARMS_ZERO_SOFT,
-                          true);
-        if (rc == ARMS_OK && !strcmp(op, "zero"))
-            puts(hw ? "已发出硬件清零脉冲；按驱动手册重启并验证零位。" : "偏置已写入配置，下次启动生效。");
     }
     return rc == ARMS_OK ? ok() : failed("%s", arms_last_error());
 }
@@ -840,6 +917,7 @@ static const command commands[] = {
     {"status", "查看", "[关节] [--raw]", 0, 2, "显示关节状态表（位置/速度/力矩、状态、AL、状态字、错误码）",
      "  关节写法: 21 | l_wrist_z | left | right | all | 15-18 | 21,28（默认全部已打开关节）\n"
      "  状态: offline / preop / safeop / locked（OP，伺服失能）/ enabled / FAULT\n"
+     "        released / held（失能，且抱闸为强制松闸 / 强制抱闸）\n"
      "  cmd、kp、kd 为实际下发的位置和增益；M=过渡中，L=限幅，T=超时，flt=累计故障次数。",
      "  status\n  status left\n  status 21", cmd_status},
     {"watch", "查看", "[关节] [刷新Hz]", 0, 2, "持续刷新显示关节位置，回车结束",
@@ -871,20 +949,28 @@ static const command commands[] = {
      cmd_selftest},
     {"identify", "查看", "<关节>", 1, 1, "读取从站身份、序列号与配置映射", "不移动关节。", "  identify 21",
      cmd_service},
-    {"release", "维护", "<关节> --confirm", 2, 2, "强制松开抱闸（Pn075=1），用于手动转动",
-     "  关节写法同 status：21 | 15-18 | left | right | all。\n"
-     "  执行前托住对应关节：驱动器失能、抱闸松开后关节没有任何保持力，手臂会因重力下落。\n"
-     "  要求关节失能、通信正常；松闸期间拒绝 enable。完成后执行 lock，quit 退出时也会尝试锁回。",
-     "  release 21 --confirm\n  release left --confirm\n  release all --confirm", cmd_brake},
-    {"lock", "维护", "<关节> --confirm", 2, 2, "恢复正常抱闸控制（Pn075=0）并回读确认",
-     "  任何状态下都可执行。看到每个关节的“已锁回”后再撤去支撑。",
-     "  lock 21 --confirm\n  lock all --confirm", cmd_brake},
+    {"free", "控制", "<关节> [kd]", 1, 2, "零力矩拖动：使能后 kp=0，可用手转动关节",
+     "  关节写法同 status：21 | 15-18 | left | right | all。kd 为阻尼，默认 0（最轻），不超过 gain_max.kd。\n"
+     "  关节没有保持力，肩、肘会因重力下落，执行前先托住。超过 vel_fault 会触发超速保护。\n"
+     "  结束拖动: disable（失能，抱闸锁住）或 hold（保持当前位置）。抱闸不是 normal 模式时拒绝执行。",
+     "  free 21\n  free left 0.2", cmd_free},
+    {"brake", "维护", "<关节> [normal|release|hold --confirm]", 1, 3, "查看或临时设置抱闸模式（Pn075）",
+     "  不带模式: 读取并显示 Pn075。\n"
+     "  normal  (0) 正常控制：使能时松闸，失能时抱闸。任何状态都可设置。\n"
+     "  release (1) 强制松闸：失能时抱闸不再提供保持；驱动器失能时电机阻尼很大，仍难以用手转动。\n"
+     "  hold    (2) 强制抱闸：使能时也不松闸。\n"
+     "  release / hold 要求关节失能，期间拒绝 enable、free 和 pn_save。只临时修改，不保存；\n"
+     "  永久保存用 pn_save。quit 退出时本次改动过的关节恢复为 normal。",
+     "  brake all\n  brake 16 normal --confirm\n  brake left hold --confirm", cmd_brake},
     {"zero", "维护", "<关节> [--hw] --confirm", 2, 3, "以当前位置为零点",
-     "  默认写入配置文件的 offset_rad，下次启动生效。\n"
-     "  --hw 向驱动器发送 Pn101 清零脉冲，需重新上电生效。要求关节失能、静止、抱闸锁住。",
-     "  zero 21 --confirm\n  zero 21 --hw --confirm", cmd_service},
-    {"pn_save", "维护", "<关节> --confirm", 2, 2, "发送参数保存脉冲（Pn097）",
-     "  把驱动器当前参数写入掉电保存区。松闸期间拒绝执行。", "  pn_save 21 --confirm", cmd_service},
+     "  关节写法同 status，可一次校多个关节。要求关节失能、静止。\n"
+     "  默认写入配置文件的 offset_rad 并立即生效，只改该数值，不改变文件排版。\n"
+     "  --hw 向驱动器发送 Pn101 清零脉冲，驱动器重新上电后生效，之后应把 offset_rad 改为 0。\n"
+     "  流程: free <关节> → 用手转到机械零位 → disable <关节> → zero <关节> --confirm",
+     "  zero 21 --confirm\n  zero left --confirm\n  zero 21 --hw --confirm", cmd_multi_service},
+    {"pn_save", "维护", "<关节> --confirm", 2, 2, "发送参数保存脉冲（Pn097），写入驱动器掉电保存区",
+     "  关节写法同 status。要求关节失能；有关节抱闸不是 normal 模式时拒绝执行。",
+     "  pn_save 21 --confirm\n  pn_save all --confirm", cmd_multi_service},
     {"pn", "维护", "<关节> <参数号> [值 --confirm]", 2, 4, "读取参数；仅白名单参数可写",
      "参数号支持 75、075 或 Pn075。", "  pn 21 75", cmd_service},
     {"sdo", "维护", "<关节> <索引> <子索引> [值 --confirm]", 3, 5, "读对象字典或写白名单参数",
@@ -1057,7 +1143,8 @@ static void usage(FILE *out)
         "      --check / --no-check  本次要求 / 不要求未屏蔽关节全部在线（不改变运行时掉线策略）\n"
         "      --check-motor 0|1     显式选择启动检查；--motor-disable MASK 等价于 --mask\n"
         "\n"
-        "维护命令（release/lock/zero/pn_save 及参数写入）在同一会话中可用，须带 --confirm 且关节失能。\n"
+        "维护命令（brake/zero/pn_save 及参数写入）在同一会话中可用，须带 --confirm。\n"
+        "用手拖动关节用 free（使能后 kp=0）；驱动器失能时电机阻尼很大，仅松开抱闸仍难以转动。\n"
         "  -T, --timestamps     每一行输出都加时间戳（默认只在事件行加）\n"
         "  -h, --help           显示本帮助\n"
         "  -V, --version        显示版本\n"
