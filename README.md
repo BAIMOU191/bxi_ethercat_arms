@@ -83,3 +83,5 @@ for (;;) {
 ```
 
 `arms_ready()` 返回 true 表示全部关节已进入 OP 且通信稳定。
+
+运行资源（线程、CPU、中断、周期耗时、内存）见 `docs/resources.md`。
