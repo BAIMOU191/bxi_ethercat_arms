@@ -53,7 +53,7 @@ if(ARMS_HAVE_ETHERLAB)
 endif()
 set_target_properties(arms_driver PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_executable(arms_test tools/arms_test/main.c tools/arms_test/joint_select.c tools/arms_test/power.c
+add_executable(arms_test tools/arms_test/main.c tools/arms_test/motion.c tools/arms_test/joint_select.c tools/arms_test/power.c
                tools/arms_test/runtime_env.c tools/arms_test/tlog.c)
 target_link_libraries(arms_test PRIVATE arms_driver)
 
@@ -81,7 +81,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_control PRIVATE arms_driver m)
   add_test(NAME control COMMAND test_control ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
   add_test(NAME mock_session COMMAND arms_test --mock -c ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json
-           -e "status" -e "bus" -e "commtest 2" -e "help")
+           -e "status" -e "bus" -e "enable all" -e "mit 17 0.1 -m 0.3" -e "home all -m 0.5"
+           -e "swing 17 0.05 1 1" -e "mit 18 0.1 2 0.1 0.05" -e "hold" -e "commtest 2 --enabled"
+           -e "disable" -e "status" -e "help")
 endif()
 
 install(TARGETS arms_test RUNTIME DESTINATION bin)

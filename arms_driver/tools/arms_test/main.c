@@ -7,6 +7,8 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <getopt.h>
+#include <limits.h>
+#include <math.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -19,12 +21,15 @@
 
 #include "arms/arms.h"
 #include "joint_select.h"
+#include "motion.h"
 #include "power.h"
 #include "runtime_env.h"
 #include "tlog.h"
 
 static volatile sig_atomic_t g_interrupted;
 static arms_t *g_arms;
+static bool powered, power_known, mock_backend;
+static unsigned int power_wait = 3000;
 
 static void on_sigint(int sig)
 {
@@ -102,17 +107,23 @@ static int cmd_status(int argc, char **argv)
     if (need_session()) return -1;
     if (argc > 1 && arms_parse_joints(argv[1], arms_opened_joints(g_arms), &sel, err, sizeof(err)) != 0)
         return failed("%s", err);
-    printf("%-3s %-20s %-11s %-8s %-6s %-6s %-6s %10s %10s %9s\n", "关节", "名称", "臂/位置", "状态", "AL",
-           "SW", "ERR", "pos[rad]", "vel[rad/s]", "tor[N.m]");
+    printf("%-3s %-20s %-11s %-8s %-6s %-6s %-6s %10s %10s %9s %10s %8s %8s %4s %5s\n", "关节", "名称", "臂/位置", "状态", "AL",
+           "SW", "ERR", "pos[rad]", "vel[rad/s]", "tor[N.m]", "cmd", "kp", "kd", "flag", "flt");
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_joint_state s;
-        char where[16];
+        char where[16], flags[4];
+        int n = 0;
         if (!(sel & ARMS_MASK_JOINT(j))) continue;
         arms_read_joint(g_arms, j, &s);
         snprintf(where, sizeof(where), "%s/%d", s.arm == 0 ? "L" : "R", s.slave);
-        printf("%-3d %-20s %-11s %-8s 0x%02x   0x%04x 0x%04x %10.4f %10.4f %9.3f\n", j, s.name ? s.name : "-",
+        if (s.cmd_moving) flags[n++] = 'M';
+        if (s.cmd_limited) flags[n++] = 'L';
+        if (s.cmd_timeout) flags[n++] = 'T';
+        if (!n) flags[n++] = '-';
+        flags[n] = '\0';
+        printf("%-3d %-20s %-11s %-8s 0x%02x   0x%04x 0x%04x %10.4f %10.4f %9.4f %10.4f %8.4f %8.4f %4s %5u\n", j, s.name ? s.name : "-",
                where, arms_joint_mode_name(s.mode), s.al_state, s.status_word, s.error_code, s.position,
-               s.velocity, s.torque);
+               s.velocity, s.torque, s.cmd_position, s.cmd_kp, s.cmd_kd, flags, s.fault_count);
     }
     return ok();
 }
@@ -121,9 +132,9 @@ static int cmd_status(int argc, char **argv)
 static void print_stats(const arms_bus_stats *st)
 {
     int i;
-    printf("周期 %u Hz  已运行 %llu 周期  平均 %.1f us  最短 %.1f  最长 %.1f  抖动RMS %.2f us\n", st->cycle_hz,
+    printf("周期 %u Hz  已运行 %llu 周期  平均 %.4f us  最短 %.4f  最长 %.4f  抖动RMS %.4f us\n", st->cycle_hz,
            (unsigned long long)st->cycles, st->period.mean, st->period.min, st->period.max, st->period.rms_jitter);
-    printf("唤醒最大延迟 %.1f us  单周期最大耗时 %.1f us  超时(>1.5T) %llu  跳过周期 %llu\n", st->wake_late_us_max,
+    printf("唤醒最大延迟 %.4f us  单周期最大耗时 %.4f us  超时(>1.5T) %llu  跳过周期 %llu\n", st->wake_late_us_max,
            st->work_us_max, (unsigned long long)st->overruns, (unsigned long long)st->skipped);
     for (i = 0; i < ARMS_ARM_COUNT; ++i) {
         const arms_arm_stats *a = &st->arm[i];
@@ -132,7 +143,7 @@ static void print_stats(const arms_bus_stats *st)
             continue;
         }
         printf("%-5s %s 主站%d 链路%s  从站 OP %d/%d(总线上 %d)  WKC %u/%u  异常 %llu (最长连续 %u)  发送错误 %llu"
-               "  收 %.1f us 发 %.1f us%s\n",
+               "  收 %.4f us 发 %.4f us%s\n",
                arms_arm_name(i), a->interface, a->master_index, a->link_up ? "UP" : "DOWN", a->slaves_op,
                a->slaves_expected, a->slaves_found, a->wkc_last, a->wkc_expected, (unsigned long long)a->wkc_bad,
                a->wkc_bad_consecutive_max, (unsigned long long)a->send_errors, a->recv_us_max, a->send_us_max,
@@ -155,7 +166,258 @@ static int cmd_bus(int argc, char **argv)
     return ok();
 }
 
+/* ---- 控制命令的公共参数 ---- */
+static int bad_args(const char *reason)
+{
+    failed("%s", reason);
+    return -2; /* 由命令分派器统一打印用法。 */
+}
+
+static int selection(const char *text, arms_mask *mask)
+{
+    char err[256];
+    *mask = arms_opened_joints(g_arms);
+    if (text && arms_parse_joints(text, *mask, mask, err, sizeof(err)) != 0) return bad_args(err);
+    if (!*mask) return bad_args("未选中已打开的关节");
+    return 0;
+}
+
+static bool number(const char *s, double *v)
+{
+    char *end;
+    errno = 0;
+    *v = strtod(s, &end);
+    return end != s && !*end && !errno && isfinite(*v);
+}
+
+static bool integer(const char *s, long lo, long hi, long *v)
+{
+    char *end;
+    errno = 0;
+    *v = strtol(s, &end, 10);
+    return end != s && !*end && !errno && *v >= lo && *v <= hi;
+}
+
+static int move_option(int *argc, char **argv, double *move)
+{
+    *move = -1.0;
+    if (*argc >= 3 && strcmp(argv[*argc - 2], "-m") == 0) {
+        if (!number(argv[*argc - 1], move) || *move < 0.0 || *move > 60.0)
+            return bad_args("-m 需要 0..60 秒的过渡时间");
+        *argc -= 2;
+    }
+    return 0;
+}
+
+static void delay_ms(unsigned int ms)
+{
+    struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+}
+
+static void show_modes(arms_mask mask, bool with_position)
+{
+    for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        arms_joint_state s;
+        if (!(mask & ARMS_MASK_JOINT(j))) continue;
+        arms_read_joint(g_arms, j, &s);
+        printf("%d %-8s", j, arms_joint_mode_name(s.mode));
+        if (with_position) printf(" 位置 %.4f rad", s.position);
+        putchar('\n');
+    }
+}
+
+static int disable_joints(arms_mask mask, unsigned int wait_ms)
+{
+    motion_cancel_refresh(mask);
+    if (arms_disable(g_arms, mask) != ARMS_OK) return failed("失能失败: %s", arms_last_error());
+    delay_ms(wait_ms);
+    return 0;
+}
+
+static int cmd_enable(int argc, char **argv)
+{
+    arms_mask mask;
+    long ms = 0;
+    if (selection(argv[1], &mask)) return -2;
+    if (argc != 2 && (argc != 4 || strcmp(argv[2], "-t") || !integer(argv[3], 0, INT_MAX, &ms)))
+        return bad_args("-t 需要非负整数毫秒数");
+    if (arms_enable(g_arms, mask, (unsigned int)ms) != ARMS_OK) return failed("使能失败: %s", arms_last_error());
+    show_modes(mask, true);
+    return ok();
+}
+
+static int cmd_disable(int argc, char **argv)
+{
+    arms_mask mask;
+    if (selection(argc > 1 ? argv[1] : NULL, &mask)) return -2;
+    if (disable_joints(mask, 20)) return -1;
+    show_modes(mask, false);
+    return ok();
+}
+
+static int cmd_reset(int argc, char **argv)
+{
+    arms_mask mask;
+    (void)argc;
+    if (selection(argv[1], &mask)) return -2;
+    motion_cancel_refresh(mask);
+    if (arms_reset(g_arms, mask, 0) != ARMS_OK) return failed("复位失败: %s", arms_last_error());
+    show_modes(mask, false);
+    return ok();
+}
+
+static int cmd_hold(int argc, char **argv)
+{
+    arms_mask mask;
+    if (selection(argc > 1 ? argv[1] : NULL, &mask)) return -2;
+    return motion_hold(mask) ? -1 : ok();
+}
+
+static int cmd_mit(int argc, char **argv)
+{
+    arms_mask mask;
+    arms_command c = {.kp = NAN, .kd = NAN};
+    double move;
+    double *fields[] = {&c.position, &c.kp, &c.kd, &c.velocity, &c.torque};
+    if (move_option(&argc, argv, &move)) return -2;
+    if (argc < 3 || argc > 7) return bad_args("请指定关节、目标位置及可选参数");
+    if (selection(argv[1], &mask)) return -2;
+    for (int i = 2; i < argc; ++i)
+        if (!number(argv[i], fields[i - 2])) return bad_args("运动参数必须是有限数值");
+    return motion_mit(mask, c, move) ? -2 : ok();
+}
+
+static int cmd_home(int argc, char **argv)
+{
+    arms_mask mask;
+    double move;
+    if (move_option(&argc, argv, &move)) return -2;
+    if (argc > 2) return bad_args("可选参数为关节和 -m 秒");
+    if (selection(argc == 2 ? argv[1] : NULL, &mask)) return -2;
+    if (argc == 1) mask &= motion_enabled();
+    return motion_home(mask, move) ? -2 : ok();
+}
+
+static int cmd_swing(int argc, char **argv)
+{
+    arms_mask mask;
+    double amplitude, period = 4.0, kp = NAN, kd = NAN;
+    long count = 3;
+    if (selection(argv[1], &mask)) return -2;
+    if (!number(argv[2], &amplitude) || amplitude < 0.0) return bad_args("幅值必须为非负有限数值");
+    if (argc > 3 && (!number(argv[3], &period) || period <= 0.0)) return bad_args("周期必须为正数");
+    if (argc > 4 && !integer(argv[4], 1, LONG_MAX, &count)) return bad_args("次数必须为正整数");
+    if (argc > 5 && !number(argv[5], &kp)) return bad_args("kp 必须是有限数值");
+    if (argc > 6 && !number(argv[6], &kd)) return bad_args("kd 必须是有限数值");
+    return motion_swing(mask, amplitude, period, count, kp, kd) ? -2 : ok();
+}
+
+static int cmd_power(int argc, char **argv)
+{
+    const char *op = argv[1];
+    (void)argc;
+    if (strcmp(op, "on") && strcmp(op, "off") && strcmp(op, "status")) return bad_args("未知电源操作");
+    if (!arms_power_available()) return failed("本程序不支持 PCI 电源控制");
+    if (mock_backend) return failed("模拟后端不访问 PCI 电源");
+    if (!strcmp(op, "status")) {
+        printf("电源: %s（以现场指示为准）\n", !power_known ? "状态未知" : powered ? "已请求上电" : "已请求断电");
+    } else if (!strcmp(op, "on")) {
+        if (!powered && arms_power_on(power_wait) != 0) {
+            power_known = false;
+            return failed("上电失败");
+        }
+        powered = power_known = true;
+    } else {
+        if (!powered && !power_known) return failed("未接管电源，无法确认或切断外部供电");
+        if (motion_enabled() && disable_joints(arms_opened_joints(g_arms), 50)) return -1;
+        if (arms_power_off() != 0) {
+            powered = power_known = false;
+            return failed("断电失败，请核对现场电源状态");
+        }
+        powered = false;
+        power_known = true;
+    }
+    return ok();
+}
+
 /* ---- commtest ---- */
+static int cmd_commtest(int argc, char **argv)
+{
+    long seconds;
+    arms_bus_stats st;
+    arms_mask all = arms_opened_joints(g_arms);
+    bool enabled = argc == 3, pass = true;
+    const char *label = enabled ? "伺服使能，" : "";
+    long t;
+    int i;
+    if (!integer(argv[1], 1, 86400, &seconds)) return bad_args("秒数必须是 1..86400 的整数");
+    if (enabled && strcmp(argv[2], "--enabled")) return bad_args("可选参数为 --enabled");
+    if (!enabled && motion_enabled()) return failed("常规通信测试需要全部关节失能；带载测试请使用 --enabled");
+    if (enabled) {
+        arms_mask already = motion_enabled();
+        if (motion_hold(all)) goto enable_error;
+        if (arms_enable(g_arms, all, 0) != ARMS_OK) {
+            failed("伺服使能失败: %s", arms_last_error());
+            goto enable_error;
+        }
+        /* 新使能的关节由驱动保持原位；原先已使能的关节也须撤销原运动目标。 */
+        for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+            arms_joint_state s;
+            arms_joint_limits l;
+            if (!(already & ARMS_MASK_JOINT(j))) continue;
+            if (arms_read_joint(g_arms, j, &s) != ARMS_OK || arms_get_limits(g_arms, j, &l) != ARMS_OK) {
+                failed("无法读取关节 %d 的原位与默认增益", j);
+                goto enable_error;
+            }
+            arms_command cmd = {.position = s.position, .kp = l.kp_default, .kd = l.kd_default};
+            if (arms_set_command(g_arms, j, &cmd, 0.0) != ARMS_OK) {
+                failed("关节 %d 无法保持原位: %s", j, arms_last_error());
+                goto enable_error;
+            }
+        }
+    }
+    arms_reset_stats(g_arms);
+    delay_ms(20);
+    tlog("通信测试开始: %s%ld 秒，回车或 Ctrl+C 提前结束", label, seconds);
+    for (t = 1; t <= seconds; ++t) {
+        if (motion_wait_or_enter(1000)) {
+            tlog("通信测试提前结束: 已运行 %ld 秒", t - 1);
+            break;
+        }
+        if (enabled && motion_enabled() != all) {
+            tlog_err("伺服使能状态丢失，终止通信测试");
+            pass = false;
+            break;
+        }
+        if (t % 10 == 0 || t == seconds) {
+            arms_get_stats(g_arms, &st);
+            tlog("  %3ld s  周期 %llu  WKC异常 左 %llu 右 %llu  周期最长 %.4f us", t, (unsigned long long)st.cycles,
+                 (unsigned long long)st.arm[0].wkc_bad, (unsigned long long)st.arm[1].wkc_bad, st.period.max);
+        }
+    }
+    tlog("通信测试结束");
+    arms_get_stats(g_arms, &st);
+    if (enabled) {
+        if (motion_enabled() != all) pass = false;
+        if (disable_joints(all, 20)) return -1;
+    }
+    print_stats(&st);
+    for (i = 0; i < ARMS_ARM_COUNT; ++i)
+        if (st.arm[i].present && (st.arm[i].wkc_bad || st.arm[i].send_errors || st.arm[i].comm_failed)) pass = false;
+    if (st.overruns || st.skipped) pass = false;
+    if (pass) {
+        printf("结果: 通过（%s无 WKC 异常、无发送错误、无超时周期）\n", label);
+        return ok();
+    }
+    return failed("通信测试未通过（%s见上方统计）", label);
+
+enable_error:
+    disable_joints(all, 20);
+    return -1;
+}
+
+/* ---- watch ---- */
 static int wait_or_enter(unsigned int ms)
 {
     fd_set rfds;
@@ -172,46 +434,6 @@ static int wait_or_enter(unsigned int ms)
     return 0;
 }
 
-static int cmd_commtest(int argc, char **argv)
-{
-    char *end;
-    long seconds = strtol(argv[1], &end, 10);
-    arms_bus_stats st;
-    long t;
-    int i;
-    bool pass = true;
-    (void)argc;
-    if (need_session()) return -1;
-    if (*end || seconds < 1 || seconds > 86400) return failed("秒数必须是 1..86400 的整数");
-    arms_reset_stats(g_arms);
-    usleep(20000);
-    tlog("通信测试开始: %ld 秒，回车或 Ctrl+C 提前结束", seconds);
-    g_interrupted = 0;
-    for (t = 1; t <= seconds; ++t) {
-        if (wait_or_enter(1000) || g_interrupted) {
-            tlog("通信测试提前结束: 已运行 %ld 秒", t - 1);
-            break;
-        }
-        if (t % 10 == 0 || t == seconds) {
-            arms_get_stats(g_arms, &st);
-            tlog("  %3ld s  周期 %llu  WKC异常 左 %llu 右 %llu  周期最长 %.1f us", t, (unsigned long long)st.cycles,
-                 (unsigned long long)st.arm[0].wkc_bad, (unsigned long long)st.arm[1].wkc_bad, st.period.max);
-        }
-    }
-    tlog("通信测试结束");
-    arms_get_stats(g_arms, &st);
-    print_stats(&st);
-    for (i = 0; i < ARMS_ARM_COUNT; ++i)
-        if (st.arm[i].present && (st.arm[i].wkc_bad || st.arm[i].send_errors || st.arm[i].comm_failed)) pass = false;
-    if (st.overruns || st.skipped) pass = false;
-    if (pass) {
-        printf("结果: 通过（无 WKC 异常、无发送错误、无超时周期）\n");
-        return ok();
-    }
-    return failed("通信测试未通过（见上方统计）");
-}
-
-/* ---- watch ---- */
 static int cmd_watch(int argc, char **argv)
 {
     arms_mask sel = arms_opened_joints(g_arms);
@@ -234,7 +456,7 @@ static int cmd_watch(int argc, char **argv)
             arms_joint_state s;
             if (!(sel & ARMS_MASK_JOINT(j))) continue;
             arms_read_joint(g_arms, j, &s);
-            printf("%d:%+.3f%s ", j, s.position, s.mode == ARMS_JS_FAULT ? "!" : "");
+            printf("%d:%+.4f%s ", j, s.position, s.mode == ARMS_JS_FAULT ? "!" : "");
         }
         fflush(stdout);
         if (wait_or_enter((unsigned int)(1000 / hz)) || g_interrupted) break;
@@ -290,7 +512,8 @@ static const command commands[] = {
      "  不带参数: 按分组列出命令\n  带命令名: 等同于 <命令> -h", "  help\n  help commtest", cmd_help},
     {"status", "查看", "[关节]", 0, 1, "显示关节状态表（位置/速度/力矩、状态、AL、状态字、错误码）",
      "  关节写法: 21 | l_wrist_z | left | right | all | 15-18 | 21,28（默认全部已打开关节）\n"
-     "  状态: offline / preop / safeop / locked（OP，伺服失能）/ enabled / FAULT",
+     "  状态: offline / preop / safeop / locked（OP，伺服失能）/ enabled / FAULT\n"
+     "  cmd、kp、kd 为实际下发的位置和增益；M=过渡中，L=限幅，T=超时，flt=累计故障次数。",
      "  status\n  status left\n  status 21", cmd_status},
     {"watch", "查看", "[关节] [刷新Hz]", 0, 2, "持续刷新显示关节位置，回车结束", "  刷新频率 1..50 Hz，默认 5",
      "  watch left 10", cmd_watch},
@@ -300,10 +523,29 @@ static const command commands[] = {
      "  bus\n  bus reset", cmd_bus},
     {"info", "查看", "", 0, 0, "显示版本、配置文件、周期、实时 CPU、关节与总线位置的对应关系", "", "  info",
      cmd_info},
-    {"commtest", "测试", "<秒>", 1, 1, "伺服失能状态下的通信质量测试，结束时给出结论",
-     "  先清零统计，再运行指定秒数，每 10 秒打印一次进度\n"
+    {"enable", "控制", "<关节> [-t 毫秒]", 1, 3, "使能并显示模式和当前位置",
+     "  -t 指定等待超时；0 或省略时使用驱动默认值。", "  enable left -t 2000", cmd_enable},
+    {"disable", "控制", "[关节]", 0, 1, "停止刷新并使关节失能",
+     "  缺省作用于全部已打开关节。", "  disable", cmd_disable},
+    {"reset", "控制", "<关节>", 1, 1, "故障复位并显示模式",
+     "  复位后处于失能状态，运动前须重新使能。", "  reset 17", cmd_reset},
+    {"mit", "控制", "<关节> <位置> [kp] [kd] [速度] [前馈] [-m 秒]", 2, 8, "下发 MIT 指令",
+     "  位置单位 rad，速度 rad/s，前馈 N.m。增益默认取各关节配置；位置过渡时间默认按限速计算。\n"
+     "  非零速度或前馈立即生效并持续刷新。所有关节均须已使能且目标不超限。",
+     "  mit 17 0.1 -m 0.3\n  mit 18 0.1 2 0.1 0.05", cmd_mit},
+    {"hold", "控制", "[关节]", 0, 1, "停止刷新并保持当前指令位置",
+     "  清零速度与前馈，保留增益；缺省作用于全部已打开关节。", "  hold", cmd_hold},
+    {"home", "控制", "[关节] [-m 秒]", 0, 3, "同步回到各关节的 home 位置",
+     "  不指定关节时只回零已使能关节。回车或 Ctrl+C 中止并保持。", "  home all -m 0.5", cmd_home},
+    {"swing", "测试", "<关节> <幅值> [周期秒] [次数] [kp] [kd]", 2, 6, "以当前指令位置为中心正弦摆动",
+     "  幅值单位 rad，默认周期 4 秒、3 次、各关节默认增益。回车或 Ctrl+C 中止，1 秒过渡返回中心。",
+     "  swing 17 0.05 1 1", cmd_swing},
+    {"power", "控制", "on | off | status", 1, 1, "请求上电、断电或显示电源控制状态",
+     "  断电前先将全部已使能关节失能。仅支持具备 PCI 电源接口的硬件会话。", "  power status", cmd_power},
+    {"commtest", "测试", "<秒> [--enabled]", 1, 2, "测试通信质量；可选伺服使能测试",
+     "  默认要求全部关节失能；--enabled 使能全部已打开关节并保持原位，结束或中止后全部失能。\n  清零统计后每 10 秒打印一次进度。\n"
      "  通过条件: WKC 异常 0 次、发送错误 0 次、无超时周期、无跳过周期",
-     "  commtest 300", cmd_commtest},
+     "  commtest 300\n  commtest 2 --enabled", cmd_commtest},
     {"version", "通用", "", 0, 0, "显示版本", "", "  version", cmd_version},
     {"quit", "通用", "", 0, 0, "退出：停止通信并释放主站", "  也可以用 exit 或 q", "  quit", cmd_quit},
 };
@@ -321,7 +563,7 @@ static const command *find_command(const char *name)
 
 static int cmd_help(int argc, char **argv)
 {
-    static const char *groups[] = {"查看", "测试", "通用"};
+    static const char *groups[] = {"查看", "控制", "测试", "通用"};
     size_t g, i;
     if (argc > 1) {
         const command *c = find_command(argv[1]);
@@ -365,7 +607,9 @@ static int run_command(int argc, char **argv)
                c->max_args, args, c->name);
         return -1;
     }
-    return c->fn(argc, argv);
+    int rc = c->fn(argc, argv);
+    if (rc == -2) print_usage(c);
+    return rc;
 }
 
 static int split(char *line, char **argv, int max)
@@ -381,24 +625,21 @@ static void build_prompt(char *buf, size_t size)
 {
     arms_bus_stats st;
     char hz[16];
-    int j, locked = 0, fault = -1, opened = 0;
+    int j, enabled = 0, fault = -1;
     arms_get_stats(g_arms, &st);
     hz_short(st.cycle_hz, hz, sizeof(hz));
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_joint_state s;
         if (!(arms_opened_joints(g_arms) & ARMS_MASK_JOINT(j))) continue;
-        opened++;
         arms_read_joint(g_arms, j, &s);
-        if (s.mode == ARMS_JS_LOCKED) locked++;
+        if (s.mode == ARMS_JS_ENABLED) enabled++;
         if (s.mode == ARMS_JS_FAULT && fault < 0) fault = j;
     }
     {
-        char state[32];
-        if (fault >= 0) snprintf(state, sizeof(state), "FAULT:%d", fault);
-        else if (locked == opened) snprintf(state, sizeof(state), "locked");
-        else snprintf(state, sizeof(state), "%d/%d locked", locked, opened);
-        snprintf(buf, size, "arms %s L%d/%d R%d/%d %s%s> ", hz, st.arm[0].slaves_op, st.arm[0].slaves_expected,
-                 st.arm[1].slaves_op, st.arm[1].slaves_expected, state,
+        char state[32] = "";
+        if (fault >= 0) snprintf(state, sizeof(state), " FAULT:%d", fault);
+        snprintf(buf, size, "arms %s L%d/%d R%d/%d E%d%s%s> ", hz, st.arm[0].slaves_op, st.arm[0].slaves_expected,
+                 st.arm[1].slaves_op, st.arm[1].slaves_expected, enabled, state,
                  (st.arm[0].comm_failed || st.arm[1].comm_failed) ? " COMM!" : "");
     }
 }
@@ -450,9 +691,8 @@ int main(int argc, char **argv)
     arms_options opt;
     const char *execs[16];
     int nexec = 0, ch, rc = 0, i;
-    bool power = true, keep_power = false, powered = false, rt_setup = true, stamp_all = false;
+    bool power = true, keep_power = false, rt_setup = true, stamp_all = false;
     char started[32];
-    unsigned int power_wait = 3000;
     char err[256];
     struct sigaction sa;
     arms_status st;
@@ -535,7 +775,8 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
 
     tlog("arms_test %s  启动时间 %s", arms_version(), tlog_datetime(started, sizeof(started)));
-    if (opt.backend == ARMS_BACKEND_MOCK) {
+    mock_backend = opt.backend == ARMS_BACKEND_MOCK;
+    if (mock_backend) {
         power = false;
         rt_setup = false;
     } else {
@@ -546,7 +787,7 @@ int main(int argc, char **argv)
                 arms_env_rt_revert();
                 return 1;
             }
-            powered = true;
+            powered = power_known = true;
             opt.scan_timeout_ms = 20000;
         }
     }
@@ -563,6 +804,10 @@ int main(int argc, char **argv)
         arms_bus_stats bs;
         arms_get_stats(g_arms, &bs);
         print_stats(&bs);
+    }
+    if (motion_start(g_arms, &g_interrupted, nexec > 0) != 0) {
+        rc = 1;
+        goto close_session;
     }
     if (nexec > 0) {
         for (i = 0; i < nexec && !g_interrupted; ++i) {
@@ -599,11 +844,14 @@ int main(int argc, char **argv)
             run_command(ac, av);
         }
     }
+    motion_stop();
+    if (motion_enabled() && disable_joints(arms_opened_joints(g_arms), 50)) rc = 1;
+close_session:
     tlog("退出: 停止通信并释放主站");
     arms_close(g_arms);
     if (powered) {
         if (keep_power) tlog("电源: 保持上电（--keep-power）");
-        else arms_power_off();
+        else if (arms_power_off() != 0) rc = 1;
     }
     arms_env_rt_revert();
     tlog("已退出");
