@@ -33,6 +33,7 @@
 static volatile sig_atomic_t g_interrupted;
 static arms_t *g_arms;
 static bool powered, power_known, mock_backend;
+static bool g_stamp_all; /* -T：每行加时间戳，输出经过管道 */
 static unsigned int power_wait = 3000;
 
 static void on_sigint(int sig)
@@ -564,21 +565,32 @@ static int cmd_watch(int argc, char **argv)
         hz = strtol(argv[2], &end, 10);
         if (*end || hz < 1 || hz > 50) return failed("刷新频率必须是 1..50 Hz");
     }
-    printf("持续刷新，回车或 Ctrl+C 结束\n");
+    printf("持续刷新 %ld Hz，回车或 Ctrl+C 结束\n", hz);
     g_interrupted = 0;
-    for (;;) {
-        int j;
-        printf("\r");
-        for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
-            arms_joint_state s;
-            if (!(sel & ARMS_MASK_JOINT(j))) continue;
-            arms_read_joint(g_arms, j, &s);
-            printf("%d:%+.4f%s ", j, s.position, s.mode == ARMS_JS_FAULT ? "!" : "");
+    {
+        /* 每个关节一行，原地刷新：第二次起先把光标移回表格首行。-T 模式输出经过时间戳管道，改为逐次打印 */
+        bool in_place = !g_stamp_all && isatty(STDOUT_FILENO);
+        int rows = 0;
+        for (;;) {
+            int j;
+            if (in_place && rows > 0) printf("\x1b[%dA", rows);
+            rows = 0;
+            printf("\r\x1b[2K%-4s %-20s %-8s %10s %10s %9s %10s\n", "关节", "名称", "状态", "pos[rad]", "vel[rad/s]",
+                   "tor[N.m]", "cmd");
+            rows++;
+            for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+                arms_joint_state s;
+                if (!(sel & ARMS_MASK_JOINT(j))) continue;
+                arms_read_joint(g_arms, j, &s);
+                printf("\r\x1b[2K%-4d %-20s %-8s %10.4f %10.4f %9.4f %10.4f\n", j, s.name ? s.name : "-",
+                       arms_joint_mode_name(s.mode), s.position, s.velocity, s.torque, s.cmd_position);
+                rows++;
+            }
+            fflush(stdout);
+            if (wait_or_enter((unsigned int)(1000 / hz)) || g_interrupted) break;
+            if (!in_place) printf("\n");
         }
-        fflush(stdout);
-        if (wait_or_enter((unsigned int)(1000 / hz)) || g_interrupted) break;
     }
-    printf("\n");
     return ok();
 }
 
@@ -920,8 +932,10 @@ static const command commands[] = {
      "        released / held（失能，且抱闸为强制松闸 / 强制抱闸）\n"
      "  cmd、kp、kd 为实际下发的位置和增益；M=过渡中，L=限幅，T=超时，flt=累计故障次数。",
      "  status\n  status left\n  status 21", cmd_status},
-    {"watch", "查看", "[关节] [刷新Hz]", 0, 2, "持续刷新显示关节位置，回车结束",
-     "  刷新频率 1..50 Hz，默认 5", "  watch left 10", cmd_watch},
+    {"watch", "查看", "[关节] [刷新Hz]", 0, 2, "原地刷新显示关节状态、位置、速度、力矩，回车结束",
+     "  每个关节一行，在同一块区域内刷新。刷新频率 1..50 Hz，默认 5。\n"
+     "  使用 -T 启动时输出经过时间戳处理，改为每次刷新打印一组。",
+     "  watch\n  watch left 10\n  watch 21", cmd_watch},
     {"bus", "查看", "[reset]", 0, 1, "显示两条臂的通信统计；reset 清零",
      "  周期: 平均/最短/最长间隔、抖动、唤醒延迟、超时周期、跳过周期\n"
      "  每条臂: 链路、OP 从站数、WKC、异常次数、最长连续异常、发送错误、收发耗时",
@@ -1262,7 +1276,7 @@ int main(int argc, char **argv)
         }
         case 'p': power = true; break;
         case 'P': power = false; break;
-        case 'T': stamp_all = true; break;
+        case 'T': stamp_all = g_stamp_all = true; break;
         case 'R': rt_setup = false; break;
         case 'k': keep_power = true; break;
         case 'w': {
