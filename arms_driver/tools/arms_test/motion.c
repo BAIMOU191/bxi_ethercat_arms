@@ -35,6 +35,9 @@ typedef struct {
 } snapshot;
 
 static snapshot previous;
+static volatile bool power_off;
+
+void motion_set_power_off(bool off) { power_off = off; }
 
 static uint64_t now_ns(void)
 {
@@ -114,7 +117,8 @@ static void monitor_faults(void)
     /* 同一会话中，arms_read 始终按相同顺序返回全部已打开关节。 */
     for (size_t i = 0; i < s.count; ++i) {
         const arms_joint_state *j = &s.joints[i], *old = &previous.joints[i];
-        if (j->fault_count > old->fault_count) {
+        /* 通信失败期间上电产生的同步丢失故障在恢复时自动复位，不单独报告 */
+        if (j->fault_count > old->fault_count && !s.stats.arm[j->arm].comm_failed) {
             tlog_err("关节 %d 故障计数 %u -> %u", j->joint, old->fault_count, j->fault_count);
             report[j->arm] = true;
         }
@@ -127,9 +131,16 @@ static void monitor_faults(void)
     for (int arm = 0; arm < ARMS_ARM_COUNT; ++arm) {
         const arms_arm_stats *a = &s.stats.arm[arm];
         if (!previous.stats.arm[arm].comm_failed && a->comm_failed) {
-            tlog_err("%s 臂通信失败", arms_arm_name(arm));
+            if (power_off) {
+                tlog("%s 臂通信中断（电机已断电）", arms_arm_name(arm));
+                continue;
+            }
+            tlog_err("%s 臂通信失败，该臂关节已失能；电源或网线恢复后自动重连", arms_arm_name(arm));
             report[arm] = true;
         }
+        if (previous.stats.arm[arm].comm_failed && !a->comm_failed)
+            tlog("%s 臂通信已恢复（累计中断 %u 次），关节保持失能，需重新 enable", arms_arm_name(arm),
+                 a->comm_drops);
         if (!report[arm]) continue;
         for (size_t i = 0; i < s.count; ++i) {
             const arms_joint_state *j = &s.joints[i];

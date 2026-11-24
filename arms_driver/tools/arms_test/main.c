@@ -147,7 +147,9 @@ static void print_stats(const arms_bus_stats *st)
                arms_arm_name(i), a->interface, a->master_index, a->link_up ? "UP" : "DOWN", a->slaves_op,
                a->slaves_expected, a->slaves_found, a->wkc_last, a->wkc_expected, (unsigned long long)a->wkc_bad,
                a->wkc_bad_consecutive_max, (unsigned long long)a->send_errors, a->recv_us_max, a->send_us_max,
-               a->comm_failed ? "  [超过容错上限]" : "");
+               a->comm_failed ? "  [通信失败]" : "");
+        if (a->comm_drops || a->comm_recoveries)
+            printf("      通信中断 %u 次，自动恢复 %u 次\n", a->comm_drops, a->comm_recoveries);
     }
 }
 
@@ -313,6 +315,26 @@ static int cmd_swing(int argc, char **argv)
     return motion_swing(mask, amplitude, period, count, kp, kd) ? -2 : ok();
 }
 
+/* 等待已打开的臂全部恢复通信且从站进入 OP；回车或 Ctrl+C 中止 */
+static int wait_bus_online(unsigned int timeout_ms)
+{
+    unsigned int waited;
+    for (waited = 0; waited < timeout_ms; waited += 100) {
+        arms_bus_stats st;
+        bool online = true;
+        int i;
+        arms_get_stats(g_arms, &st);
+        for (i = 0; i < ARMS_ARM_COUNT; ++i) {
+            const arms_arm_stats *a = &st.arm[i];
+            if (a->present && (a->comm_failed || a->slaves_op != a->slaves_expected || a->wkc_last != a->wkc_expected))
+                online = false;
+        }
+        if (online) return 0;
+        if (motion_wait_or_enter(100)) return -1;
+    }
+    return -1;
+}
+
 static int cmd_power(int argc, char **argv)
 {
     const char *op = argv[1];
@@ -328,9 +350,13 @@ static int cmd_power(int argc, char **argv)
             return failed("上电失败");
         }
         powered = power_known = true;
+        motion_set_power_off(false);
+        if (wait_bus_online(30000) != 0) return failed("上电后 30 秒内通信未恢复，请检查驱动器电源与网线");
+        tlog("通信已恢复，全部关节处于失能");
     } else {
         if (!powered && !power_known) return failed("未接管电源，无法确认或切断外部供电");
         if (motion_enabled() && disable_joints(arms_opened_joints(g_arms), 50)) return -1;
+        motion_set_power_off(true);
         if (arms_power_off() != 0) {
             powered = power_known = false;
             return failed("断电失败，请核对现场电源状态");
@@ -541,7 +567,10 @@ static const command commands[] = {
      "  幅值单位 rad，默认周期 4 秒、3 次、各关节默认增益。回车或 Ctrl+C 中止，1 秒过渡返回中心。",
      "  swing 17 0.05 1 1", cmd_swing},
     {"power", "控制", "on | off | status", 1, 1, "请求上电、断电或显示电源控制状态",
-     "  断电前先将全部已使能关节失能。仅支持具备 PCI 电源接口的硬件会话。", "  power status", cmd_power},
+     "  off: 先将全部已使能关节失能，再断电；断电期间通信中断属正常。\n"
+     "  on:  上电并等待通信恢复（最长 30 秒），恢复后全部关节处于失能，需重新 enable。\n"
+     "  外部断电或断线时同样会在恢复后自动重连，不需要重启程序。\n"
+     "  仅支持具备 PCI 电源接口的硬件会话。", "  power off\n  power on\n  power status", cmd_power},
     {"commtest", "测试", "<秒> [--enabled]", 1, 2, "测试通信质量；可选伺服使能测试",
      "  默认要求全部关节失能；--enabled 使能全部已打开关节并保持原位，结束或中止后全部失能。\n  清零统计后每 10 秒打印一次进度。\n"
      "  通过条件: WKC 异常 0 次、发送错误 0 次、无超时周期、无跳过周期",

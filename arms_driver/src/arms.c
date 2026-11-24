@@ -27,6 +27,7 @@
 #define DEFAULT_SCAN_TIMEOUT_MS 10000u
 #define DEFAULT_WAIT_MS 1000u          /* 使能、复位的默认等待时间 */
 #define RESET_PULSE_MS 20u             /* 故障复位控制字 0x0080 保持时间 */
+#define RECOVER_STABLE_MS 500u         /* 通信失败后，恢复稳定该时长才清除失败标志 */
 #define MOVE_MAX_S 60.0
 
 /* 非实时线程向周期上下文发出的关节请求 */
@@ -130,6 +131,9 @@ typedef struct {
     uint32_t consecutive, consecutive_max;
     bool comm_failed;
     bool wkc_ok;                      /* 本周期 WKC 正确 */
+    uint64_t good_cycles;             /* WKC 正确且全部从站 OP 的连续周期数 */
+    uint32_t drops, recoveries;
+    bool auto_reset;                  /* 恢复后对故障关节执行一次复位 */
     double recv_us_max, send_us_max;
 } arm_rt;
 
@@ -191,6 +195,7 @@ struct arms {
     joint_ctl ctl[ARMS_JOINT_LAST + 1];
     uint64_t timeout_cycles;
     uint64_t reset_pulse_cycles;
+    uint64_t recover_cycles;
     arms_joint_state js[ARMS_JOINT_LAST + 1];
     running_stat period;
     uint64_t cycles, overruns, skipped;
@@ -288,6 +293,8 @@ static void publish(arms_t *a)
         o->wkc_bad_consecutive_max = r->consecutive_max;
         o->send_errors = r->send_errors;
         o->comm_failed = r->comm_failed;
+        o->comm_drops = r->drops;
+        o->comm_recoveries = r->recoveries;
         o->recv_us_max = r->recv_us_max;
         o->send_us_max = r->send_us_max;
     }
@@ -344,6 +351,7 @@ static void cycle_rx(arms_t *a, uint64_t now)
         arm_rt *r = &a->arm[i];
         uint64_t t0, t1;
         int wkc;
+        bool arm_op = true;
         if (!r->used) continue;
         t0 = mono_ns();
         wkc = r->ops->receive(r->bus);
@@ -360,7 +368,10 @@ static void cycle_rx(arms_t *a, uint64_t now)
                 r->wkc_bad++;
                 r->consecutive++;
                 if (r->consecutive > r->consecutive_max) r->consecutive_max = r->consecutive;
-                if (r->consecutive >= a->cfg.wkc_tolerance) r->comm_failed = true;
+                if (r->consecutive >= a->cfg.wkc_tolerance && !r->comm_failed) {
+                    r->comm_failed = true;
+                    r->drops++;
+                }
             }
         } else {
             r->consecutive = 0;
@@ -382,7 +393,19 @@ static void cycle_rx(arms_t *a, uint64_t now)
             }
             s->al_state = r->al[k];
             s->mode = mode_from(r->al[k], s->status_word);
-            if ((r->al[k] & 0x0F) != 0x08) all_good = false;
+            if ((r->al[k] & 0x0F) != 0x08) {
+                all_good = false;
+                arm_op = false;
+            }
+        }
+
+        /* 掉电或断线后，从站由主站重新配置回 OP；稳定后自动清除通信失败（不自动使能） */
+        r->good_cycles = r->wkc_ok && arm_op ? r->good_cycles + 1 : 0;
+        if (r->comm_failed && r->good_cycles >= a->recover_cycles) {
+            r->comm_failed = false;
+            r->consecutive = 0;
+            r->recoveries++;
+            r->auto_reset = true;
         }
     }
 
@@ -451,6 +474,12 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
 
     if (fault && !c->was_fault) c->fault_count++;
     c->was_fault = fault;
+
+    /* 通信恢复后，复位掉电或同步丢失引起的驱动器故障；关节保持失能 */
+    if (r->auto_reset && fault && c->phase != CTL_RESETTING) {
+        c->phase = CTL_RESETTING;
+        c->phase_cycle = a->cycles;
+    }
 
     switch (req) {
     case REQ_DISABLE:
@@ -635,6 +664,7 @@ static void cycle_tx(arms_t *a, uint64_t now)
             control_joint(a, r, k, ready, &c);
             kgu_encode(r->ops->outputs(r->bus, k), &c);
         }
+        r->auto_reset = false;
     }
     for (i = 0; i < ARMS_ARM_COUNT; ++i) {
         arm_rt *r = &a->arm[i];
@@ -796,6 +826,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     a->ready_cycles = (uint64_t)READY_STABLE_MS * a->cycle_hz / 1000u;
     a->timeout_cycles = (uint64_t)a->cfg.command_timeout_ms * a->cycle_hz / 1000u;
     a->reset_pulse_cycles = (uint64_t)RESET_PULSE_MS * a->cycle_hz / 1000u;
+    a->recover_cycles = (uint64_t)RECOVER_STABLE_MS * a->cycle_hz / 1000u;
     atomic_store(&a->enable_timeout_cycles, DEFAULT_WAIT_MS * a->cycle_hz / 1000u);
     pthread_mutex_init(&a->cmd_lock, NULL);
     a->mode = options->mode != ARMS_MODE_CONFIG ? options->mode : a->cfg.mode;

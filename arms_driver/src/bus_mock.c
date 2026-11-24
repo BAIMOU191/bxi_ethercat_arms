@@ -6,6 +6,7 @@
  *   ARMS_MOCK_SLAVES=<n>       每条臂的从站数（默认 7）
  *   ARMS_MOCK_DROP_PPM=<ppm>   每周期 WKC 为 0 的概率（故障注入）
  *   ARMS_MOCK_FAULT_CYCLE=<n>  第 n 周期后，主站 0 链上位置 0 的从站在使能状态下报故障
+ *   ARMS_MOCK_POWER_OFF=<s>,<n> 主站 0 从第 s 周期起掉电 n 个周期，恢复后从站报同步丢失故障
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,7 @@ struct bus {
     float pos[BUS_MAX_SLAVES];
     uint16_t sw[BUS_MAX_SLAVES];
     uint64_t fault_cycle;
+    uint64_t off_start, off_len;
     uint64_t activated_ns;
     uint64_t cycles;
     unsigned long drop_ppm;
@@ -53,6 +55,8 @@ static int mock_open(bus_t **out, const bus_open_params *p, char *err, size_t er
     }
     s = getenv("ARMS_MOCK_DROP_PPM");
     b->drop_ppm = s ? strtoul(s, NULL, 10) : 0;
+    s = getenv("ARMS_MOCK_POWER_OFF");
+    if (s) sscanf(s, "%llu,%llu", (unsigned long long *)&b->off_start, (unsigned long long *)&b->off_len);
     s = getenv("ARMS_MOCK_FAULT_CYCLE");
     b->fault_cycle = s ? strtoull(s, NULL, 10) : 0;
     b->rng = 0x12345678u;
@@ -110,6 +114,13 @@ static uint8_t mock_al(const bus_t *b)
 {
     uint64_t dt = now_ns() - b->activated_ns;
     if (b->activated_ns == 0) return 0x02;
+    if (b->off_len && b->master == 0 && b->cycles >= b->off_start) {
+        uint64_t k = b->cycles - b->off_start;
+        if (k < b->off_len) return 0x00;
+        if (k < b->off_len + 300) return 0x02;
+        if (k < b->off_len + 600) return 0x04;
+        return 0x08;
+    }
     if (dt < 300000000ull) return 0x02;
     if (dt < 600000000ull) return 0x04;
     return 0x08;
@@ -142,6 +153,8 @@ static int mock_receive(bus_t *b)
     uint8_t al = mock_al(b);
     int i;
     b->cycles++;
+    if (b->off_len && b->master == 0 && b->cycles == b->off_start + b->off_len)
+        for (i = 0; i < b->configured; ++i) b->sw[i] = 0x0218u; /* 上电后报同步丢失故障 */
     for (i = 0; i < b->configured; ++i) {
         kgu_feedback f;
         kgu_command c;

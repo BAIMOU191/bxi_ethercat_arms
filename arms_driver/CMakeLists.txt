@@ -80,6 +80,9 @@ if(BUILD_TESTING)
   add_executable(test_control tests/test_control.c)
   target_link_libraries(test_control PRIVATE arms_driver m)
   add_test(NAME control COMMAND test_control ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
+  add_executable(test_recover tests/test_recover.c)
+  target_link_libraries(test_recover PRIVATE arms_driver)
+  add_test(NAME recover COMMAND test_recover ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
   add_test(NAME mock_session COMMAND arms_test --mock -c ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json
            -e "status" -e "bus" -e "enable all" -e "mit 17 0.1 -m 0.3" -e "home all -m 0.5"
            -e "swing 17 0.05 1 1" -e "mit 18 0.1 2 0.1 0.05" -e "hold" -e "commtest 2 --enabled"

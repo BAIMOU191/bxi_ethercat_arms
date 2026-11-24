@@ -155,7 +155,9 @@ typedef struct {
     uint64_t wkc_bad;                /**< WKC 不符的周期数 */
     uint32_t wkc_bad_consecutive_max;
     uint64_t send_errors;
-    bool comm_failed;                /**< 连续异常超过 safety.wkc_tolerance */
+    bool comm_failed;                /**< 连续异常超过 safety.wkc_tolerance，恢复稳定后自动清除 */
+    uint32_t comm_drops;             /**< 通信失败次数 */
+    uint32_t comm_recoveries;        /**< 自动恢复次数 */
     double recv_us_max;
     double send_us_max;
 } arms_arm_stats;
