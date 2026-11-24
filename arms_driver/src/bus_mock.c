@@ -5,6 +5,7 @@
  * 环境变量：
  *   ARMS_MOCK_SLAVES=<n>       每条臂的从站数（默认 7）
  *   ARMS_MOCK_DROP_PPM=<ppm>   每周期 WKC 为 0 的概率（故障注入）
+ *   ARMS_MOCK_FAULT_CYCLE=<n>  第 n 周期后，主站 0 链上位置 0 的从站在使能状态下报故障
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,8 @@ struct bus {
     uint8_t out[BUS_MAX_SLAVES][KGU_OUT_BYTES];
     uint8_t in[BUS_MAX_SLAVES][KGU_IN_BYTES];
     float pos[BUS_MAX_SLAVES];
+    uint16_t sw[BUS_MAX_SLAVES];
+    uint64_t fault_cycle;
     uint64_t activated_ns;
     uint64_t cycles;
     unsigned long drop_ppm;
@@ -50,6 +53,8 @@ static int mock_open(bus_t **out, const bus_open_params *p, char *err, size_t er
     }
     s = getenv("ARMS_MOCK_DROP_PPM");
     b->drop_ppm = s ? strtoul(s, NULL, 10) : 0;
+    s = getenv("ARMS_MOCK_FAULT_CYCLE");
+    b->fault_cycle = s ? strtoull(s, NULL, 10) : 0;
     b->rng = 0x12345678u;
     b->master = p->master;
     if (b->master < 0) {
@@ -86,6 +91,7 @@ static int mock_configure(bus_t *b, const int *positions, int n, char *err, size
             return -1;
         }
         b->positions[i] = positions[i];
+        b->sw[i] = 0x0250u;
         b->pos[i] = 0.1f * (float)(positions[i] + 1) * ((positions[i] & 1) ? -1.0f : 1.0f);
     }
     b->configured = n;
@@ -109,6 +115,28 @@ static uint8_t mock_al(const bus_t *b)
     return 0x08;
 }
 
+/* CiA402 状态机的简化模拟 */
+static uint16_t mock_drive(bus_t *b, int i, uint16_t cw)
+{
+    uint16_t st = b->sw[i] & 0x006Fu;
+    if (b->sw[i] & 0x0008u) {
+        if (cw & 0x0080u) b->sw[i] = 0x0250u;
+        return b->sw[i];
+    }
+    if (b->fault_cycle && b->master == 0 && b->positions[i] == 0 && b->cycles >= b->fault_cycle && st == 0x0027u) {
+        b->fault_cycle = 0;
+        b->sw[i] = 0x0218u;
+        return b->sw[i];
+    }
+    switch (cw & 0x008Fu) {
+    case 0x0006u: b->sw[i] = 0x0231u; break;
+    case 0x0007u: if (st == 0x0021u || st == 0x0023u || st == 0x0027u) b->sw[i] = 0x0233u; break;
+    case 0x000Fu: if (st == 0x0023u || st == 0x0027u) b->sw[i] = 0x0237u; break;
+    default: b->sw[i] = 0x0250u; break;
+    }
+    return b->sw[i];
+}
+
 static int mock_receive(bus_t *b)
 {
     uint8_t al = mock_al(b);
@@ -118,12 +146,16 @@ static int mock_receive(bus_t *b)
         kgu_feedback f;
         kgu_command c;
         uint8_t tmp[KGU_IN_BYTES];
+        float prev = b->pos[i];
         c.controlword = kgu_get_u16(b->out[i], KGU_OUT_CONTROLWORD);
-        f.statusword = (c.controlword & 0x000Fu) == 0x000Fu ? 0x0237u : 0x0250u;
+        c.pos = kgu_get_f32(b->out[i], KGU_OUT_TARGET_POS);
+        c.kp = kgu_get_f32(b->out[i], KGU_OUT_KP);
+        f.statusword = al == 0x08 ? mock_drive(b, i, c.controlword) : 0x0250u;
+        if ((f.statusword & 0x006Fu) == 0x0027u && c.kp > 0.0f) b->pos[i] += (c.pos - b->pos[i]) * 0.02f;
         f.pos = b->pos[i];
-        f.vel = 0.0f;
+        f.vel = (b->pos[i] - prev) * 1000.0f;
         f.torque = 0.0f;
-        f.error = 0;
+        f.error = (f.statusword & 0x0008u) ? 0x7500u : 0;
         memset(tmp, 0, sizeof(tmp));
         kgu_put_u16(tmp, KGU_IN_STATUSWORD, f.statusword);
         kgu_put_f32(tmp, KGU_IN_POS, f.pos);

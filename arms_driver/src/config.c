@@ -264,6 +264,11 @@ static bool parse_joint(const cJSON *node, arms_config *c, int idx, char *error,
         fail(error, size, "关节 %ld 的限位/增益无效（不能为负，默认值不能超过上限）", joint);
         return false;
     }
+    j->home = get_num(node, "home", &v) ? v : 0.0;
+    if (j->home < j->pos_min || j->home > j->pos_max) {
+        fail(error, size, "关节 %ld 的 home %.3f 超出 limit.pos [%.3f, %.3f]", joint, j->home, j->pos_min, j->pos_max);
+        return false;
+    }
     j->pn082_expected = -1;
     pn = cJSON_GetObjectItemCaseSensitive(node, "pn082");
     if (pn && !cJSON_IsNull(pn)) {

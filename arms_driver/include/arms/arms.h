@@ -122,6 +122,17 @@ typedef struct {
     double velocity;        /**< 输出端速度 [rad/s] */
     double torque;          /**< 输出端力矩 [N.m] */
     uint64_t sample_ns;     /**< 采样时刻，CLOCK_MONOTONIC */
+
+    /* 本周期实际下发的指令（关节侧，已限幅） */
+    double cmd_position;    /**< [rad] */
+    double cmd_velocity;    /**< [rad/s] */
+    double cmd_torque;      /**< 前馈力矩 [N.m] */
+    double cmd_kp;
+    double cmd_kd;
+    bool cmd_moving;        /**< 正在执行带过渡时间的指令 */
+    bool cmd_limited;       /**< 本周期指令被限幅 */
+    bool cmd_timeout;       /**< 指令超时，已按 safety.timeout_action 处理 */
+    uint32_t fault_count;   /**< 打开以来进入故障的次数 */
 } arms_joint_state;
 
 /** 周期间隔统计 [us] */
@@ -230,11 +241,63 @@ int arms_joint_by_name(const arms_t *arms, const char *name);
 /** @brief 臂名称 "left" / "right" */
 const char *arms_arm_name(int arm);
 
-/** @brief 使能关节（暂不支持，返回 ARMS_E_UNSUPPORTED） */
-arms_status arms_enable(arms_t *arms, arms_mask joints);
+/** 关节限位与默认增益（关节侧） */
+typedef struct {
+    double pos_min, pos_max;  /**< [rad] */
+    double vel_max;           /**< [rad/s] */
+    double tff_max;           /**< [N.m] */
+    double kp_max, kd_max;
+    double kp_default, kd_default;
+    double home;              /**< 回零位置 [rad] */
+} arms_joint_limits;
 
-/** @brief 失能关节 */
+/** @brief 读取关节限位，关节未打开时返回 ARMS_E_ARG */
+arms_status arms_get_limits(const arms_t *arms, int joint, arms_joint_limits *limits);
+
+/**
+ * @brief 使能关节（CiA402：0x06 → 0x07 → 0x0F）
+ * @param joints 关节掩码，只作用于已打开的关节
+ * @param timeout_ms 等待全部关节进入使能的超时，0 表示 1000 ms
+ *
+ * 使能时目标位置取当前实际位置，增益为 gain_default，因此关节保持原位。
+ * 已使能的关节不受影响。处于故障的关节需先 arms_reset()。
+ * 超时或失败时，本次请求中未完成的关节回到失能。
+ */
+arms_status arms_enable(arms_t *arms, arms_mask joints, unsigned int timeout_ms);
+
+/** @brief 失能关节（控制字 0x0000，抱闸由驱动器接管），立即返回 */
 arms_status arms_disable(arms_t *arms, arms_mask joints);
+
+/**
+ * @brief 故障复位（控制字 0x0080 脉冲），复位后关节处于失能
+ * @param timeout_ms 等待故障位清除的超时，0 表示 1000 ms
+ *
+ * 同时清除所属臂的通信失败标志（当前通信须已恢复）。
+ */
+arms_status arms_reset(arms_t *arms, arms_mask joints, unsigned int timeout_ms);
+
+/** MIT 指令（关节侧） */
+typedef struct {
+    double position; /**< 目标位置 [rad] */
+    double velocity; /**< 目标速度 [rad/s] */
+    double torque;   /**< 前馈力矩 [N.m] */
+    double kp;
+    double kd;
+} arms_command;
+
+/**
+ * @brief 写入单个关节的 MIT 指令，下一周期生效
+ * @param move_s 过渡时间 [s]。0 表示立即生效；大于 0 时目标位置从当前指令位置
+ *               按余弦曲线过渡，期间速度与前馈为 0，增益立即生效
+ *
+ * 只对已使能的关节有效。各量在周期内按 limit / gain_max 限幅。
+ * 调用方需在 safety.command_timeout_ms 内持续刷新，否则按 safety.timeout_action 处理；
+ * 过渡期间不计超时。可在任意非实时线程调用。
+ */
+arms_status arms_set_command(arms_t *arms, int joint, const arms_command *command, double move_s);
+
+/** @brief 关节保持当前指令位置：速度与前馈清零，增益不变 */
+arms_status arms_hold(arms_t *arms, arms_mask joints);
 
 /** @brief 版本字符串 */
 const char *arms_version(void);

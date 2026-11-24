@@ -26,7 +26,8 @@ typedef struct {
     double vel_max, tff_max;
     double kp_max, kd_max;
     double kp_default, kd_default;
-    int pn082_expected;     /* -1 = not checked */
+    double home;            /* 回零目标位置 [rad] */
+    int pn082_expected;    /* -1 = not checked */
     char brake[16];         /* "normal" | "release" | "lock" */
 } arms_joint_config;
 

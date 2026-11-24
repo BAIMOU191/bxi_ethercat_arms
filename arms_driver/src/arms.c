@@ -25,6 +25,18 @@
 #define STATE_POLL_HZ 10u        /* AL 状态与链路刷新频率 */
 #define READY_STABLE_MS 200u     /* 全部 OP 且 WKC 正确持续该时长后判定预热完成 */
 #define DEFAULT_SCAN_TIMEOUT_MS 10000u
+#define DEFAULT_WAIT_MS 1000u          /* 使能、复位的默认等待时间 */
+#define RESET_PULSE_MS 20u             /* 故障复位控制字 0x0080 保持时间 */
+#define MOVE_MAX_S 60.0
+
+/* 非实时线程向周期上下文发出的关节请求 */
+enum { REQ_NONE = 0, REQ_ENABLE, REQ_DISABLE, REQ_RESET, REQ_HOLD };
+
+/* 请求结果，由周期上下文写入 */
+enum { RES_PENDING = 0, RES_OK, RES_TIMEOUT, RES_FAULT, RES_STATE, RES_COMM };
+
+/* 关节控制阶段 */
+enum { CTL_OFF = 0, CTL_ENABLING, CTL_ON, CTL_RESETTING };
 
 static __thread char last_error[512];
 
@@ -117,6 +129,7 @@ typedef struct {
     uint64_t cycles, wkc_bad, send_errors;
     uint32_t consecutive, consecutive_max;
     bool comm_failed;
+    bool wkc_ok;                      /* 本周期 WKC 正确 */
     double recv_us_max, send_us_max;
 } arm_rt;
 
@@ -124,6 +137,29 @@ typedef struct {
     arms_joint_state s[ARMS_JOINT_LAST + 1];
     arms_bus_stats stats;
 } shared_snapshot;
+
+/* 指令槽：非实时线程在 cmd_lock 下写入，周期上下文无锁读取（seqlock，读失败沿用上一周期） */
+typedef struct {
+    atomic_uint seq;
+    arms_command cmd;
+    double move_s;
+} cmd_slot;
+
+/* 关节控制状态，仅在周期上下文中访问 */
+typedef struct {
+    int phase;
+    uint64_t phase_cycle;
+    unsigned int seq_seen;
+    uint64_t fresh_cycle;
+    arms_command cur;                 /* 当前生效的指令（关节侧，未限幅） */
+    double lim_min, lim_max;          /* 生效的位置限位，使能时若实际位置在限位外则放宽到该位置 */
+    bool moving;
+    double mv_from, mv_to;
+    uint64_t mv_start, mv_len;
+    bool timed_out;
+    bool was_fault;
+    uint32_t fault_count;
+} joint_ctl;
 
 struct arms {
     arms_config cfg;
@@ -144,7 +180,17 @@ struct arms {
     atomic_uint seq;
     shared_snapshot snap;
 
+    pthread_mutex_t cmd_lock;
+    cmd_slot slot[ARMS_JOINT_LAST + 1];
+    atomic_uint req[ARMS_JOINT_LAST + 1];
+    atomic_uint res[ARMS_JOINT_LAST + 1];
+    atomic_bool clear_comm[ARMS_ARM_COUNT];
+    atomic_uint enable_timeout_cycles;
+
     /* 以下仅在周期上下文中访问 */
+    joint_ctl ctl[ARMS_JOINT_LAST + 1];
+    uint64_t timeout_cycles;
+    uint64_t reset_pulse_cycles;
     arms_joint_state js[ARMS_JOINT_LAST + 1];
     running_stat period;
     uint64_t cycles, overruns, skipped;
@@ -154,6 +200,8 @@ struct arms {
     unsigned int poll_div, poll_cnt;
     uint64_t stable_cycles, ready_cycles;
 };
+
+static void post(arms_t *a, arms_mask joints, unsigned int req);
 
 static uint64_t mono_ns(void)
 {
@@ -303,7 +351,10 @@ static void cycle_rx(arms_t *a, uint64_t now)
         if ((double)(t1 - t0) / 1000.0 > r->recv_us_max) r->recv_us_max = (double)(t1 - t0) / 1000.0;
         r->cycles++;
         r->wkc_last = wkc < 0 ? 0 : (uint32_t)wkc;
-        if (wkc < 0 || (uint32_t)wkc != r->wkc_expected) {
+        r->wkc_ok = wkc >= 0 && (uint32_t)wkc == r->wkc_expected;
+        if (atomic_exchange_explicit(&a->clear_comm[i], false, memory_order_acq_rel) && r->consecutive == 0)
+            r->comm_failed = false;
+        if (!r->wkc_ok) {
             all_good = false;
             if (ready) {
                 r->wkc_bad++;
@@ -350,8 +401,229 @@ static void cycle_rx(arms_t *a, uint64_t now)
     }
 }
 
+static double clampd(double v, double lo, double hi, bool *limited)
+{
+    if (v < lo) { *limited = true; return lo; }
+    if (v > hi) { *limited = true; return hi; }
+    return v;
+}
+
+static void finish(arms_t *a, int j, unsigned int result)
+{
+    atomic_store_explicit(&a->res[j], result, memory_order_release);
+}
+
+/* 尝试读取指令槽；有新指令时返回 true */
+static bool fetch_command(arms_t *a, int j, arms_command *cmd, double *move_s)
+{
+    cmd_slot *sl = &a->slot[j];
+    joint_ctl *c = &a->ctl[j];
+    unsigned int s1, s2;
+    arms_command tmp;
+    double mv;
+
+    s1 = atomic_load_explicit(&sl->seq, memory_order_acquire);
+    if ((s1 & 1u) || s1 == c->seq_seen) return false;
+    tmp = sl->cmd;
+    mv = sl->move_s;
+    atomic_thread_fence(memory_order_acquire);
+    s2 = atomic_load_explicit(&sl->seq, memory_order_relaxed);
+    if (s1 != s2) return false;
+    c->seq_seen = s1;
+    *cmd = tmp;
+    *move_s = mv;
+    return true;
+}
+
+/* 单个关节的 CiA402 与 MIT 指令处理，生成本周期的过程数据 */
+static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *out)
+{
+    int j = r->slot_joint[k];
+    const arms_joint_config *jc = &a->cfg.joint[j];
+    arms_joint_state *s = &a->js[j];
+    joint_ctl *c = &a->ctl[j];
+    uint16_t sw = s->status_word;
+    bool fault = s->mode == ARMS_JS_FAULT;
+    bool op = (r->al[k] & 0x0F) == 0x08;
+    bool comm_ok = r->wkc_ok && !r->comm_failed;
+    unsigned int req = atomic_exchange_explicit(&a->req[j], REQ_NONE, memory_order_acq_rel);
+    bool active, limited = false;
+
+    if (fault && !c->was_fault) c->fault_count++;
+    c->was_fault = fault;
+
+    switch (req) {
+    case REQ_DISABLE:
+        if (c->phase == CTL_ENABLING) finish(a, j, RES_STATE);
+        c->phase = CTL_OFF;
+        break;
+    case REQ_ENABLE:
+        if (c->phase == CTL_ON) {
+            finish(a, j, RES_OK);
+        } else if (!ready || !comm_ok) {
+            finish(a, j, RES_COMM);
+        } else if (fault) {
+            finish(a, j, RES_FAULT);
+        } else if (!op || c->phase == CTL_RESETTING) {
+            finish(a, j, RES_STATE);
+        } else {
+            c->phase = CTL_ENABLING;
+            c->phase_cycle = a->cycles;
+            c->cur.position = s->position;
+            c->cur.velocity = 0.0;
+            c->cur.torque = 0.0;
+            c->cur.kp = jc->kp_default;
+            c->cur.kd = jc->kd_default;
+            c->lim_min = s->position < jc->pos_min ? s->position : jc->pos_min;
+            c->lim_max = s->position > jc->pos_max ? s->position : jc->pos_max;
+            c->moving = false;
+            c->timed_out = false;
+            c->seq_seen = atomic_load_explicit(&a->slot[j].seq, memory_order_acquire) & ~1u;
+            c->fresh_cycle = a->cycles;
+        }
+        break;
+    case REQ_RESET:
+        if (c->phase == CTL_ENABLING) finish(a, j, RES_STATE);
+        c->phase = CTL_RESETTING;
+        c->phase_cycle = a->cycles;
+        break;
+    case REQ_HOLD:
+        if (c->phase == CTL_ON) {
+            c->moving = false;
+            c->cur.velocity = 0.0;
+            c->cur.torque = 0.0;
+            c->fresh_cycle = a->cycles;
+        }
+        break;
+    default:
+        break;
+    }
+
+    if ((c->phase == CTL_ENABLING || c->phase == CTL_ON) && (fault || !op || r->comm_failed)) {
+        if (c->phase == CTL_ENABLING) finish(a, j, fault ? RES_FAULT : RES_COMM);
+        c->phase = CTL_OFF;
+    }
+
+    out->mode = KGU_MODE_MIT;
+    switch (c->phase) {
+    case CTL_ENABLING: {
+        unsigned int st = sw & 0x006Fu;
+        if ((sw & 0x004Fu) == 0x0040u) out->controlword = KGU_CW_SHUTDOWN;
+        else if (st == 0x0021u) out->controlword = KGU_CW_SWITCH_ON;
+        else if (st == 0x0023u || st == 0x0027u) out->controlword = KGU_CW_ENABLE;
+        else out->controlword = KGU_CW_SHUTDOWN;
+        if (st == 0x0027u) {
+            c->phase = CTL_ON;
+            c->fresh_cycle = a->cycles;
+            finish(a, j, RES_OK);
+        } else if (a->cycles - c->phase_cycle >
+                   atomic_load_explicit(&a->enable_timeout_cycles, memory_order_relaxed)) {
+            c->phase = CTL_OFF;
+            out->controlword = KGU_CW_DISABLE;
+            finish(a, j, RES_TIMEOUT);
+        }
+        break;
+    }
+    case CTL_ON: {
+        arms_command cmd;
+        double mv;
+        out->controlword = KGU_CW_ENABLE;
+        if (fetch_command(a, j, &cmd, &mv)) {
+            c->fresh_cycle = a->cycles;
+            c->timed_out = false;
+            if (mv > 0.0) {
+                c->moving = true;
+                c->mv_from = c->cur.position;
+                c->mv_to = cmd.position;
+                c->mv_start = a->cycles;
+                c->mv_len = (uint64_t)(mv * (double)a->cycle_hz);
+                if (c->mv_len == 0) c->mv_len = 1;
+                c->cur.velocity = 0.0;
+                c->cur.torque = 0.0;
+                c->cur.kp = cmd.kp;
+                c->cur.kd = cmd.kd;
+            } else {
+                c->moving = false;
+                c->cur = cmd;
+            }
+        }
+        if (c->moving) {
+            double t = (double)(a->cycles - c->mv_start) / (double)c->mv_len;
+            if (t >= 1.0) {
+                c->cur.position = c->mv_to;
+                c->moving = false;
+                c->fresh_cycle = a->cycles;
+            } else {
+                c->cur.position = c->mv_from + (c->mv_to - c->mv_from) * 0.5 * (1.0 - cos(M_PI * t));
+            }
+        } else if (a->cycles - c->fresh_cycle > a->timeout_cycles && !c->timed_out) {
+            c->timed_out = true;
+            if (strcmp(a->cfg.timeout_action, "disable") == 0) {
+                c->phase = CTL_OFF;
+                out->controlword = KGU_CW_DISABLE;
+            } else {
+                c->cur.velocity = 0.0;
+                c->cur.torque = 0.0;
+            }
+        }
+        break;
+    }
+    case CTL_RESETTING: {
+        uint64_t el = a->cycles - c->phase_cycle;
+        if (el < 2) {
+            out->controlword = KGU_CW_DISABLE;
+        } else if (el < 2 + a->reset_pulse_cycles) {
+            out->controlword = KGU_CW_FAULT_RESET;
+        } else {
+            out->controlword = KGU_CW_DISABLE;
+            if (!fault && el > 2 + 2 * a->reset_pulse_cycles) {
+                c->phase = CTL_OFF;
+                finish(a, j, RES_OK);
+            } else if (el > atomic_load_explicit(&a->enable_timeout_cycles, memory_order_relaxed)) {
+                c->phase = CTL_OFF;
+                finish(a, j, RES_FAULT);
+            }
+        }
+        break;
+    }
+    default:
+        out->controlword = KGU_CW_DISABLE;
+        break;
+    }
+
+    active = c->phase == CTL_ENABLING || c->phase == CTL_ON;
+    if (active) {
+        double pos = clampd(c->cur.position, c->lim_min, c->lim_max, &limited);
+        double vel = clampd(c->cur.velocity, -jc->vel_max, jc->vel_max, &limited);
+        double tff = clampd(c->cur.torque, -jc->tff_max, jc->tff_max, &limited);
+        double kp = clampd(c->cur.kp, 0.0, jc->kp_max, &limited);
+        double kd = clampd(c->cur.kd, 0.0, jc->kd_max, &limited);
+        double d = (double)jc->direction;
+        out->pos = (float)(d * (pos + jc->offset_rad));
+        out->vel = (float)(d * vel);
+        out->tff = (float)(d * tff);
+        out->kp = (float)kp;
+        out->kd = (float)kd;
+        s->cmd_position = pos;
+        s->cmd_velocity = vel;
+        s->cmd_torque = tff;
+        s->cmd_kp = kp;
+        s->cmd_kd = kd;
+    } else {
+        out->pos = r->slot_pos[k];
+        out->vel = out->tff = out->kp = out->kd = 0.0f;
+        s->cmd_position = s->position;
+        s->cmd_velocity = s->cmd_torque = s->cmd_kp = s->cmd_kd = 0.0;
+    }
+    s->cmd_moving = active && c->moving;
+    s->cmd_limited = limited;
+    s->cmd_timeout = c->phase == CTL_ON && c->timed_out;
+    s->fault_count = c->fault_count;
+}
+
 static void cycle_tx(arms_t *a, uint64_t now)
 {
+    bool ready = atomic_load_explicit(&a->ready, memory_order_relaxed);
     uint64_t end;
     int i, k;
 
@@ -360,13 +632,7 @@ static void cycle_tx(arms_t *a, uint64_t now)
         if (!r->used) continue;
         for (k = 0; k < r->count; ++k) {
             kgu_command c;
-            c.controlword = KGU_CW_DISABLE;
-            c.pos = r->slot_pos[k];
-            c.vel = 0.0f;
-            c.tff = 0.0f;
-            c.kp = 0.0f;
-            c.kd = 0.0f;
-            c.mode = KGU_MODE_MIT;
+            control_joint(a, r, k, ready, &c);
             kgu_encode(r->ops->outputs(r->bus, k), &c);
         }
     }
@@ -475,6 +741,9 @@ static void close_buses(arms_t *a)
 static void stop_and_free(arms_t *a)
 {
     if (a->thread_started) {
+        /* 先失能并保持若干周期，让驱动器在通信停止前进入失能 */
+        post(a, a->joints, REQ_DISABLE);
+        usleep(50000);
         atomic_store(&a->stop, true);
         pthread_join(a->thread, NULL);
     }
@@ -525,6 +794,10 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     a->period_ns = 1000000000ull / a->cycle_hz;
     a->poll_div = a->cycle_hz / STATE_POLL_HZ ? a->cycle_hz / STATE_POLL_HZ : 1u;
     a->ready_cycles = (uint64_t)READY_STABLE_MS * a->cycle_hz / 1000u;
+    a->timeout_cycles = (uint64_t)a->cfg.command_timeout_ms * a->cycle_hz / 1000u;
+    a->reset_pulse_cycles = (uint64_t)RESET_PULSE_MS * a->cycle_hz / 1000u;
+    atomic_store(&a->enable_timeout_cycles, DEFAULT_WAIT_MS * a->cycle_hz / 1000u);
+    pthread_mutex_init(&a->cmd_lock, NULL);
     a->mode = options->mode != ARMS_MODE_CONFIG ? options->mode : a->cfg.mode;
     a->rt_cpu = options->rt_cpu >= -1 ? options->rt_cpu : a->cfg.rt_cpu;
     if (a->rt_cpu >= sysconf(_SC_NPROCESSORS_CONF)) {
@@ -793,17 +1066,164 @@ int arms_joint_by_name(const arms_t *a, const char *name)
     return -1;
 }
 
-arms_status arms_enable(arms_t *a, arms_mask joints)
+arms_status arms_get_limits(const arms_t *a, int joint, arms_joint_limits *l)
 {
-    (void)a;
-    (void)joints;
-    set_error("使能功能暂不支持");
-    return ARMS_E_UNSUPPORTED;
+    const arms_joint_config *jc;
+    if (!a || !l || joint < ARMS_JOINT_FIRST || joint > ARMS_JOINT_LAST || !(a->joints & ARMS_MASK_JOINT(joint)))
+        return ARMS_E_ARG;
+    jc = &a->cfg.joint[joint];
+    l->pos_min = jc->pos_min;
+    l->pos_max = jc->pos_max;
+    l->vel_max = jc->vel_max;
+    l->tff_max = jc->tff_max;
+    l->kp_max = jc->kp_max;
+    l->kd_max = jc->kd_max;
+    l->kp_default = jc->kp_default;
+    l->kd_default = jc->kd_default;
+    l->home = jc->home;
+    return ARMS_OK;
+}
+
+static void post(arms_t *a, arms_mask joints, unsigned int req)
+{
+    int j;
+    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j)
+        if (joints & a->joints & ARMS_MASK_JOINT(j)) atomic_store(&a->req[j], req);
+}
+
+static const char *result_text(unsigned int r)
+{
+    switch (r) {
+    case RES_TIMEOUT: return "超时";
+    case RES_FAULT: return "驱动器故障";
+    case RES_STATE: return "从站不在 OP 或请求被取消";
+    case RES_COMM: return "通信未就绪或已失败";
+    case RES_PENDING: return "未响应";
+    }
+    return "?";
+}
+
+/* 向 mask 中已打开的关节发出请求并等待结果；失败时返回首个失败关节的说明 */
+static arms_status request_and_wait(arms_t *a, arms_mask mask, unsigned int req, unsigned int timeout_ms,
+                                    const char *what)
+{
+    uint64_t deadline;
+    int j, bad = -1;
+    unsigned int bad_res = RES_PENDING;
+    bool pending = true;
+
+    mask &= a->joints;
+    if (!mask) {
+        set_error("%s: 没有选中已打开的关节", what);
+        return ARMS_E_ARG;
+    }
+    if (!arms_ready(a)) {
+        set_error("%s: 预热未完成", what);
+        return ARMS_E_STATE;
+    }
+    if (!timeout_ms) timeout_ms = DEFAULT_WAIT_MS;
+    atomic_store(&a->enable_timeout_cycles, (unsigned int)((uint64_t)timeout_ms * a->cycle_hz / 1000u));
+    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        if (!(mask & ARMS_MASK_JOINT(j))) continue;
+        atomic_store(&a->res[j], RES_PENDING);
+        atomic_store(&a->req[j], req);
+    }
+    /* 周期上下文自身也按 timeout_ms 结束请求，这里多留余量 */
+    deadline = mono_ns() + ((uint64_t)timeout_ms + 200u) * 1000000ull;
+    while (pending && mono_ns() < deadline) {
+        pending = false;
+        for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j)
+            if ((mask & ARMS_MASK_JOINT(j)) && atomic_load(&a->res[j]) == RES_PENDING) pending = true;
+        if (pending) usleep(2000);
+    }
+    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        unsigned int r;
+        if (!(mask & ARMS_MASK_JOINT(j))) continue;
+        r = atomic_load(&a->res[j]);
+        if (r != RES_OK && bad < 0) {
+            bad = j;
+            bad_res = r;
+        }
+    }
+    if (bad < 0) {
+        /* 等快照包含本次结果后再返回，保证随后的 arms_read()/arms_set_command() 看到新状态 */
+        unsigned int s0 = atomic_load(&a->seq);
+        uint64_t until = mono_ns() + 100000000ull;
+        while (atomic_load(&a->seq) - s0 < 4u && mono_ns() < until) usleep(500);
+        return ARMS_OK;
+    }
+    if (req == REQ_ENABLE) {
+        arms_mask undone = 0;
+        for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j)
+            if ((mask & ARMS_MASK_JOINT(j)) && atomic_load(&a->res[j]) != RES_OK) undone |= ARMS_MASK_JOINT(j);
+        post(a, undone, REQ_DISABLE);
+    }
+    {
+        arms_joint_state s;
+        arms_read_joint(a, bad, &s);
+        set_error("%s失败: 关节 %d (%s) %s, 状态字 0x%04x, 错误码 0x%04x", what, bad, a->cfg.joint[bad].name,
+                  result_text(bad_res), s.status_word, s.error_code);
+    }
+    if (bad_res == RES_TIMEOUT || bad_res == RES_PENDING) return ARMS_E_TIMEOUT;
+    if (bad_res == RES_COMM) return ARMS_E_COMM;
+    return ARMS_E_STATE;
+}
+
+arms_status arms_enable(arms_t *a, arms_mask joints, unsigned int timeout_ms)
+{
+    if (!a) return ARMS_E_ARG;
+    return request_and_wait(a, joints, REQ_ENABLE, timeout_ms, "使能");
+}
+
+arms_status arms_reset(arms_t *a, arms_mask joints, unsigned int timeout_ms)
+{
+    int j;
+    if (!a) return ARMS_E_ARG;
+    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j)
+        if ((joints & a->joints & ARMS_MASK_JOINT(j))) atomic_store(&a->clear_comm[a->cfg.joint[j].arm], true);
+    return request_and_wait(a, joints, REQ_RESET, timeout_ms, "复位");
 }
 
 arms_status arms_disable(arms_t *a, arms_mask joints)
 {
-    (void)a;
-    (void)joints;
+    if (!a) return ARMS_E_ARG;
+    post(a, joints, REQ_DISABLE);
+    return ARMS_OK;
+}
+
+arms_status arms_hold(arms_t *a, arms_mask joints)
+{
+    if (!a) return ARMS_E_ARG;
+    post(a, joints, REQ_HOLD);
+    return ARMS_OK;
+}
+
+arms_status arms_set_command(arms_t *a, int joint, const arms_command *cmd, double move_s)
+{
+    arms_joint_state s;
+    cmd_slot *sl;
+    if (!a || !cmd || joint < ARMS_JOINT_FIRST || joint > ARMS_JOINT_LAST || !(a->joints & ARMS_MASK_JOINT(joint))) {
+        set_error("关节 %d 未打开", joint);
+        return ARMS_E_ARG;
+    }
+    if (!isfinite(cmd->position) || !isfinite(cmd->velocity) || !isfinite(cmd->torque) || !isfinite(cmd->kp) ||
+        !isfinite(cmd->kd) || cmd->kp < 0.0 || cmd->kd < 0.0 || !isfinite(move_s) || move_s < 0.0 ||
+        move_s > MOVE_MAX_S) {
+        set_error("关节 %d 的指令无效（数值非有限、增益为负或过渡时间超出 0..%.0f s）", joint, MOVE_MAX_S);
+        return ARMS_E_ARG;
+    }
+    arms_read_joint(a, joint, &s);
+    if (s.mode != ARMS_JS_ENABLED) {
+        set_error("关节 %d (%s) 未使能，当前 %s", joint, a->cfg.joint[joint].name, arms_joint_mode_name(s.mode));
+        return ARMS_E_STATE;
+    }
+    sl = &a->slot[joint];
+    pthread_mutex_lock(&a->cmd_lock);
+    atomic_fetch_add_explicit(&sl->seq, 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    sl->cmd = *cmd;
+    sl->move_s = move_s;
+    atomic_fetch_add_explicit(&sl->seq, 1, memory_order_release);
+    pthread_mutex_unlock(&a->cmd_lock);
     return ARMS_OK;
 }
