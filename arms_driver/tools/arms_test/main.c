@@ -21,6 +21,7 @@
 #include "joint_select.h"
 #include "power.h"
 #include "runtime_env.h"
+#include "tlog.h"
 
 static volatile sig_atomic_t g_interrupted;
 static arms_t *g_arms;
@@ -34,8 +35,7 @@ static void on_sigint(int sig)
 static void log_line(void *user, const char *line)
 {
     (void)user;
-    printf("  %s\n", line);
-    fflush(stdout);
+    tlog("  %s", line);
 }
 
 typedef int (*cmd_fn)(int argc, char **argv);
@@ -185,20 +185,20 @@ static int cmd_commtest(int argc, char **argv)
     if (*end || seconds < 1 || seconds > 86400) return failed("秒数必须是 1..86400 的整数");
     arms_reset_stats(g_arms);
     usleep(20000);
-    printf("失能通信测试 %ld 秒，回车或 Ctrl+C 提前结束...\n", seconds);
+    tlog("通信测试开始: %ld 秒，回车或 Ctrl+C 提前结束", seconds);
     g_interrupted = 0;
     for (t = 1; t <= seconds; ++t) {
         if (wait_or_enter(1000) || g_interrupted) {
-            printf("已提前结束（%ld 秒）\n", t - 1);
+            tlog("通信测试提前结束: 已运行 %ld 秒", t - 1);
             break;
         }
         if (t % 10 == 0 || t == seconds) {
             arms_get_stats(g_arms, &st);
-            printf("  %3ld s  周期 %llu  WKC异常 左 %llu 右 %llu  周期最长 %.1f us\n", t,
-                   (unsigned long long)st.cycles, (unsigned long long)st.arm[0].wkc_bad,
-                   (unsigned long long)st.arm[1].wkc_bad, st.period.max);
+            tlog("  %3ld s  周期 %llu  WKC异常 左 %llu 右 %llu  周期最长 %.1f us", t, (unsigned long long)st.cycles,
+                 (unsigned long long)st.arm[0].wkc_bad, (unsigned long long)st.arm[1].wkc_bad, st.period.max);
         }
     }
+    tlog("通信测试结束");
     arms_get_stats(g_arms, &st);
     print_stats(&st);
     for (i = 0; i < ARMS_ARM_COUNT; ++i)
@@ -422,6 +422,7 @@ static void usage(FILE *out)
             "      --keep-power     退出时不断电\n"
             "      --power-wait MS  上电后等待驱动器启动的时间（默认 3000）\n"
             "      --no-rt-setup    不配置实时运行环境（中断绑定、CPU 隔离）\n"
+            "  -T, --timestamps     每一行输出都加时间戳（默认只在事件行加）\n"
             "  -h, --help           显示本帮助\n"
             "  -V, --version        显示版本\n"
             "\n"
@@ -443,12 +444,14 @@ int main(int argc, char **argv)
         {"power", no_argument, NULL, 'p'},        {"help", no_argument, NULL, 'h'},
         {"version", no_argument, NULL, 'V'},      {"power-wait", required_argument, NULL, 'w'},
         {"keep-power", no_argument, NULL, 'k'},   {"no-power", no_argument, NULL, 'P'},
-        {"no-rt-setup", no_argument, NULL, 'R'},  {NULL, 0, NULL, 0},
+        {"no-rt-setup", no_argument, NULL, 'R'},  {"timestamps", no_argument, NULL, 'T'},
+        {NULL, 0, NULL, 0},
     };
     arms_options opt;
     const char *execs[16];
     int nexec = 0, ch, rc = 0, i;
-    bool power = true, keep_power = false, powered = false, rt_setup = true;
+    bool power = true, keep_power = false, powered = false, rt_setup = true, stamp_all = false;
+    char started[32];
     unsigned int power_wait = 3000;
     char err[256];
     struct sigaction sa;
@@ -457,7 +460,7 @@ int main(int argc, char **argv)
     arms_options_init(&opt);
     opt.mode = ARMS_MODE_STANDALONE;
     opt.log = log_line;
-    while ((ch = getopt_long(argc, argv, "f:j:r:c:e:hV", long_opts, NULL)) != -1) {
+    while ((ch = getopt_long(argc, argv, "f:j:r:c:e:ThV", long_opts, NULL)) != -1) {
         switch (ch) {
         case 'f': {
             char *end;
@@ -496,6 +499,7 @@ int main(int argc, char **argv)
         }
         case 'p': power = true; break;
         case 'P': power = false; break;
+        case 'T': stamp_all = true; break;
         case 'R': rt_setup = false; break;
         case 'k': keep_power = true; break;
         case 'w': {
@@ -519,6 +523,10 @@ int main(int argc, char **argv)
     }
 
     if (opt.backend != ARMS_BACKEND_MOCK && arms_env_ensure_root(argc, argv) != 0) return 1;
+    if (stamp_all) {
+        if (tlog_stamp_all_lines() == 0) atexit(tlog_shutdown);
+        else fprintf(stderr, "警告: 无法启用逐行时间戳\n");
+    }
 
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_sigint;
@@ -526,7 +534,7 @@ int main(int argc, char **argv)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    printf("arms_test %s\n", arms_version());
+    tlog("arms_test %s  启动时间 %s", arms_version(), tlog_datetime(started, sizeof(started)));
     if (opt.backend == ARMS_BACKEND_MOCK) {
         power = false;
         rt_setup = false;
@@ -542,10 +550,11 @@ int main(int argc, char **argv)
             opt.scan_timeout_ms = 20000;
         }
     }
-    printf("启动: %s后端，扫描并预热，全部关节保持伺服失能\n", opt.backend == ARMS_BACKEND_MOCK ? "模拟" : "EtherLab ");
+    tlog("启动: %s后端，扫描并预热，全部关节保持伺服失能", opt.backend == ARMS_BACKEND_MOCK ? "模拟" : "EtherLab ");
     st = arms_open(&opt, &g_arms);
     if (st != ARMS_OK) {
-        fprintf(stderr, "启动失败: %s\n  原因: %s\n", arms_strerror(st), arms_last_error());
+        tlog_err("启动失败: %s", arms_strerror(st));
+        tlog_err("  原因: %s", arms_last_error());
         if (powered && !keep_power) arms_power_off();
         arms_env_rt_revert();
         return 1;
@@ -561,11 +570,11 @@ int main(int argc, char **argv)
             int ac;
             snprintf(line, sizeof(line), "%s", execs[i]);
             ac = split(line, av, 16);
-            printf(">> %s\n", execs[i]);
+            tlog(">> %s", execs[i]);
             if (run_command(ac, av) != 0) rc = 1;
         }
     } else {
-        printf("就绪。输入 help 查看命令，quit 退出。\n");
+        tlog("就绪。输入 help 查看命令，quit 退出");
         while (!g_quit) {
             char prompt[128], line[512], *av[16];
             int ac;
@@ -583,16 +592,20 @@ int main(int argc, char **argv)
                 break;
             }
             ac = split(line, av, 16);
+            if (ac > 0 && !stamp_all) {
+                char ts[16];
+                printf("[%s] %s\n", tlog_time(ts, sizeof(ts)), av[0]);
+            }
             run_command(ac, av);
         }
     }
-    printf("退出: 停止通信并释放主站\n");
+    tlog("退出: 停止通信并释放主站");
     arms_close(g_arms);
     if (powered) {
-        if (keep_power) printf("电源: 保持上电（--keep-power）\n");
+        if (keep_power) tlog("电源: 保持上电（--keep-power）");
         else arms_power_off();
     }
     arms_env_rt_revert();
-    printf("已退出\n");
+    tlog("已退出");
     return rc;
 }

@@ -33,10 +33,14 @@ cd arms_driver
 ./arms_test --mock                 # 模拟后端，不访问硬件
 ./arms_test -f 2000 -j left        # 2 kHz，只打开左臂
 ./arms_test -e "commtest 300"      # 执行命令后退出
+./arms_test -T                     # 每一行输出都加时间戳
 scripts/comm_test.sh -j all -t 300 # 通信质量测试，1000/2000 Hz 各一轮
 ```
 
 交互终端中输入 `help` 查看命令，`<命令> -h` 查看详细用法。
+
+输出中的时间戳为本地时间 `[HH:MM:SS.mmm]`：启动、电源、实时环境、命令开始、通信测试进度等事件行默认带时间戳；
+`-T` 使每一行都带时间戳，`scripts/comm_test.sh` 默认启用。
 
 ## 编译与测试
 

@@ -54,7 +54,7 @@ endif()
 set_target_properties(arms_driver PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_executable(arms_test tools/arms_test/main.c tools/arms_test/joint_select.c tools/arms_test/power.c
-               tools/arms_test/runtime_env.c)
+               tools/arms_test/runtime_env.c tools/arms_test/tlog.c)
 target_link_libraries(arms_test PRIVATE arms_driver)
 
 # Motor main power for the test tool (BXI PCI SDK, aarch64 static library)

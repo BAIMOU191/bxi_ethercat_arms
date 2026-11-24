@@ -45,7 +45,7 @@ declare -A RESULT
 for f in $FREQS; do
   echo
   echo "== ${f} Hz"
-  if "$ROOT/arms_test" "${ARGS[@]}" -f "$f" -e "info" -e "commtest $DURATION" -e "bus"; then
+  if "$ROOT/arms_test" "${ARGS[@]}" -T -f "$f" -e "info" -e "commtest $DURATION" -e "bus"; then
     RESULT[$f]=通过
   else
     RESULT[$f]=未通过

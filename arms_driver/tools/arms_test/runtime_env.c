@@ -14,6 +14,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "tlog.h"
+
 #define MASTER_PARAM "/sys/module/ec_master/parameters/main_devices"
 #define MASTER_INIT "/etc/init.d/ethercat"
 #define RT_STATE "/run/arms_rt_setup.state"
@@ -43,10 +45,9 @@ int arms_env_ensure_root(int argc, char **argv)
     args[0] = "sudo";
     args[1] = exe;
     for (i = 1; i < argc; ++i) args[i + 1] = argv[i];
-    printf("需要 root 权限，通过 sudo 启动\n");
-    fflush(stdout);
+    tlog("需要 root 权限，通过 sudo 启动");
     execvp("sudo", args);
-    fprintf(stderr, "无法执行 sudo: %s\n", strerror(errno));
+    tlog_err("无法执行 sudo: %s", strerror(errno));
     free(args);
     return -1;
 }
@@ -63,20 +64,20 @@ int arms_env_start_master(void)
     int i;
     if (access(MASTER_PARAM, R_OK) == 0) return 0;
     if (access(MASTER_INIT, X_OK) != 0) {
-        fprintf(stderr, "EtherLab 主站未加载，且找不到 %s\n", MASTER_INIT);
+        tlog_err("EtherLab 主站未加载，且找不到 %s", MASTER_INIT);
         return -1;
     }
-    printf("启动 EtherLab 主站\n");
-    fflush(stdout);
+    tlog("启动 EtherLab 主站");
     if (run(MASTER_INIT " start > /dev/null 2>&1") != 0) {
-        fprintf(stderr, "EtherLab 主站启动失败，请检查 /etc/sysconfig/ethercat\n");
+        tlog_err("EtherLab 主站启动失败，请检查 /etc/sysconfig/ethercat");
         return -1;
     }
     for (i = 0; i < 50 && access(MASTER_PARAM, R_OK) != 0; ++i) usleep(100000);
     if (access(MASTER_PARAM, R_OK) != 0) {
-        fprintf(stderr, "EtherLab 主站启动后仍不可用\n");
+        tlog_err("EtherLab 主站启动后仍不可用");
         return -1;
     }
+    tlog("EtherLab 主站已就绪");
     return 0;
 }
 
@@ -102,11 +103,11 @@ int arms_env_rt_apply(const char *config, int rt_cpu)
     int n;
 
     if (locate_script() != 0) {
-        printf("实时环境: 未找到 rt_setup.sh，跳过\n");
+        tlog("实时环境: 未找到 rt_setup.sh，跳过");
         return 1;
     }
     if (access(RT_STATE, F_OK) == 0) {
-        printf("实时环境: 发现上次未还原的设置，先还原\n");
+        tlog("实时环境: 发现上次未还原的设置，先还原");
         snprintf(cmd, sizeof(cmd), "'%s' revert > " RT_LOG " 2>&1", g_rt_script);
         run(cmd);
     }
@@ -115,7 +116,7 @@ int arms_env_rt_apply(const char *config, int rt_cpu)
     if (rt_cpu >= 0) n += snprintf(cmd + n, sizeof(cmd) - (size_t)n, " --rt-cpu %d --irq-cpu %d", rt_cpu, rt_cpu);
     snprintf(cmd + n, sizeof(cmd) - (size_t)n, " > " RT_LOG " 2>&1");
     if (run(cmd) != 0) {
-        fprintf(stderr, "实时环境配置失败，详见 " RT_LOG "\n");
+        tlog_err("实时环境配置失败，详见 " RT_LOG);
         return -1;
     }
     g_rt_applied = true;
@@ -123,8 +124,12 @@ int arms_env_rt_apply(const char *config, int rt_cpu)
         FILE *f = fopen(RT_LOG, "r");
         char line[256];
         if (f) {
-            while (fgets(line, sizeof(line), f))
-                if (strncmp(line, "配置:", strlen("配置:")) == 0) printf("实时环境: %s", line + strlen("配置:"));
+            while (fgets(line, sizeof(line), f)) {
+                size_t n = strlen(line);
+                if (strncmp(line, "配置:", strlen("配置:")) != 0) continue;
+                if (n > 0 && line[n - 1] == '\n') line[n - 1] = '\0';
+                tlog("实时环境:%s", line + strlen("配置:"));
+            }
             fclose(f);
         }
     }
@@ -136,7 +141,7 @@ void arms_env_rt_revert(void)
     char cmd[PATH_MAX + 64];
     if (!g_rt_applied || !g_rt_script[0]) return;
     snprintf(cmd, sizeof(cmd), "'%s' revert > " RT_LOG " 2>&1", g_rt_script);
-    if (run(cmd) == 0) printf("实时环境: 已还原\n");
-    else fprintf(stderr, "实时环境还原失败，请执行 sudo %s revert\n", g_rt_script);
+    if (run(cmd) == 0) tlog("实时环境: 已还原");
+    else tlog_err("实时环境还原失败，请执行 sudo %s revert", g_rt_script);
     g_rt_applied = false;
 }
