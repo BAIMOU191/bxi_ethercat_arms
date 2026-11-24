@@ -1593,8 +1593,15 @@ arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
                 st = arms_sdo_read(a, other, arms_pn_index(75), 0, data, 2, &n);
                 if (st != ARMS_OK)
                     return st;
-                if (n != 2 || kgu_get_u16(data, 0) != 0) {
-                    set_error("关节 %d 抱闸参数非默认或未知；拒绝释放第二个关节", other);
+                if (n != 2) {
+                    set_error("无法确认关节 %d 的抱闸参数 Pn075（读回 %zu 字节），未松开关节 %d", other, n, j);
+                    return ARMS_E_STATE;
+                }
+                if (kgu_get_u16(data, 0) != 0) {
+                    unsigned v = kgu_get_u16(data, 0);
+                    set_error("关节 %d 的 Pn075=%u（%s），同一时间只允许一个关节松闸，未松开关节 %d；"
+                              "先托住关节 %d 并执行 lock %d --confirm",
+                              other, v, v == 1 ? "强制松闸" : v == 2 ? "强制锁闸" : "非默认值", j, other, other);
                     return ARMS_E_STATE;
                 }
             }
