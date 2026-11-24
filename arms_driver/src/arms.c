@@ -557,7 +557,8 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         }
         logf_(a, "%s 臂: 网口 %s -> 主站 %d，扫描中...", arms_arm_name(i), ac->interface,
               r->ops->master_index(r->bus));
-        if (r->ops->scan(r->bus, infos, BUS_MAX_SLAVES, &found, 10000, err, sizeof(err)) != 0) {
+        if (r->ops->scan(r->bus, infos, BUS_MAX_SLAVES, &found,
+                         options->scan_timeout_ms ? options->scan_timeout_ms : 10000u, err, sizeof(err)) != 0) {
             set_error("%s 臂: %s", arms_arm_name(i), err);
             st = strstr(err, "DOWN") ? ARMS_E_LINK : ARMS_E_TOPOLOGY;
             goto fail;

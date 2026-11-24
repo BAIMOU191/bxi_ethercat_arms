@@ -18,6 +18,7 @@
 
 #include "arms/arms.h"
 #include "joint_select.h"
+#include "power.h"
 
 static volatile sig_atomic_t g_interrupted;
 static arms_t *g_arms;
@@ -442,13 +443,16 @@ static void usage(FILE *out)
             "  -e, --exec CMD       执行一条命令后退出，例如 -e \"commtest 300\"（可重复）\n"
             "      --mock           使用模拟后端，不访问硬件\n"
             "      --no-check       跳过自检（阶段 4 起生效）\n"
-            "      --power          启动时请求电机总电源上电（尚未实现，默认不碰电源）\n"
+            "      --power          启动前请求电机总电源上电，退出时断电（默认不碰电源）\n"
+            "      --power-wait MS  上电后等待驱动器启动的时间（默认 3000）\n"
+            "      --keep-power     配合 --power：退出时不断电\n"
             "  -h, --help           显示本帮助\n"
             "  -V, --version        显示版本\n"
             "\n"
             "关节编号: 15-21 左臂（肩y/x/z、肘y、腕x/y/z），22-28 右臂，顺序相同。\n"
             "示例:\n"
-            "  sudo arms_test                        扫描两臂、预热，进入交互终端\n"
+            "  sudo arms_test --power                上电、扫描两臂、预热，进入交互终端\n"
+            "  sudo arms_test                        电源已由别的程序打开时使用\n"
             "  sudo arms_test -f 2000 -j left        只测左臂，2 kHz\n"
             "  sudo arms_test -e \"commtest 300\"      跑 5 分钟通信测试后退出\n"
             "  arms_test --mock                      不接硬件，熟悉命令\n"
@@ -462,11 +466,14 @@ int main(int argc, char **argv)
         {"config", required_argument, NULL, 'c'}, {"exec", required_argument, NULL, 'e'},
         {"mock", no_argument, NULL, 'm'},         {"no-check", no_argument, NULL, 'n'},
         {"power", no_argument, NULL, 'p'},        {"help", no_argument, NULL, 'h'},
-        {"version", no_argument, NULL, 'V'},      {NULL, 0, NULL, 0},
+        {"version", no_argument, NULL, 'V'},      {"power-wait", required_argument, NULL, 'w'},
+        {"keep-power", no_argument, NULL, 'k'},   {NULL, 0, NULL, 0},
     };
     arms_options opt;
     const char *execs[16];
     int nexec = 0, ch, rc = 0, i;
+    bool power = false, keep_power = false, powered = false;
+    unsigned int power_wait = 3000;
     char err[256];
     struct sigaction sa;
     arms_status st;
@@ -501,7 +508,18 @@ int main(int argc, char **argv)
             break;
         case 'm': opt.backend = ARMS_BACKEND_MOCK; break;
         case 'n': opt.skip_selftest = true; break;
-        case 'p': fprintf(stderr, "提示: --power 尚未实现，本次不会操作电源\n"); break;
+        case 'p': power = true; break;
+        case 'k': keep_power = true; break;
+        case 'w': {
+            char *end;
+            long v = strtol(optarg, &end, 10);
+            if (*end || v < 0 || v > 60000) {
+                fprintf(stderr, "错误: --power-wait 需要 0..60000 的毫秒数\n");
+                return 2;
+            }
+            power_wait = (unsigned int)v;
+            break;
+        }
         case 'h': usage(stdout); return 0;
         case 'V': printf("arms_test %s\n", arms_version()); return 0;
         default: usage(stderr); return 2;
@@ -519,10 +537,20 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
 
     printf("arms_test %s\n", arms_version());
+    if (power && opt.backend == ARMS_BACKEND_MOCK) {
+        printf("提示: mock 模式忽略 --power\n");
+        power = false;
+    }
+    if (power) {
+        if (arms_power_on(power_wait) != 0) return 1;
+        powered = true;
+        opt.scan_timeout_ms = 20000;
+    }
     printf("启动: %s 后端，扫描并预热（全部关节保持失能）...\n", opt.backend == ARMS_BACKEND_MOCK ? "mock" : "EtherLab");
     st = arms_open(&opt, &g_arms);
     if (st != ARMS_OK) {
         fprintf(stderr, "启动失败: %s\n  原因: %s\n", arms_strerror(st), arms_last_error());
+        if (powered && !keep_power) arms_power_off();
         return 1;
     }
     {
@@ -563,6 +591,10 @@ int main(int argc, char **argv)
     }
     printf("退出: 停止通信并释放主站...\n");
     arms_close(g_arms);
+    if (powered) {
+        if (keep_power) printf("电源: 按 --keep-power 保持上电\n");
+        else arms_power_off();
+    }
     printf("已退出\n");
     return rc;
 }

@@ -65,6 +65,7 @@ typedef struct {
     unsigned int cycle_hz;     /* 0 = use configuration */
     arms_mask joints;          /* joints to bring up; 0 = all configured */
     bool skip_selftest;
+    unsigned int scan_timeout_ms; /* 0 = 10000; raise after a fresh power-on */
     arms_log_fn log;           /* progress/diagnostic lines (non-realtime) */
     void *log_user;
 } arms_options;
