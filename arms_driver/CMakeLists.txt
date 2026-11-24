@@ -1,0 +1,72 @@
+cmake_minimum_required(VERSION 3.16)
+project(arms_driver VERSION 0.1.0 LANGUAGES C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo)
+endif()
+add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+
+option(ARMS_WITH_ETHERLAB "Build the EtherLab backend" ON)
+set(ETHERLAB_ROOT "/usr/local/etherlab" CACHE PATH "EtherLab installation prefix")
+find_package(Threads REQUIRED)
+
+set(ARMS_HAVE_ETHERLAB OFF)
+if(ARMS_WITH_ETHERLAB)
+  find_path(ETHERLAB_INCLUDE_DIR ecrt.h HINTS ${ETHERLAB_ROOT} PATH_SUFFIXES include)
+  find_library(ETHERLAB_LIBRARY ethercat HINTS ${ETHERLAB_ROOT} PATH_SUFFIXES lib lib64)
+  if(ETHERLAB_INCLUDE_DIR AND ETHERLAB_LIBRARY)
+    set(ARMS_HAVE_ETHERLAB ON)
+    message(STATUS "EtherLab: ${ETHERLAB_LIBRARY}")
+  else()
+    message(WARNING "EtherLab not found: building with the mock backend only")
+  endif()
+endif()
+
+find_package(Git QUIET)
+set(ARMS_GIT "nogit")
+if(GIT_FOUND)
+  execute_process(COMMAND ${GIT_EXECUTABLE} describe --always --dirty
+                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                  OUTPUT_VARIABLE ARMS_GIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(NOT ARMS_GIT)
+    set(ARMS_GIT "nogit")
+  endif()
+endif()
+
+add_library(arms_driver STATIC
+  src/arms.c
+  src/config.c
+  src/bus_mock.c
+  third_party/cjson/cJSON.c)
+target_include_directories(arms_driver
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
+  PRIVATE src third_party/cjson)
+target_compile_definitions(arms_driver PRIVATE ARMS_VERSION_STRING="${PROJECT_VERSION}-${ARMS_GIT}")
+target_link_libraries(arms_driver PUBLIC Threads::Threads m)
+if(ARMS_HAVE_ETHERLAB)
+  target_sources(arms_driver PRIVATE src/bus_etherlab.c)
+  target_compile_definitions(arms_driver PRIVATE ARMS_HAVE_ETHERLAB=1)
+  target_include_directories(arms_driver PRIVATE ${ETHERLAB_INCLUDE_DIR})
+  target_link_libraries(arms_driver PUBLIC ${ETHERLAB_LIBRARY})
+endif()
+set_target_properties(arms_driver PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_executable(arms_test tools/arms_test/main.c tools/arms_test/joint_select.c)
+target_link_libraries(arms_test PRIVATE arms_driver)
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(test_config tests/test_config.c tools/arms_test/joint_select.c)
+  target_include_directories(test_config PRIVATE src tools/arms_test third_party/cjson)
+  target_link_libraries(test_config PRIVATE arms_driver)
+  add_test(NAME config COMMAND test_config ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
+  add_test(NAME mock_session COMMAND arms_test --mock -c ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json
+           -e "status" -e "bus" -e "commtest 2" -e "help")
+endif()
+
+install(TARGETS arms_test RUNTIME DESTINATION bin)
+install(TARGETS arms_driver ARCHIVE DESTINATION lib)
+install(DIRECTORY include/ DESTINATION include)
+install(FILES config/arms.json DESTINATION share/arms_driver/config)
