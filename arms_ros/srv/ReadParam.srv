@@ -1,0 +1,12 @@
+# Read-only parameter query for one joint (SDO upload); never writes to the drive.
+# pn >= 0: decimal Pn number 0..999 (Pn075 -> object 0x2075:00), value is INT16.
+# pn = -1: read object index/subindex directly, value is little-endian unsigned.
+uint8 joint
+int32 pn
+uint16 index
+uint8 subindex
+---
+bool success
+int64 value
+uint8[] raw
+string message

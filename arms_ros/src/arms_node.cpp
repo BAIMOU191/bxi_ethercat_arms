@@ -2,8 +2,11 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <unistd.h>
 #include <rclcpp/rclcpp.hpp>
@@ -11,9 +14,12 @@
 #include <communication/msg/actuator_states.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <arms_ros/srv/joint_operation.hpp>
+#include <arms_ros/srv/read_param.hpp>
 #include "arms/arms.h"
 #include "arms/lease.h"
+#include "arms/pn.h"
 extern "C" {
 #include "power.h"
 #include "runtime_env.h"
@@ -24,6 +30,18 @@ using State = communication::msg::ActuatorStates;
 using Joint = sensor_msgs::msg::JointState;
 using Diag = diagnostic_msgs::msg::DiagnosticArray;
 using Op = arms_ros::srv::JointOperation;
+using Trigger = std_srvs::srv::Trigger;
+using ReadParam = arms_ros::srv::ReadParam;
+
+static std::string format(const char *fmt, ...)
+{
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    return line;
+}
 
 // Also runs when a partially constructed node fails its startup checks.
 struct Device {
@@ -57,10 +75,13 @@ class ArmsNode final : public rclcpp::Node
     rclcpp::Publisher<State>::SharedPtr state_pub;
     rclcpp::Publisher<Diag>::SharedPtr diag_pub;
     rclcpp::Subscription<Cmd>::SharedPtr cmd_sub;
-    std::vector<rclcpp::Service<Op>::SharedPtr> services;
+    std::vector<rclcpp::ServiceBase::SharedPtr> services;
     rclcpp::TimerBase::SharedPtr tick, report;
     int64_t max_age_ms;
     unsigned rejected = 0;
+    bool manage_power = false;
+    /* hold 的关节：忽略话题目标，直到对其执行 enable、free、disable 或 reset。仅在执行器线程访问。 */
+    arms_mask held = 0;
     void reject(const char *why)
     {
         ++rejected;
@@ -117,7 +138,7 @@ class ArmsNode final : public rclcpp::Node
             }
         }
         for (int j = 15; j <= 28; j++)
-            if (mask & ARMS_MASK_JOINT(j)) {
+            if ((mask & ~held) & ARMS_MASK_JOINT(j)) {
                 arms_joint_state s{};
                 arms_read_joint(dev.driver, j, &s);
                 if (s.mode == ARMS_JS_ENABLED && arms_set_command(dev.driver, j, &cmds[j]) != ARMS_OK) {
@@ -156,6 +177,27 @@ class ArmsNode final : public rclcpp::Node
             r.message = "select opened joint bits 15..28";
             return;
         }
+        if (name == "hold") {
+            /* 停在当前指令位置：速度与前馈清零，增益不变；不需要确认 */
+            arms_mask enabled = 0;
+            for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; j++) {
+                arms_joint_state s{};
+                if ((m & ARMS_MASK_JOINT(j)) && arms_read_joint(dev.driver, j, &s) == ARMS_OK &&
+                    s.mode == ARMS_JS_ENABLED)
+                    enabled |= ARMS_MASK_JOINT(j);
+            }
+            if (!enabled) {
+                r.message = "no selected joint is enabled";
+                return;
+            }
+            held |= enabled;
+            r.success = arms_hold(dev.driver, enabled) == ARMS_OK;
+            r.message = r.success ? format("holding joints 0x%08x; topic targets for them are ignored until "
+                                           "enable, free, disable or reset",
+                                           enabled)
+                                  : std::string("hold failed: ") + arms_last_error();
+            return;
+        }
         if (name != "disable" && (!q.confirm || dev.cut)) {
             r.message = "confirmation required or protection latched";
             return;
@@ -191,8 +233,159 @@ class ArmsNode final : public rclcpp::Node
             r.message = r.success ? "OK" : failed;
             return;
         }
+        if (name == "disable" || st == ARMS_OK)
+            held &= ~m;
         r.success = st == ARMS_OK;
         r.message = r.success ? "OK" : std::string(arms_strerror(st)) + ": " + arms_last_error();
+    }
+    /* 一次性可读状态：总线、保护、每个关节的模式和反馈 */
+    void status(Trigger::Response &r)
+    {
+        static const char *protect_names[] = {"none", "overspeed", "overtorque"};
+        arms_bus_stats b{};
+        arms_get_stats(dev.driver, &b);
+        std::string t;
+        const char *protect = b.protect.reason <= ARMS_PROTECT_OVERTORQUE ? protect_names[b.protect.reason] : "?";
+        t += format("session %s, trip %s (joints 0x%08x), protect %s", dev.cut ? "LATCHED" : "ok",
+                    b.tripped ? "LATCHED" : "none", b.trip_joints, protect);
+        if (b.protect.reason != ARMS_PROTECT_NONE)
+            t += format(" joint %d value %.3f limit %.3f", b.protect.joint, b.protect.value, b.protect.limit);
+        t += format("\nignored 0x%08x  missing 0x%08x  held 0x%08x  rejected_commands %u\n",
+                    arms_ignored_joints(dev.driver), arms_missing_joints(dev.driver), held, rejected);
+        for (int i = 0; i < ARMS_ARM_COUNT; i++) {
+            const auto &a = b.arm[i];
+            if (!a.present)
+                continue;
+            t += format("%-5s %s link %s  OP %d/%d  WKC %u/%u  comm %s  drops %u\n", arms_arm_name(i), a.interface,
+                        a.link_up ? "up" : "DOWN", a.slaves_op, a.slaves_expected, a.wkc_last, a.wkc_expected,
+                        a.comm_failed ? "FAILED" : "ok", a.comm_drops);
+        }
+        t += "joint name                 mode         pos(rad)  vel(rad/s) torque(Nm)  SW     ERR    cmd_pos  kp      "
+             "kd     flags\n";
+        arms_joint_state s[ARMS_JOINT_COUNT];
+        size_t n = 0;
+        arms_read(dev.driver, s, ARMS_JOINT_COUNT, &n);
+        for (size_t i = 0; i < n; i++) {
+            std::string flags;
+            if (held & ARMS_MASK_JOINT(s[i].joint)) flags += 'H';
+            if (s[i].cmd_limited) flags += 'L';
+            if (s[i].cmd_timeout) flags += 'T';
+            if (flags.empty()) flags = "-";
+            t += format("%-5d %-20s %-10s %9.4f %10.4f %10.4f  0x%04x 0x%04x %8.4f %7.2f %6.2f %s\n", s[i].joint,
+                        s[i].name ? s[i].name : "-", arms_joint_mode_name(s[i].mode), s[i].position, s[i].velocity,
+                        s[i].torque, s[i].status_word, s[i].error_code, s[i].cmd_position, s[i].cmd_kp, s[i].cmd_kd,
+                        flags.c_str());
+        }
+        t += "flags: H=hold (topic targets ignored), L=limited, T=command timeout";
+        r.success = healthy();
+        r.message = t;
+    }
+    /* 等待两条臂通信恢复：链路正常、从站全部 OP、WKC 正确 */
+    bool wait_online(unsigned timeout_ms)
+    {
+        for (unsigned waited = 0; waited <= timeout_ms; waited += 100) {
+            arms_bus_stats b{};
+            arms_get_stats(dev.driver, &b);
+            bool online = true;
+            for (int i = 0; i < ARMS_ARM_COUNT; i++) {
+                const auto &a = b.arm[i];
+                if (a.present && (a.comm_failed || a.slaves_op != a.slaves_expected || a.wkc_last != a.wkc_expected))
+                    online = false;
+            }
+            if (online)
+                return true;
+            std::this_thread::sleep_for(100ms);
+        }
+        return false;
+    }
+    /*
+     * 解除掉线保护锁定。节点管理电源时先重新上电；等待通信恢复后要求全部已打开关节在线，
+     * 通过则清除锁定，关节保持失能。检查失败时，本次上的电会再次切断。
+     */
+    void clear_trip(Trigger::Response &r)
+    {
+        arms_bus_stats b{};
+        arms_get_stats(dev.driver, &b);
+        if (!b.tripped && !dev.cut) {
+            r.success = true;
+            r.message = "no protection trip latched";
+            return;
+        }
+        bool powered_here = false;
+        if (manage_power && !dev.owns_power) {
+            if (arms_power_on(0)) {
+                r.message = "power-on request failed";
+                return;
+            }
+            dev.owns_power = true;
+            powered_here = true;
+        }
+        std::string why;
+        if (!wait_online(15000)) {
+            arms_mask off = 0;
+            why = arms_check_online(dev.driver, &off) != ARMS_OK ? arms_last_error()
+                                                                 : "communication did not recover within 15 s";
+        } else if (arms_check_online(dev.driver, nullptr) != ARMS_OK || arms_clear_trip(dev.driver) != ARMS_OK) {
+            why = arms_last_error();
+        }
+        if (!why.empty()) {
+            if (powered_here && dev.owns_power.exchange(false) && arms_power_off())
+                why += "; power-off request FAILED, switch motor power off manually";
+            else if (powered_here)
+                why += "; motor power switched off again";
+            r.message = "trip not cleared: " + why;
+            return;
+        }
+        held = 0;
+        dev.cut = false;
+        r.success = true;
+        r.message = "trip cleared; all opened joints online and disabled. Reset drive faults if any, then enable.";
+        RCLCPP_INFO(get_logger(), "protection trip cleared");
+    }
+    /* 只读：按 Pn 编号或对象字典地址读取单个关节的参数（SDO 上传），不修改驱动器 */
+    void read_param(const ReadParam::Request &q, ReadParam::Response &r)
+    {
+        const int j = q.joint;
+        if (j < ARMS_JOINT_FIRST || j > ARMS_JOINT_LAST || !(arms_opened_joints(dev.driver) & ARMS_MASK_JOINT(j))) {
+            r.message = "joint must be an opened joint 15..28";
+            return;
+        }
+        uint16_t index = q.index;
+        uint8_t sub = q.subindex;
+        const arms_pn_info *info = nullptr;
+        if (q.pn >= 0) {
+            const int idx = q.pn <= 999 ? arms_pn_index(static_cast<unsigned>(q.pn)) : -1;
+            if (idx < 0) {
+                r.message = "pn must be a decimal Pn number 0..999, or -1 to use index/subindex";
+                return;
+            }
+            index = static_cast<uint16_t>(idx);
+            sub = 0;
+            info = arms_pn_lookup(static_cast<unsigned>(q.pn));
+        }
+        uint8_t data[64];
+        size_t n = 0;
+        if (arms_sdo_read(dev.driver, j, index, sub, data, sizeof(data), &n) != ARMS_OK) {
+            r.message = arms_last_error();
+            return;
+        }
+        r.raw.assign(data, data + n);
+        int64_t value = 0;
+        for (size_t i = 0; i < n && i < 8; i++)
+            value |= static_cast<int64_t>(data[i]) << (8 * i);
+        if (q.pn >= 0 && n == 2)
+            value = static_cast<int16_t>(data[0] | (data[1] << 8)); /* Pn 为 INT16 */
+        std::string bytes;
+        for (size_t i = 0; i < n; i++)
+            bytes += format(" %02x", data[i]);
+        r.value = value;
+        r.success = true;
+        if (q.pn >= 0)
+            r.message = format("joint %d Pn%03d (0x%04x:%02x%s%s) = %lld, raw%s", j, q.pn, index, sub,
+                               info ? ", " : "", info ? info->name : "", static_cast<long long>(value), bytes.c_str());
+        else
+            r.message = format("joint %d 0x%04x:%02x = %lld, raw%s", j, index, sub, static_cast<long long>(value),
+                               bytes.c_str());
     }
     void feedback()
     {
@@ -266,6 +459,7 @@ class ArmsNode final : public rclcpp::Node
             add("protect_joint", b.protect.joint);
             add("protect_value", b.protect.value);
             add("rejected_commands", rejected);
+            add("held_joints", held);
             msg.status.push_back(d);
         }
         diag_pub->publish(msg);
@@ -290,6 +484,7 @@ class ArmsNode final : public rclcpp::Node
             max_age_ms < 1 || max_age_ms > 1000)
             throw std::invalid_argument("invalid startup parameters");
         opt.check_motors = (int)check;
+        manage_power = power && !mock;
         if (mock)
             opt.backend = ARMS_BACKEND_MOCK;
         else {
@@ -339,11 +534,21 @@ class ArmsNode final : public rclcpp::Node
         cmd_sub = create_subscription<Cmd>("hardware/actuators_cmds", qos,
                                            [this](Cmd::ConstSharedPtr msg) { receive(*msg); });
         for (std::string name :
-             {"enable", "disable", "reset", "selftest", "free", "brake_normal", "brake_release", "brake_hold", "zero"}) {
+             {"enable", "disable", "reset", "selftest", "free", "hold", "brake_normal", "brake_release", "brake_hold",
+              "zero"}) {
             services.push_back(create_service<Op>(
                 "arms/" + name, [this, name](const std::shared_ptr<Op::Request> q,
                                              std::shared_ptr<Op::Response> r) { operation(name, *q, *r); }));
         }
+        services.push_back(create_service<Trigger>(
+            "arms/status",
+            [this](const std::shared_ptr<Trigger::Request>, std::shared_ptr<Trigger::Response> r) { status(*r); }));
+        services.push_back(create_service<Trigger>(
+            "arms/clear_trip",
+            [this](const std::shared_ptr<Trigger::Request>, std::shared_ptr<Trigger::Response> r) { clear_trip(*r); }));
+        services.push_back(create_service<ReadParam>(
+            "arms/read_param", [this](const std::shared_ptr<ReadParam::Request> q,
+                                      std::shared_ptr<ReadParam::Response> r) { read_param(*q, *r); }));
         tick = create_wall_timer(10ms, [this] { feedback(); });
         report = create_wall_timer(500ms, [this] { diagnostics(); });
         dev.watchdog = std::thread([this] {
