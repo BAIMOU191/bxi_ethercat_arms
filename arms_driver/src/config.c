@@ -144,6 +144,7 @@ static void set_defaults(arms_config *c)
     c->drive_monitor = true;
     c->temp_warn_c = 75;
     c->temp_max_c = 90;
+    c->esc_summary_s = 60;
     c->vendor_id = KGU_VENDOR_ID;
     c->product_code = KGU_PRODUCT_CODE;
 }
@@ -448,6 +449,13 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
                 goto out;
             }
             c->temp_max_c = v;
+        }
+        if (cJSON_GetObjectItemCaseSensitive(safety, "esc_summary_s")) {
+            if (!get_int(safety, "esc_summary_s", 1, 3600, &v)) {
+                fail(error, size, "safety.esc_summary_s 必须是 1..3600");
+                goto out;
+            }
+            c->esc_summary_s = (unsigned int)v;
         }
         if (c->temp_warn_c > c->temp_max_c) {
             fail(error, size, "safety.temp_warn_c 不能大于 safety.temp_max_c");

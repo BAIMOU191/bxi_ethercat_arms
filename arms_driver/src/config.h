@@ -50,6 +50,7 @@ typedef struct {
     bool drive_monitor;         /* 轮询执行器温度、驱动器丢帧次数和从站错误计数 */
     int temp_warn_c;            /* 执行器温度告警阈值 [℃] */
     int temp_max_c;             /* 执行器温度保护阈值 [℃]，达到即全部失能并锁定 */
+    unsigned int esc_summary_s; /* 处理类 ESC 错误（从站拒绝的帧）汇总记录的时间窗口 [s] */
     uint32_t vendor_id;
     uint32_t product_code;
     arms_arm_config arm[ARMS_ARM_COUNT];

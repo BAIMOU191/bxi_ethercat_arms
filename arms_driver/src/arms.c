@@ -150,6 +150,10 @@ typedef struct {
     double temp[BUS_MAX_SLAVES];
     int32_t drive_loss[BUS_MAX_SLAVES];
     bool temp_warned[BUS_MAX_SLAVES];
+    /* 处理类错误（只有处理单元/转发错误）按时间窗口汇总：被拒绝的帧数、首个拒绝位置、窗口开始时刻 */
+    uint32_t proc_frames;
+    int proc_origin;
+    uint64_t proc_since;
 } arm_rt;
 
 /* ---- 通信事件记录：周期上下文写入，管理线程读出后写日志文件 ---- */
@@ -163,6 +167,7 @@ enum {
     EVT_DRIVE_LOSS, /* 驱动器自报的 EtherCAT 丢帧次数增加 */
     EVT_TEMP_WARN,  /* 温度达到告警阈值 */
     EVT_OVERTEMP,   /* 温度达到保护阈值，已锁定保护 */
+    EVT_ESC_PROC,   /* 处理类错误汇总：从站拒绝的帧，线路类计数未变 */
     EVT_KINDS
 };
 
@@ -596,7 +601,20 @@ static const char *const esc_names[ESC_ERR_BYTES] = {
     "端口0链路丢失", "端口1链路丢失", "端口2链路丢失", "端口3链路丢失",
 };
 
-/* 轮流读取（或按请求清零）每个从站的 ESC 错误计数；计数增加时记录事件 */
+/*
+ * 线路类计数：各端口无效帧、物理层错误、链路丢失，反映网线、接头或从站网口的问题。
+ * 其余（转发错误、处理单元错误、PDI 错误）为处理类：帧在电气上完好，但被从站判为无效，
+ * 只出现处理类计数时，通常是主机发往 EtherCAT 网口的非 EtherCAT 报文。
+ */
+static bool esc_line_counter(unsigned int b) { return b < 8 || (b >= 16 && b < 20); }
+#define ESC_PU_ERR 12u   /* 处理单元错误 */
+#define ESC_FWD_PORT0 8u /* 端口 0 转发错误 */
+
+/*
+ * 轮流读取（或按请求清零）每个从站的 ESC 错误计数。线路类计数增加时逐条记录；
+ * 只有处理类计数增加时累计被拒绝的帧数，由 diag_tick() 按窗口汇总。
+ * 某从站新拒绝的帧数 = 处理单元错误增量 − 端口 0 转发错误增量（后者是上游已标记的帧）。
+ */
 static void esc_step(arms_t *a, int i, uint64_t now)
 {
     arm_rt *r = &a->arm[i];
@@ -618,10 +636,24 @@ static void esc_step(arms_t *a, int i, uint64_t now)
             memset(r->esc[k], 0, ESC_ERR_BYTES);
             r->esc_clear[k] = false;
         } else {
-            bool grew = false;
-            for (unsigned int b = 0; b < ESC_ERR_BYTES; ++b)
-                if (esc_names[b] && r->esc_valid[k] && v[b] > r->esc[k][b]) grew = true;
-            if (grew) {
+            bool line = false, proc = false;
+            for (unsigned int b = 0; b < ESC_ERR_BYTES; ++b) {
+                if (!esc_names[b] || !r->esc_valid[k] || v[b] <= r->esc[k][b]) continue;
+                if (esc_line_counter(b)) line = true;
+                else proc = true;
+            }
+            if (proc && !line) {
+                int pu = v[ESC_PU_ERR] > r->esc[k][ESC_PU_ERR] ? v[ESC_PU_ERR] - r->esc[k][ESC_PU_ERR] : 0;
+                int fwd = v[ESC_FWD_PORT0] > r->esc[k][ESC_FWD_PORT0] ? v[ESC_FWD_PORT0] - r->esc[k][ESC_FWD_PORT0] : 0;
+                if (pu > fwd) {
+                    if (!r->proc_frames) {
+                        r->proc_since = now;
+                        r->proc_origin = k;
+                    }
+                    r->proc_frames += (uint32_t)(pu - fwd);
+                }
+            }
+            if (line) {
                 event_detail d;
                 memset(&d, 0, sizeof(d));
                 d.joint = r->slot_joint[k];
@@ -756,6 +788,16 @@ static void diag_tick(arms_t *a, uint64_t now)
         if (r->comm_failed || !r->wkc_ok) continue;
         esc_step(a, i, now);
         monitor_step(a, i, now);
+        if (r->proc_frames && now - r->proc_since >= (uint64_t)a->cfg.esc_summary_s * 1000000000ull) {
+            event_detail d;
+            memset(&d, 0, sizeof(d));
+            d.joint = r->slot_joint[r->proc_origin];
+            d.slave = r->slot_slave[r->proc_origin];
+            d.value = r->proc_frames;
+            d.limit = (double)(now - r->proc_since) / 1e9;
+            record_event(a, EVT_ESC_PROC, i, now, &d);
+            r->proc_frames = 0;
+        }
         for (int k = 0; k < r->count; ++k) {
             arms_joint_state *s = &a->js[r->slot_joint[k]];
             s->temperature = r->temp[k];
@@ -1702,7 +1744,8 @@ static const char *event_name(int kind)
     case EVT_RECOVER: return "通信恢复";
     case EVT_LATE: return "周期延迟";
     case EVT_TRIP: return "离线保护触发";
-    case EVT_ESC: return "ESC 错误计数增加";
+    case EVT_ESC: return "线路错误计数增加";
+    case EVT_ESC_PROC: return "从站拒绝的帧（汇总）";
     case EVT_DRIVE_LOSS: return "驱动器丢帧";
     case EVT_TEMP_WARN: return "温度告警";
     case EVT_OVERTEMP: return "过温保护";
@@ -1747,7 +1790,16 @@ static void write_detail(FILE *fp, const event_record *e)
         for (unsigned int b = 0; b < ESC_ERR_BYTES; ++b)
             if (esc_names[b] && d->after[b] != d->before[b])
                 fprintf(fp, " %s %u→%u", esc_names[b], d->before[b], d->after[b]);
-        fprintf(fp, "\n  端口 0 接主站一侧，端口 1 接下一个从站；计数最先增加的位置通常最靠近故障点\n");
+        fprintf(fp, "\n  线路类计数（无效帧、物理层错误、链路丢失）增加，指向网线、接头或从站网口。\n"
+                    "  端口 0 接主站一侧，端口 1 接下一个从站；计数最先增加的位置通常最靠近故障点\n");
+        break;
+    case EVT_ESC_PROC:
+        fprintf(fp,
+                "  过去 %.0f 秒内有 %.0f 个帧被从站处理单元拒绝，最先拒绝的是关节 %d（链上位置 %d）；线路类计数未变。\n"
+                "  帧在电气上完好，不是网线问题。通常是主机发往 EtherCAT 网口的 DHCP、mDNS、IPv6 等普通报文，\n"
+                "  rt_setup.sh 在程序运行期间会阻止这类报文；用 rt_setup.sh status 查看网口是否仍有 IP 或由 "
+                "NetworkManager 管理。\n",
+                d->limit, d->value, d->joint, d->slave);
         break;
     case EVT_DRIVE_LOSS:
         fprintf(fp, "  关节 %d（链上位置 %d）驱动器自报 EtherCAT 丢帧次数 %.0f → %.0f\n", d->joint, d->slave, d->limit,
@@ -1799,7 +1851,7 @@ static FILE *open_event_log(arms_t *a)
 static void write_event(arms_t *a, FILE *fp, const event_record *e)
 {
     char when[48], since[48];
-    bool timing = e->kind != EVT_TEMP_WARN && e->kind != EVT_OVERTEMP;
+    bool timing = e->kind != EVT_TEMP_WARN && e->kind != EVT_OVERTEMP && e->kind != EVT_ESC_PROC;
     unsigned int shown = !timing ? 0
                          : (e->kind == EVT_FAIL || e->kind == EVT_TRIP) ? e->n
                                                                          : (e->n < 16 ? e->n : 16);

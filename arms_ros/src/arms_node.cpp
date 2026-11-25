@@ -430,7 +430,7 @@ class ArmsNode final : public rclcpp::Node
         size_t n = 0;
         arms_mask faults[ARMS_ARM_COUNT]{};
         double max_temp[ARMS_ARM_COUNT];
-        int64_t drive_loss[ARMS_ARM_COUNT]{}, esc_errors[ARMS_ARM_COUNT]{};
+        int64_t drive_loss[ARMS_ARM_COUNT]{}, esc_line[ARMS_ARM_COUNT]{}, esc_proc[ARMS_ARM_COUNT]{};
         for (auto &t : max_temp)
             t = std::numeric_limits<double>::quiet_NaN();
         arms_read(dev.driver, states, ARMS_JOINT_COUNT, &n);
@@ -441,9 +441,15 @@ class ArmsNode final : public rclcpp::Node
                 max_temp[s.arm] = s.temperature;
             if (s.drive_frame_loss > 0)
                 drive_loss[s.arm] += s.drive_frame_loss;
-            for (int e = 0; e < 20; ++e)
-                if (e != 14 && e != 15)
-                    esc_errors[s.arm] += s.esc_errors[e];
+            /* 线路类：无效帧、物理层错误、链路丢失；处理类：转发、处理单元、PDI 错误 */
+            for (int e = 0; e < 20; ++e) {
+                if (e == 14 || e == 15)
+                    continue;
+                if (e < 8 || e >= 16)
+                    esc_line[s.arm] += s.esc_errors[e];
+                else
+                    esc_proc[s.arm] += s.esc_errors[e];
+            }
         }
         for (int i = 0; i < ARMS_ARM_COUNT; i++) {
             auto &a = b.arm[i];
@@ -481,7 +487,8 @@ class ArmsNode final : public rclcpp::Node
             add("held_joints", held);
             add("max_temp_c", std::isnan(max_temp[i]) ? -1.0 : max_temp[i]);
             add("drive_frame_loss", drive_loss[i]);
-            add("esc_error_sum", esc_errors[i]);
+            add("esc_line_errors", esc_line[i]);
+            add("esc_processing_errors", esc_proc[i]);
             msg.status.push_back(d);
         }
         diag_pub->publish(msg);

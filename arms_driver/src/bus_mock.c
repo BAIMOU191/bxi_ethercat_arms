@@ -11,6 +11,8 @@
  *   ARMS_MOCK_PN075_UNREADABLE=1  模拟抱闸参数读取失败
  *   ARMS_MOCK_POWER_OFF=<s>,<n> 主站 0 从第 s 周期起掉电 n 个周期，恢复后从站报同步丢失故障
  *   ARMS_MOCK_ESC_ERR=<n>      第 n 周期起，主站 0 链上位置 3 的从站端口 1 错误计数每 200 周期加 1
+ *   ARMS_MOCK_ESC_PROC=<n>     第 n 周期起，主站 0 每 2000 周期有一个帧被位置 0 的从站拒绝：
+ *                              各从站处理单元错误加 1，下游端口 0、上游端口 1 转发错误加 1
  *   ARMS_MOCK_TEMP=<C>         全部从站执行器温度（默认 35 + 链上位置）
  *   ARMS_MOCK_DRIVE_LOSS=<n>   第 n 周期起，主站 0 各从站自报的 EtherCAT 丢帧次数每 500 周期加 1
  *   ARMS_MOCK_EMCY=<n>         第 n 周期，主站 0 链上位置 0 的从站发出一条紧急报文（错误码 0x7500）
@@ -47,7 +49,7 @@ struct bus {
     int master;
     /* 诊断模拟：ESC 错误计数、监控量和紧急报文 */
     uint8_t esc[BUS_MAX_SLAVES][ESC_ERR_BYTES];
-    uint64_t esc_err_cycle, esc_done[BUS_MAX_SLAVES], mon_done[BUS_MAX_SLAVES];
+    uint64_t esc_err_cycle, esc_proc_cycle, esc_done[BUS_MAX_SLAVES], mon_done[BUS_MAX_SLAVES];
     bool esc_reading[BUS_MAX_SLAVES], mon_reading[BUS_MAX_SLAVES];
     int temp_c;
     uint64_t loss_cycle, emcy_cycle;
@@ -95,6 +97,8 @@ static int mock_open(bus_t **out, const bus_open_params *p, char *err, size_t er
     b->overspeed_cycle = s ? strtoull(s, NULL, 10) : 0;
     s = getenv("ARMS_MOCK_ESC_ERR");
     b->esc_err_cycle = s ? strtoull(s, NULL, 10) : 0;
+    s = getenv("ARMS_MOCK_ESC_PROC");
+    b->esc_proc_cycle = s ? strtoull(s, NULL, 10) : 0;
     s = getenv("ARMS_MOCK_TEMP");
     b->temp_c = s ? atoi(s) : -1;
     s = getenv("ARMS_MOCK_DRIVE_LOSS");
@@ -203,6 +207,14 @@ static int mock_receive(bus_t *b)
                 if (b->positions[i] != 3) continue;
                 if (b->esc[i][2] < 0xFF) b->esc[i][2]++; /* 端口 1 无效帧 */
                 if (b->esc[i][3] < 0xFF) b->esc[i][3]++; /* 端口 1 物理层错误 */
+            }
+        }
+        if (b->esc_proc_cycle && b->cycles >= b->esc_proc_cycle && (b->cycles - b->esc_proc_cycle) % 2000u == 0) {
+            for (i = 0; i < b->configured; ++i) {
+                uint8_t *e = b->esc[i];
+                if (e[12] < 0xFF) e[12]++;                                       /* 处理单元错误 */
+                if (b->positions[i] > 0 && e[8] < 0xFF) e[8]++;                  /* 端口 0 转发错误 */
+                if (b->positions[i] < b->slaves - 1 && e[9] < 0xFF) e[9]++;      /* 端口 1 转发错误 */
             }
         }
         if (b->loss_cycle && b->cycles >= b->loss_cycle && (b->cycles - b->loss_cycle) % 500u == 0)

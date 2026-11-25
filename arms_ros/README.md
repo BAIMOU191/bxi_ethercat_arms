@@ -10,7 +10,7 @@ source install/local_setup.bash
 ros2 run arms_ros arms_node --ros-args -p mock:=true -p config:=$(realpath arms_driver/config/arms.json)
 ```
 
-参数：config、mock、check_motor（-1 取配置，0/1 覆盖）、motor_disable（-1 取配置）、command_max_age_ms（默认 100）、setup_rt、manage_power。后两者默认 false；不拥有电源时节点不能切断外部电源。节点启动完成后保持失能。伺服使能、解抱闸或写校准均不随话题自动触发。
+参数：config、mock、check_motor（-1 取配置，0/1 覆盖）、motor_disable（-1 取配置）、command_max_age_ms（默认 100）、setup_rt、manage_power。后两者默认 false；不拥有电源时节点不能切断外部电源。实机运行建议 setup_rt:=true：除实时环境外，还会在运行期间让 EtherCAT 网口退出 NetworkManager、去掉 IP 并关闭 IPv6，避免主机普通报文进入 EtherCAT 链。节点启动完成后保持失能。伺服使能、解抱闸或写校准均不随话题自动触发。
 
 | 接口 | 类型 / 约定 |
 |---|---|

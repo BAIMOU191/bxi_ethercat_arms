@@ -469,28 +469,35 @@ static int cmd_power(int argc, char **argv)
 }
 
 /* ---- commtest ---- */
+/* print_diag() 的返回位：出现线路类计数、只有处理类计数、驱动器丢帧增加 */
+enum { DIAG_LINE = 1, DIAG_PROC = 2, DIAG_LOSS = 4 };
+
 /*
- * 打印执行器温度、驱动器丢帧次数和 ESC 错误计数。only_nonzero 时只列出有错误计数、
- * 或驱动器丢帧次数相对 loss_base（按关节号索引，可为 NULL）增加的关节。返回列出的关节数。
+ * 打印执行器温度、驱动器丢帧次数和 ESC 错误计数，线路类（无效帧、物理层错误、链路丢失）与
+ * 处理类（转发错误、处理单元错误、PDI 错误）分列。only_nonzero 时只列出有计数、或驱动器丢帧次数
+ * 相对 loss_base（按关节号索引，可为 NULL）增加的关节。返回 DIAG_* 位的组合。
  */
 static int print_diag(arms_mask mask, bool only_nonzero, const int32_t *loss_base)
 {
-    int shown = 0;
+    int found = 0;
     bool header = false;
     for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_joint_state s;
         char where[16], temp[16], loss[16];
         const uint8_t *e;
-        bool nonzero = false;
+        int flags = 0;
         if (!(mask & ARMS_MASK_JOINT(j)) || arms_read_joint(g_arms, j, &s) != ARMS_OK) continue;
         e = s.esc_errors;
-        for (int b = 0; b < 20; ++b)
-            if (b != 14 && b != 15 && e[b]) nonzero = true;
-        if (s.drive_frame_loss > (loss_base && loss_base[j] >= 0 ? loss_base[j] : 0)) nonzero = true;
-        if (only_nonzero && !nonzero) continue;
+        for (int b = 0; b < 20; ++b) {
+            if (b == 14 || b == 15 || !e[b]) continue;
+            flags |= (b < 8 || b >= 16) ? DIAG_LINE : DIAG_PROC;
+        }
+        if (s.drive_frame_loss > (loss_base && loss_base[j] >= 0 ? loss_base[j] : 0)) flags |= DIAG_LOSS;
+        if (only_nonzero && !flags) continue;
+        found |= flags;
         if (!header) {
-            printf("%-3s %-20s %-7s %6s %9s  %-23s  %-23s  %8s %5s\n", "关节", "名称", "臂/位置", "温度℃", "驱动器丢帧",
-                   "端口0 无效/物理/转发/丢链", "端口1 无效/物理/转发/丢链", "处理单元", "PDI");
+            printf("%-3s %-20s %-7s %6s %9s  %-24s  %-24s  %s\n", "关节", "名称", "臂/位置", "温度℃", "驱动器丢帧",
+                   "线路类 端口0 无效/物理/丢链", "线路类 端口1 无效/物理/丢链", "处理类 转发0/转发1/处理单元/PDI");
             header = true;
         }
         snprintf(where, sizeof(where), "%s/%d", s.arm == 0 ? "L" : "R", s.slave);
@@ -501,13 +508,12 @@ static int print_diag(arms_mask mask, bool only_nonzero, const int32_t *loss_bas
         if (!s.esc_valid) {
             printf("%-3d %-20s %-7s %6s %9s  %s\n", j, s.name ? s.name : "-", where, temp, loss, "ESC 计数尚未读到");
         } else {
-            printf("%-3d %-20s %-7s %6s %9s  %4u %4u %4u %4u            %4u %4u %4u %4u            %8u %5u\n", j,
-                   s.name ? s.name : "-", where, temp, loss, e[0], e[1], e[8], e[16], e[2], e[3], e[9], e[17], e[12],
+            printf("%-3d %-20s %-7s %6s %9s  %4u %4u %4u               %4u %4u %4u               %4u %4u %4u %4u\n", j,
+                   s.name ? s.name : "-", where, temp, loss, e[0], e[1], e[16], e[2], e[3], e[17], e[8], e[9], e[12],
                    e[13]);
         }
-        shown++;
     }
-    return shown;
+    return found;
 }
 
 /* diag：执行器温度、驱动器丢帧次数和各从站 ESC 错误计数 */
@@ -529,7 +535,8 @@ static int cmd_diag(int argc, char **argv)
     }
     print_diag(m, false, NULL);
     printf("端口 0 接主站一侧，端口 1 接下一个从站。ESC 计数自预热完成（或 diag reset、通信恢复）起累计，到 255 停止。\n"
-           "某个从站端口 0 的计数增加，通常说明它和上一个从站之间的网线或接头有问题。\n");
+           "线路类计数增加指向网线、接头或从站网口：哪个从站端口 0 先出现计数，问题通常在它和上一个从站之间。\n"
+           "只有处理类计数时帧在电气上完好，只是被从站拒绝，通常是主机发往 EtherCAT 网口的普通网络报文。\n");
     return ok();
 }
 
@@ -600,9 +607,15 @@ static int cmd_commtest(int argc, char **argv)
         if (disable_joints(all, 20)) return -1;
     }
     print_stats(&st);
-    if (print_diag(all, true, loss_base) > 0) {
-        printf("以上关节在测试期间有 ESC 错误计数或驱动器自报丢帧（详见 diag 和通信事件日志）\n");
-        pass = false;
+    {
+        int found = print_diag(all, true, loss_base);
+        if (found & (DIAG_LINE | DIAG_LOSS)) {
+            printf("以上关节在测试期间有线路类错误计数或驱动器自报丢帧（详见 diag 和通信事件日志）\n");
+            pass = false;
+        } else if (found & DIAG_PROC) {
+            printf("提示: 只有处理类计数（从站拒绝的帧，线路类为 0），不是网线问题，不影响结果；"
+                   "通常是主机发往 EtherCAT 网口的普通网络报文，可用 rt_setup.sh status 检查网口\n");
+        }
     }
     for (i = 0; i < ARMS_ARM_COUNT; ++i)
         if (st.arm[i].present && (st.arm[i].wkc_bad || st.arm[i].send_errors || st.arm[i].comm_failed)) pass = false;
@@ -1128,10 +1141,13 @@ static const command commands[] = {
      "  status\n  status left\n  status 21", cmd_status},
     {"diag", "查看", "[关节] [reset]", 0, 2, "显示执行器温度、驱动器丢帧次数和各从站 ESC 错误计数",
      "  驱动器丢帧: 驱动器自报的 EtherCAT 丢帧次数（Pn002=63），上电清零，不能由程序清零。\n"
-     "  ESC 错误计数: 从站通信芯片寄存器 0x0300..0x0313，按端口列出无效帧、物理层错误、转发错误、链路丢失，\n"
-     "    以及处理单元错误和 PDI 错误。自预热完成、diag reset 或通信恢复起累计，到 255 停止。\n"
-     "  端口 0 接主站一侧，端口 1 接下一个从站；哪个从站的端口 0 先出现计数，故障点通常在它与上一个从站之间。\n"
-     "  reset: 清零全部从站的 ESC 错误计数。计数增加、温度告警和过温保护都会写入通信事件日志。\n"
+     "  ESC 错误计数: 从站通信芯片寄存器 0x0300..0x0313，自预热完成、diag reset 或通信恢复起累计，到 255 停止。\n"
+     "    线路类: 各端口无效帧、物理层错误、链路丢失，指向网线、接头或从站网口；\n"
+     "      哪个从站的端口 0 先出现计数，故障点通常在它与上一个从站之间（端口 0 接主站一侧，端口 1 接下一个从站）。\n"
+     "    处理类: 转发错误、处理单元错误、PDI 错误。只有处理类时帧在电气上完好，只是被从站拒绝，\n"
+     "      通常是主机发往 EtherCAT 网口的普通网络报文（rt_setup.sh 运行期间会阻止）。\n"
+     "  reset: 清零全部从站的 ESC 错误计数。线路类计数增加逐条写入通信事件日志；处理类按 safety.esc_summary_s\n"
+     "    （默认 60 秒）汇总一条；温度告警和过温保护也写入日志。\n"
      "  过温保护: 温度达到 safety.temp_max_c 时全部关节失能并锁定，降温后 reset；safety.temp_warn_c 只告警。",
      "  diag\n  diag left\n  diag reset", cmd_diag},
     {"watch", "查看", "[关节] [刷新Hz]", 0, 2, "原地刷新显示关节状态、位置、速度、力矩，回车结束",
@@ -1218,7 +1234,8 @@ static const command commands[] = {
      "  默认要求全部关节失能；--enabled 使能全部已打开关节并保持原位，结束或中止后全部失能。\n  清零统计后每 "
      "10 秒打印一次进度。\n"
      "  开始时清零 ESC 错误计数，结束时列出错误计数非零或驱动器丢帧增加的关节。\n"
-     "  通过条件: WKC 异常 0 次、发送错误 0 次、无超时周期、无跳过周期、无 ESC 错误计数、驱动器丢帧不增加",
+     "  通过条件: WKC 异常 0 次、发送错误 0 次、无超时周期、无跳过周期、无线路类 ESC 错误计数、驱动器丢帧不增加；\n"
+     "  只有处理类计数（从站拒绝的帧）时给出提示，不判为不通过",
      "  commtest 300\n  commtest 2 --enabled", cmd_commtest},
     {"version", "通用", "", 0, 0, "显示版本", "", "  version", cmd_version},
     {"quit", "通用", "", 0, 0, "退出：停止通信并释放主站", "  也可以用 exit 或 q", "  quit", cmd_quit},
@@ -1421,7 +1438,8 @@ static void usage(FILE *out)
         "      --no-power       不操作电机电源（电源已由其他程序打开时使用）\n"
         "      --keep-power     退出时不断电\n"
         "      --power-wait MS  上电后等待总线稳定的最长时间（默认 15000）；从站数达到配置并稳定后立即继续\n"
-        "      --no-rt-setup    不配置实时运行环境（中断绑定、CPU 隔离）\n"
+        "      --no-rt-setup    不配置实时运行环境（中断绑定、CPU 隔离，以及 EtherCAT 网口退出 NetworkManager、\n"
+        "                       去掉 IP 地址、关闭 IPv6；退出时还原）\n"
         "  -m, --mask MASK      屏蔽掩码（31 位，第 n 位对应关节 n）。被屏蔽的关节不打开、不做在线检查，\n"
         "                       掉线不触发下电保护；例如 0x10200000 屏蔽 21 和 28（默认取配置 "
         "safety.ignore_mask）\n"

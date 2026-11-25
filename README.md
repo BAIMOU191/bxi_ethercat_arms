@@ -156,3 +156,10 @@ cd arms_driver
 - **CoE 紧急报文**：每个从站保留 8 条，写事件日志时取出。
 
 `diag [关节] [reset]` 查看上述数据；`commtest` 开始时清零 ESC 计数，结束时列出计数非零或驱动器丢帧增加的关节，并判为不通过。ROS 诊断增加 `max_temp_c`、`drive_frame_loss`、`esc_error_sum`。这些事件都写入通信事件日志。
+
+### ESC 错误计数分类与 EtherCAT 网口隔离
+
+- **线路类**（各端口无效帧、物理层错误、链路丢失）：指向网线、接头或从站网口，每次增加都写一条“线路错误计数增加”事件，`commtest` 判为不通过。
+- **处理类**（转发错误、处理单元错误、PDI 错误）：帧在电气上完好，只是被从站拒绝。只有这一类时不逐条记录，按 `safety.esc_summary_s`（默认 60 秒）汇总一条“从站拒绝的帧（汇总）”，给出被拒帧数和最先拒绝的从站；`commtest` 只提示，不判为不通过。
+
+EtherLab 通用驱动下网口对 Linux 仍然可见，NetworkManager 的 DHCP、avahi 的 mDNS、IPv6 报文会被发到 EtherCAT 链上并被第一个从站拒绝，表现为全部从站处理类计数同步增加。`rt_setup.sh apply`（`arms_test` 默认执行，ROS 节点需 `setup_rt:=true`）因此会让配置中的 EtherCAT 网口退出 NetworkManager 管理、去掉 IPv4 地址并关闭 IPv6，链路保持 UP；`revert`（程序退出时执行）交还 NetworkManager 或恢复原有地址和 IPv6 设置。其他网卡（如 wlan0）不受影响。`rt_setup.sh status` 显示各网口当前状态。程序被强制结束未能还原时，重启 NetworkManager 或板子即恢复。
