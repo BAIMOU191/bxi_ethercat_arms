@@ -107,6 +107,8 @@ if(BUILD_TESTING)
     $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
   add_test(NAME maintenance_cli COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_maintenance.py
     $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
+  add_test(NAME drive_monitor COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_diag.py
+    $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
   add_test(NAME comm_event_log COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_events.py
     $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
   add_test(NAME mock_session COMMAND arms_test --mock -c ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json

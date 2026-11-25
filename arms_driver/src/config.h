@@ -47,6 +47,9 @@ typedef struct {
     unsigned int overspeed_ms;  /* 速度持续超过 vel_fault 的累计时长阈值 */
     unsigned int overtorque_ms; /* 力矩持续超过 torque_fault 的累计时长阈值 */
     unsigned int op_timeout_ms;
+    bool drive_monitor;         /* 轮询执行器温度、驱动器丢帧次数和从站错误计数 */
+    int temp_warn_c;            /* 执行器温度告警阈值 [℃] */
+    int temp_max_c;             /* 执行器温度保护阈值 [℃]，达到即全部失能并锁定 */
     uint32_t vendor_id;
     uint32_t product_code;
     arms_arm_config arm[ARMS_ARM_COUNT];

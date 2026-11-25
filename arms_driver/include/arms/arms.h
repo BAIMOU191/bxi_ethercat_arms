@@ -137,6 +137,17 @@ typedef struct {
     bool cmd_limited;       /**< 本周期指令被限幅 */
     bool cmd_timeout;       /**< 指令超时，已按 safety.timeout_action 处理 */
     uint32_t fault_count;   /**< 打开以来进入故障的次数 */
+
+    /* 驱动器监控（safety.drive_monitor），由周期上下文用异步请求轮流读取，每个关节约每秒更新一次 */
+    double temperature;     /**< 执行器温度 [℃]（Pn002=77 的监控量），NaN 表示尚未读到 */
+    int32_t drive_frame_loss; /**< 驱动器自报的 EtherCAT 丢帧次数（Pn002=63，上电清零），-1 表示尚未读到 */
+    bool esc_valid;         /**< esc_errors 已读到 */
+    /**
+     * ESC 错误计数寄存器 0x0300..0x0313 的最近读数，自上次清零起累计，达到 255 后不再增加：
+     * [0]/[2] 端口 0/1 无效帧，[1]/[3] 端口 0/1 物理层错误，[8]/[9] 端口 0/1 转发错误，
+     * [12] 处理单元错误，[13] PDI 错误，[16]/[17] 端口 0/1 链路丢失（端口 0 接主站一侧，端口 1 接下一个从站）
+     */
+    uint8_t esc_errors[20];
 } arms_joint_state;
 
 /** 周期间隔统计 [us] */
@@ -171,16 +182,17 @@ typedef enum {
     ARMS_PROTECT_NONE = 0,
     ARMS_PROTECT_OVERSPEED,  /**< 反馈速度超过 limit.vel_fault 累计 safety.overspeed_ms */
     ARMS_PROTECT_OVERTORQUE, /**< 反馈力矩超过 limit.torque_fault 累计 safety.overtorque_ms */
+    ARMS_PROTECT_OVERTEMP,   /**< 执行器温度达到 safety.temp_max_c */
 } arms_protect_reason;
 
 /**
- * 超速/超力矩保护：任一使能关节触发后，全部关节失能并锁定，
- * 拒绝使能，直到 arms_reset() 清除。
+ * 超速/超力矩/过温保护：任一关节触发后，全部关节失能并锁定，
+ * 拒绝使能，直到 arms_reset() 清除（过温时若温度仍不低于阈值会再次触发）。
  */
 typedef struct {
     arms_protect_reason reason;
     int joint;        /**< 触发关节，无则 -1 */
-    double value;     /**< 触发时的反馈速度 [rad/s] 或力矩 [N.m] */
+    double value;     /**< 触发时的反馈速度 [rad/s]、力矩 [N.m] 或温度 [℃] */
     double limit;     /**< 对应阈值 */
 } arms_protect;
 
@@ -258,12 +270,17 @@ void arms_reset_stats(arms_t *arms);
  *
  * 在非实时线程中周期调用（例如每 100 ms），退出前再调用一次。记录的事件：
  * WKC 异常（每臂每秒最多一条，其余计入下一条的“限速期间另有”）、通信失败、通信恢复、
- * 周期延迟（两次周期开始间隔超过 1.5 个周期，每秒最多一条）、离线保护触发。
- * 每条事件附带此前最近 64 个周期的时序（周期间隔、唤醒延迟、发送结束到接收的间隔、
- * 处理耗时、两臂 WKC），以及两臂链路、WKC 计数和各从站 AL 状态。
+ * 周期延迟（两次周期开始间隔超过 1.5 个周期，每秒最多一条）、离线保护触发、
+ * ESC 错误计数增加和驱动器自报丢帧增加（每臂每秒最多一条）、温度告警、过温保护，
+ * 以及驱动器发出的 CoE 紧急报文（本函数调用时取出）。
+ * 通信类事件附带此前最近 64 个周期的时序（周期间隔、唤醒延迟、发送结束到接收的间隔、
+ * 处理耗时、两臂 WKC），以及两臂链路、WKC 计数、各从站 AL 状态、错误计数、温度和驱动器丢帧次数。
  * @return 本次写入的事件数；无法写入时返回 -1，arms_last_error() 说明原因
  */
 int arms_log_events(arms_t *arms);
+
+/** @brief 请求清零全部从站的 ESC 错误计数，由周期上下文在下一轮轮询时写入 */
+void arms_clear_esc_counters(arms_t *arms);
 
 /** @brief 通信事件日志文件路径（无法写入原路径时会改用 /tmp/arms_comm_events.log） */
 const char *arms_event_log_path(const arms_t *arms);

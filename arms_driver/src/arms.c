@@ -139,12 +139,39 @@ typedef struct {
     uint32_t drops, recoveries;
     bool auto_reset;                  /* 恢复后对故障关节执行一次复位 */
     double recv_us_max, send_us_max;
+    /* 驱动器监控轮询（周期上下文）：ESC 错误计数与监控量各自轮流处理一个从站 */
+    int esc_slot, esc_phase;          /* esc_phase: 0 发起，1 等待结果 */
+    bool esc_clearing;
+    bool esc_clear[BUS_MAX_SLAVES];
+    bool esc_valid[BUS_MAX_SLAVES];
+    uint8_t esc[BUS_MAX_SLAVES][ESC_ERR_BYTES];
+    int mon_slot, mon_phase;          /* 见 monitor_step() */
+    unsigned int mon_wait;
+    double temp[BUS_MAX_SLAVES];
+    int32_t drive_loss[BUS_MAX_SLAVES];
+    bool temp_warned[BUS_MAX_SLAVES];
 } arm_rt;
 
 /* ---- 通信事件记录：周期上下文写入，管理线程读出后写日志文件 ---- */
 #define TRACE_LEN 64u   /* 每条事件附带的最近周期数 */
+#define EMERGENCY_MSG_BYTES 8 /* CoE 紧急报文长度 */
+#define EMERGENCY_BATCH 32    /* 每次写日志最多取出的紧急报文数 */
 #define EVENT_RING 16u  /* 尚未写出的事件最多保留条数 */
-enum { EVT_WKC = 0, EVT_FAIL, EVT_RECOVER, EVT_LATE, EVT_TRIP, EVT_KINDS };
+enum {
+    EVT_WKC = 0, EVT_FAIL, EVT_RECOVER, EVT_LATE, EVT_TRIP,
+    EVT_ESC,        /* ESC 错误计数增加 */
+    EVT_DRIVE_LOSS, /* 驱动器自报的 EtherCAT 丢帧次数增加 */
+    EVT_TEMP_WARN,  /* 温度达到告警阈值 */
+    EVT_OVERTEMP,   /* 温度达到保护阈值，已锁定保护 */
+    EVT_KINDS
+};
+
+/* 单个从站相关事件的细节 */
+typedef struct {
+    int joint, slave;               /* 关节号、链上位置；无则 -1 */
+    double value, limit;            /* 温度事件：温度与阈值；丢帧事件：新旧计数 */
+    uint8_t before[ESC_ERR_BYTES], after[ESC_ERR_BYTES];
+} event_detail;
 
 typedef struct {
     uint64_t cycle;
@@ -168,7 +195,14 @@ typedef struct {
         uint32_t wkc, wkc_expected, consecutive;
         uint64_t wkc_bad;
         uint8_t al[BUS_MAX_SLAVES];
+        int joint[BUS_MAX_SLAVES];
+        bool esc_valid[BUS_MAX_SLAVES];
+        uint8_t esc[BUS_MAX_SLAVES][ESC_ERR_BYTES];
+        double temp[BUS_MAX_SLAVES];
+        int32_t drive_loss[BUS_MAX_SLAVES];
     } arm[ARMS_ARM_COUNT];
+    bool has_detail;
+    event_detail detail;
     unsigned int n;             /* trace 中的有效条数 */
     trace_entry trace[TRACE_LEN]; /* 旧 → 新 */
 } event_record;
@@ -303,6 +337,10 @@ struct arms {
     uint64_t evt_read;                /* 已写到日志文件的事件数，仅管理线程访问 */
     bool evt_header_done;
     char event_log[PATH_MAX];
+
+    /* 驱动器监控轮询节拍（周期上下文）；清零请求由管理线程发出 */
+    unsigned int diag_div, diag_cnt;
+    atomic_bool esc_clear_all;
 };
 
 static void post(arms_t *a, arms_mask joints, unsigned int req);
@@ -468,18 +506,18 @@ static void check_limits(arms_t *a, int j, const arms_joint_state *s)
 
 /*
  * 记录一条通信事件（周期上下文）：复制最近的周期时序和两臂状态，按 seqlock 方式发布到事件环。
- * WKC 异常和周期延迟每臂每秒最多记录一条，其余计入下一条的 suppressed。
+ * WKC 异常、周期延迟、ESC 错误计数和驱动器丢帧每臂每秒最多记录一条，其余计入下一条的 suppressed。
  */
-static void record_event(arms_t *a, int kind, int arm, uint64_t now)
+static void record_event(arms_t *a, int kind, int arm, uint64_t now, const event_detail *d)
 {
     int ai = arm < 0 ? 0 : arm;
     uint64_t n = atomic_load_explicit(&a->evt_count, memory_order_relaxed);
     event_record *e = &a->evt_scratch.r;
     struct timespec rt;
     unsigned int k;
+    bool limited = kind == EVT_WKC || kind == EVT_LATE || kind == EVT_ESC || kind == EVT_DRIVE_LOSS;
 
-    if ((kind == EVT_WKC || kind == EVT_LATE) && a->evt_last_ns[kind][ai] &&
-        now - a->evt_last_ns[kind][ai] < 1000000000ull) {
+    if (limited && a->evt_last_ns[kind][ai] && now - a->evt_last_ns[kind][ai] < 1000000000ull) {
         a->evt_suppressed[kind][ai]++;
         return;
     }
@@ -507,6 +545,17 @@ static void record_event(arms_t *a, int kind, int arm, uint64_t now)
         e->arm[i].consecutive = r->consecutive;
         e->arm[i].wkc_bad = r->wkc_bad;
         memcpy(e->arm[i].al, r->al, sizeof(e->arm[i].al));
+        for (int s = 0; s < r->count; ++s) {
+            e->arm[i].joint[s] = r->slot_joint[s];
+            e->arm[i].esc_valid[s] = r->esc_valid[s];
+            memcpy(e->arm[i].esc[s], r->esc[s], ESC_ERR_BYTES);
+            e->arm[i].temp[s] = r->temp[s];
+            e->arm[i].drive_loss[s] = r->drive_loss[s];
+        }
+    }
+    if (d) {
+        e->has_detail = true;
+        e->detail = *d;
     }
     e->n = a->trace_count < TRACE_LEN ? (unsigned int)a->trace_count : TRACE_LEN;
     for (k = 0; k < e->n; ++k) e->trace[k] = a->trace[(a->trace_count - e->n + k) % TRACE_LEN];
@@ -534,6 +583,187 @@ static void resolve_event_log(arms_t *a, const char *path)
     base = base ? base + 1 : dir;
     snprintf(a->event_log, sizeof(a->event_log), strcmp(base, "config") == 0 ? "%s/../logs/comm_events.log"
                                                                               : "%s/logs/comm_events.log", dir);
+}
+
+/* ---- 驱动器监控：ESC 错误计数、温度、驱动器丢帧次数（周期上下文，异步请求，不阻塞） ---- */
+
+/* ESC 错误计数寄存器 0x0300 起各字节的含义；NULL 为错误码或保留字节，不参与比较 */
+static const char *const esc_names[ESC_ERR_BYTES] = {
+    "端口0无效帧", "端口0物理层错误", "端口1无效帧", "端口1物理层错误",
+    "端口2无效帧", "端口2物理层错误", "端口3无效帧", "端口3物理层错误",
+    "端口0转发错误", "端口1转发错误", "端口2转发错误", "端口3转发错误",
+    "处理单元错误", "PDI错误", NULL, NULL,
+    "端口0链路丢失", "端口1链路丢失", "端口2链路丢失", "端口3链路丢失",
+};
+
+/* 轮流读取（或按请求清零）每个从站的 ESC 错误计数；计数增加时记录事件 */
+static void esc_step(arms_t *a, int i, uint64_t now)
+{
+    arm_rt *r = &a->arm[i];
+    int k = r->esc_slot, s;
+    uint8_t v[ESC_ERR_BYTES];
+
+    if (r->esc_phase == 0) {
+        bool clear = r->esc_clear[k];
+        if ((clear ? r->ops->esc_counters_clear(r->bus, k) : r->ops->esc_counters_read(r->bus, k)) == 0) {
+            r->esc_clearing = clear;
+            r->esc_phase = 1;
+        }
+        return;
+    }
+    s = r->ops->esc_counters_state(r->bus, k, v);
+    if (s == BUS_REQ_BUSY) return;
+    if (s == BUS_REQ_DONE) {
+        if (r->esc_clearing) {
+            memset(r->esc[k], 0, ESC_ERR_BYTES);
+            r->esc_clear[k] = false;
+        } else {
+            bool grew = false;
+            for (unsigned int b = 0; b < ESC_ERR_BYTES; ++b)
+                if (esc_names[b] && r->esc_valid[k] && v[b] > r->esc[k][b]) grew = true;
+            if (grew) {
+                event_detail d;
+                memset(&d, 0, sizeof(d));
+                d.joint = r->slot_joint[k];
+                d.slave = r->slot_slave[k];
+                memcpy(d.before, r->esc[k], ESC_ERR_BYTES);
+                memcpy(d.after, v, ESC_ERR_BYTES);
+                memcpy(r->esc[k], v, ESC_ERR_BYTES);
+                record_event(a, EVT_ESC, i, now, &d);
+            } else {
+                memcpy(r->esc[k], v, ESC_ERR_BYTES);
+            }
+        }
+        r->esc_valid[k] = true;
+    }
+    r->esc_phase = 0;
+    r->esc_slot = (k + 1) % r->count;
+}
+
+static void temperature_sample(arms_t *a, int i, int k, double t, uint64_t now)
+{
+    arm_rt *r = &a->arm[i];
+    event_detail d;
+    if (t < -40.0 || t > 200.0) return; /* 不可信的读数不参与保护 */
+    r->temp[k] = t;
+    memset(&d, 0, sizeof(d));
+    d.joint = r->slot_joint[k];
+    d.slave = r->slot_slave[k];
+    d.value = t;
+    if (t >= a->cfg.temp_max_c) {
+        if (a->protect.reason == ARMS_PROTECT_NONE) {
+            a->protect.reason = ARMS_PROTECT_OVERTEMP;
+            a->protect.joint = d.joint;
+            a->protect.value = t;
+            a->protect.limit = a->cfg.temp_max_c;
+            d.limit = a->cfg.temp_max_c;
+            record_event(a, EVT_OVERTEMP, i, now, &d);
+        }
+    } else if (t >= a->cfg.temp_warn_c) {
+        if (!r->temp_warned[k]) {
+            r->temp_warned[k] = true;
+            d.limit = a->cfg.temp_warn_c;
+            record_event(a, EVT_TEMP_WARN, i, now, &d);
+        }
+    } else if (t < a->cfg.temp_warn_c - 5.0) {
+        r->temp_warned[k] = false;
+    }
+}
+
+static void loss_sample(arms_t *a, int i, int k, int32_t v, uint64_t now)
+{
+    arm_rt *r = &a->arm[i];
+    if (r->drive_loss[k] >= 0 && v > r->drive_loss[k]) {
+        event_detail d;
+        memset(&d, 0, sizeof(d));
+        d.joint = r->slot_joint[k];
+        d.slave = r->slot_slave[k];
+        d.limit = r->drive_loss[k];
+        d.value = v;
+        r->drive_loss[k] = v;
+        record_event(a, EVT_DRIVE_LOSS, i, now, &d);
+    } else {
+        r->drive_loss[k] = v;
+    }
+}
+
+/*
+ * 监控量轮询：选择温度 → 等 0x3000 刷新 → 读取 → 选择丢帧次数 → 等待 → 读取 → 下一个从站。
+ * 驱动器在选择后需要时间刷新 0x3000，等待避免把上一个监控量读成当前量。失败时跳到下一个从站。
+ */
+enum {
+    MON_SEL_TEMP, MON_WAIT_SEL_TEMP, MON_SETTLE_TEMP, MON_READ_TEMP, MON_WAIT_TEMP,
+    MON_SEL_LOSS, MON_WAIT_SEL_LOSS, MON_SETTLE_LOSS, MON_READ_LOSS, MON_WAIT_LOSS,
+};
+#define MON_SETTLE_TICKS 10u /* 选择监控量后等待的轮询节拍数（每节拍 10 ms） */
+
+static void monitor_next(arm_rt *r)
+{
+    r->mon_phase = MON_SEL_TEMP;
+    r->mon_wait = 0;
+    r->mon_slot = (r->mon_slot + 1) % r->count;
+}
+
+static void monitor_step(arms_t *a, int i, uint64_t now)
+{
+    arm_rt *r = &a->arm[i];
+    int k = r->mon_slot, s;
+    int32_t v = 0;
+    switch (r->mon_phase) {
+    case MON_SEL_TEMP:
+    case MON_SEL_LOSS:
+        if (r->ops->monitor_select(r->bus, k,
+                                   r->mon_phase == MON_SEL_TEMP ? KGU_MON_TEMPERATURE : KGU_MON_ECAT_LOSS) == 0)
+            r->mon_phase++;
+        return;
+    case MON_SETTLE_TEMP:
+    case MON_SETTLE_LOSS:
+        if (++r->mon_wait >= MON_SETTLE_TICKS) {
+            r->mon_wait = 0;
+            r->mon_phase++;
+        }
+        return;
+    case MON_READ_TEMP:
+    case MON_READ_LOSS:
+        if (r->ops->monitor_read(r->bus, k) == 0) r->mon_phase++;
+        return;
+    default: /* 等待选择或读取的结果 */
+        s = r->ops->monitor_state(r->bus, k, &v);
+        if (s == BUS_REQ_BUSY) return;
+        if (s != BUS_REQ_DONE) {
+            monitor_next(r);
+            return;
+        }
+        if (r->mon_phase == MON_WAIT_TEMP) temperature_sample(a, i, k, (double)v, now);
+        if (r->mon_phase == MON_WAIT_LOSS) {
+            loss_sample(a, i, k, v, now);
+            monitor_next(r);
+            return;
+        }
+        r->mon_phase++;
+    }
+}
+
+/* 每 10 ms 推进一步；通信异常的臂暂停，恢复后继续 */
+static void diag_tick(arms_t *a, uint64_t now)
+{
+    bool clear_all = atomic_exchange_explicit(&a->esc_clear_all, false, memory_order_acq_rel);
+    for (int i = 0; i < ARMS_ARM_COUNT; ++i) {
+        arm_rt *r = &a->arm[i];
+        if (!r->used || r->count <= 0) continue;
+        if (clear_all)
+            for (int k = 0; k < r->count; ++k) r->esc_clear[k] = true;
+        if (r->comm_failed || !r->wkc_ok) continue;
+        esc_step(a, i, now);
+        monitor_step(a, i, now);
+        for (int k = 0; k < r->count; ++k) {
+            arms_joint_state *s = &a->js[r->slot_joint[k]];
+            s->temperature = r->temp[k];
+            s->drive_frame_loss = r->drive_loss[k];
+            s->esc_valid = r->esc_valid[k];
+            memcpy(s->esc_errors, r->esc[k], ESC_ERR_BYTES);
+        }
+    }
 }
 
 /* ---- 周期处理，独立模式与外部驱动模式共用 ---- */
@@ -631,6 +861,11 @@ static void cycle_rx(arms_t *a, uint64_t now)
             r->recoveries++;
             r->auto_reset = true;
             ev_rec[i] = true;
+            /* 驱动器可能已重新上电：错误计数从零重新累计，丢帧次数重新建立基准 */
+            for (k = 0; k < r->count; ++k) {
+                r->esc_clear[k] = true;
+                r->drive_loss[k] = -1;
+            }
         }
     }
 
@@ -681,17 +916,24 @@ static void cycle_rx(arms_t *a, uint64_t now)
 
     if (ready) {
         for (i = 0; i < ARMS_ARM_COUNT; ++i) {
-            if (ev_fail[i]) record_event(a, EVT_FAIL, i, now);
-            else if (ev_wkc[i]) record_event(a, EVT_WKC, i, now);
-            if (ev_rec[i]) record_event(a, EVT_RECOVER, i, now);
+            if (ev_fail[i]) record_event(a, EVT_FAIL, i, now, NULL);
+            else if (ev_wkc[i]) record_event(a, EVT_WKC, i, now, NULL);
+            if (ev_rec[i]) record_event(a, EVT_RECOVER, i, now, NULL);
         }
-        if (late_cycle) record_event(a, EVT_LATE, -1, now);
-        if (trip_now) record_event(a, EVT_TRIP, -1, now);
+        if (late_cycle) record_event(a, EVT_LATE, -1, now, NULL);
+        if (trip_now) record_event(a, EVT_TRIP, -1, now, NULL);
+        if (a->cfg.drive_monitor && ++a->diag_cnt >= a->diag_div) {
+            a->diag_cnt = 0;
+            diag_tick(a, now);
+        }
     }
 
     if (!ready) {
         a->stable_cycles = all_good ? a->stable_cycles + 1 : 0;
         if (a->stable_cycles >= a->ready_cycles) {
+            /* 预热完成：ESC 错误计数从零开始累计，排除上电过程中产生的计数 */
+            for (i = 0; i < ARMS_ARM_COUNT; ++i)
+                for (k = 0; k < a->arm[i].count; ++k) a->arm[i].esc_clear[k] = true;
             do_reset_stats(a);
             atomic_store_explicit(&a->ready_ns, now, memory_order_relaxed);
             atomic_store_explicit(&a->ready, true, memory_order_release);
@@ -1100,6 +1342,12 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     if (a->overspeed_cycles == 0) a->overspeed_cycles = 1;
     if (a->overtorque_cycles == 0) a->overtorque_cycles = 1;
     a->protect.joint = -1;
+    a->diag_div = a->cycle_hz >= 100u ? a->cycle_hz / 100u : 1u; /* 驱动器监控每 10 ms 推进一步 */
+    for (int i = 0; i < ARMS_ARM_COUNT; ++i)
+        for (int k = 0; k < BUS_MAX_SLAVES; ++k) {
+            a->arm[i].temp[k] = NAN;
+            a->arm[i].drive_loss[k] = -1;
+        }
     atomic_store(&a->enable_timeout_cycles, DEFAULT_WAIT_MS * a->cycle_hz / 1000u);
     a->mode = options->mode != ARMS_MODE_CONFIG ? options->mode : a->cfg.mode;
     a->rt_cpu = options->rt_cpu >= -1 ? options->rt_cpu : a->cfg.rt_cpu;
@@ -1145,6 +1393,8 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         a->js[j].arm = -1;
         a->js[j].slave = -1;
         a->js[j].mode = ARMS_JS_ABSENT;
+        a->js[j].temperature = NAN;
+        a->js[j].drive_frame_loss = -1;
     }
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         const arms_joint_config *jc = &a->cfg.joint[j];
@@ -1452,7 +1702,64 @@ static const char *event_name(int kind)
     case EVT_RECOVER: return "通信恢复";
     case EVT_LATE: return "周期延迟";
     case EVT_TRIP: return "离线保护触发";
+    case EVT_ESC: return "ESC 错误计数增加";
+    case EVT_DRIVE_LOSS: return "驱动器丢帧";
+    case EVT_TEMP_WARN: return "温度告警";
+    case EVT_OVERTEMP: return "过温保护";
     default: return "?";
+    }
+}
+
+/* 输出各从站的温度、驱动器丢帧次数和非零的 ESC 错误计数 */
+static void write_slave_table(FILE *fp, const event_record *e)
+{
+    for (int i = 0; i < ARMS_ARM_COUNT; ++i) {
+        if (!e->arm[i].used) continue;
+        fprintf(fp, "  %-5s 温度℃/驱动器丢帧:", arms_arm_name(i));
+        for (int s = 0; s < e->arm[i].count; ++s) {
+            if (isnan(e->arm[i].temp[s])) fprintf(fp, "  -");
+            else fprintf(fp, "  %.0f", e->arm[i].temp[s]);
+            if (e->arm[i].drive_loss[s] < 0) fprintf(fp, "/-");
+            else fprintf(fp, "/%d", e->arm[i].drive_loss[s]);
+        }
+        fputc('\n', fp);
+        for (int s = 0; s < e->arm[i].count; ++s) {
+            bool any = false;
+            if (!e->arm[i].esc_valid[s]) continue;
+            for (unsigned int b = 0; b < ESC_ERR_BYTES; ++b) {
+                if (!esc_names[b] || !e->arm[i].esc[s][b]) continue;
+                if (!any) fprintf(fp, "    关节 %d（链上位置 %d）ESC 错误计数:", e->arm[i].joint[s], s);
+                fprintf(fp, " %s %u", esc_names[b], e->arm[i].esc[s][b]);
+                any = true;
+            }
+            if (any) fputc('\n', fp);
+        }
+    }
+}
+
+static void write_detail(FILE *fp, const event_record *e)
+{
+    const event_detail *d = &e->detail;
+    if (!e->has_detail) return;
+    switch (e->kind) {
+    case EVT_ESC:
+        fprintf(fp, "  关节 %d（链上位置 %d）计数变化:", d->joint, d->slave);
+        for (unsigned int b = 0; b < ESC_ERR_BYTES; ++b)
+            if (esc_names[b] && d->after[b] != d->before[b])
+                fprintf(fp, " %s %u→%u", esc_names[b], d->before[b], d->after[b]);
+        fprintf(fp, "\n  端口 0 接主站一侧，端口 1 接下一个从站；计数最先增加的位置通常最靠近故障点\n");
+        break;
+    case EVT_DRIVE_LOSS:
+        fprintf(fp, "  关节 %d（链上位置 %d）驱动器自报 EtherCAT 丢帧次数 %.0f → %.0f\n", d->joint, d->slave, d->limit,
+                d->value);
+        break;
+    case EVT_TEMP_WARN:
+    case EVT_OVERTEMP:
+        fprintf(fp, "  关节 %d（链上位置 %d）执行器温度 %.0f ℃，阈值 %.0f ℃%s\n", d->joint, d->slave, d->value, d->limit,
+                e->kind == EVT_OVERTEMP ? "；全部关节已失能并锁定，降温后 reset" : "");
+        break;
+    default:
+        break;
     }
 }
 
@@ -1492,7 +1799,10 @@ static FILE *open_event_log(arms_t *a)
 static void write_event(arms_t *a, FILE *fp, const event_record *e)
 {
     char when[48], since[48];
-    unsigned int shown = (e->kind == EVT_FAIL || e->kind == EVT_TRIP) ? e->n : (e->n < 16 ? e->n : 16);
+    bool timing = e->kind != EVT_TEMP_WARN && e->kind != EVT_OVERTEMP;
+    unsigned int shown = !timing ? 0
+                         : (e->kind == EVT_FAIL || e->kind == EVT_TRIP) ? e->n
+                                                                         : (e->n < 16 ? e->n : 16);
     format_real(e->real_ns, true, when, sizeof(when));
     format_real(e->real_ns - 2000000000LL, false, since, sizeof(since));
     fprintf(fp, "==== %s  %s", when, event_name(e->kind));
@@ -1509,25 +1819,66 @@ static void write_event(arms_t *a, FILE *fp, const event_record *e)
         for (int k = 0; k < e->arm[i].count; ++k) fprintf(fp, " %02x", e->arm[i].al[k]);
         fputc('\n', fp);
     }
-    fprintf(fp, "  最近 %u 个周期（旧 → 新；时刻相对本事件）:\n", shown);
-    fprintf(fp, "     相对ms        周期    间隔us  唤醒延迟us  发送→接收us   处理us  WKC左 WKC右\n");
-    for (unsigned int k = e->n - shown; k < e->n; ++k) {
-        const trace_entry *t = &e->trace[k];
-        fprintf(fp, "  %9.3f  %10llu  %8.1f  %10.1f  %11.1f  %7.1f  %5u %5u\n",
-                ((double)t->start_ns - (double)e->mono_ns) / 1e6, (unsigned long long)t->cycle, t->period_ns / 1e3,
-                t->late_ns / 1e3, t->gap_ns / 1e3, t->work_ns / 1e3, t->wkc[0], t->wkc[1]);
+    write_detail(fp, e);
+    write_slave_table(fp, e);
+    if (shown) {
+        fprintf(fp, "  最近 %u 个周期（旧 → 新；时刻相对本事件）:\n", shown);
+        fprintf(fp, "     相对ms        周期    间隔us  唤醒延迟us  发送→接收us   处理us  WKC左 WKC右\n");
+        for (unsigned int k = e->n - shown; k < e->n; ++k) {
+            const trace_entry *t = &e->trace[k];
+            fprintf(fp, "  %9.3f  %10llu  %8.1f  %10.1f  %11.1f  %7.1f  %5u %5u\n",
+                    ((double)t->start_ns - (double)e->mono_ns) / 1e6, (unsigned long long)t->cycle,
+                    t->period_ns / 1e3, t->late_ns / 1e3, t->gap_ns / 1e3, t->work_ns / 1e3, t->wkc[0], t->wkc[1]);
+        }
     }
-    fprintf(fp, "  对照内核日志: journalctl -k -o short-precise --since \"%s\"\n\n", since);
+    if (timing) fprintf(fp, "  对照内核日志: journalctl -k -o short-precise --since \"%s\"\n", since);
+    fputc('\n', fp);
+}
+
+typedef struct {
+    int arm, slave, joint;
+    uint8_t msg[EMERGENCY_MSG_BYTES];
+} emergency_msg;
+
+/* CoE 紧急报文：错误码（2 字节小端）、错误寄存器（1 字节）、厂家数据（5 字节） */
+static void write_emergency(arms_t *a, FILE *fp, const emergency_msg *m)
+{
+    struct timespec rt;
+    char when[48];
+    arms_joint_state s;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    format_real((int64_t)rt.tv_sec * 1000000000LL + rt.tv_nsec, true, when, sizeof(when));
+    fprintf(fp, "==== %s  驱动器紧急报文  %s 臂\n", when, arms_arm_name(m->arm));
+    fprintf(fp, "  关节 %d（链上位置 %d）错误码 0x%04x  错误寄存器 0x%02x  厂家数据 %02x %02x %02x %02x %02x\n",
+            m->joint, m->slave, (unsigned)(m->msg[0] | (m->msg[1] << 8)), m->msg[2], m->msg[3], m->msg[4], m->msg[5],
+            m->msg[6], m->msg[7]);
+    if (arms_read_joint(a, m->joint, &s) == ARMS_OK)
+        fprintf(fp, "  取出时状态 %s  状态字 0x%04x  错误码(0x603F) 0x%04x\n", arms_joint_mode_name(s.mode),
+                s.status_word, s.error_code);
+    fputc('\n', fp);
 }
 
 int arms_log_events(arms_t *a)
 {
     uint64_t total, i;
-    int written = 0;
+    int written = 0, ne = 0;
+    emergency_msg emcy[EMERGENCY_BATCH];
     FILE *fp;
     if (!a) return -1;
+    for (int arm = 0; arm < ARMS_ARM_COUNT; ++arm) {
+        arm_rt *r = &a->arm[arm];
+        if (!r->used || !r->bus) continue;
+        for (int k = 0; k < r->count && ne < EMERGENCY_BATCH; ++k) {
+            while (ne < EMERGENCY_BATCH && r->ops->emerg_pop(r->bus, k, emcy[ne].msg) == 1) {
+                emcy[ne].arm = arm;
+                emcy[ne].slave = r->slot_slave[k];
+                emcy[ne].joint = r->slot_joint[k];
+                ne++;
+            }
+        }
+    }
     total = atomic_load_explicit(&a->evt_count, memory_order_acquire);
-    if (total == a->evt_read) return 0;
+    if (total == a->evt_read && ne == 0) return 0;
     fp = open_event_log(a);
     if (!fp) return -1;
     if (!a->evt_header_done) {
@@ -1556,8 +1907,15 @@ int arms_log_events(arms_t *a)
         written++;
     }
     a->evt_read = total;
+    for (int m = 0; m < ne; ++m) write_emergency(a, fp, &emcy[m]);
+    written += ne;
     fclose(fp);
     return written;
+}
+
+void arms_clear_esc_counters(arms_t *a)
+{
+    if (a) atomic_store_explicit(&a->esc_clear_all, true, memory_order_release);
 }
 arms_mask arms_opened_joints(const arms_t *a) { return a ? a->joints : 0; }
 arms_mask arms_ignored_joints(const arms_t *a) { return a ? a->ignored : 0; }
@@ -1680,7 +2038,7 @@ static const char *result_text(unsigned int r)
     case RES_STATE: return "从站不在 OP 或请求被取消";
     case RES_COMM: return "通信未就绪或已失败";
     case RES_TRIP: return "离线保护已触发，需重新上电并通过在线检查";
-    case RES_PROTECT: return "超速/超力矩保护已触发，需先 reset";
+    case RES_PROTECT: return "超速/超力矩/过温保护已触发，需先 reset";
     case RES_PENDING: return "未响应";
     }
     return "?";

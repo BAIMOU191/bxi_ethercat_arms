@@ -18,6 +18,16 @@
 
 #define KGU_MODE_MIT 10
 
+/* 监控量：Pn002 选择要显示的量，对象 0x3000（INT32，只读）给出该量的当前值 */
+#define KGU_OBJ_MONITOR_SELECT 0x2002u
+#define KGU_OBJ_MONITOR_VALUE 0x3000u
+#define KGU_MON_TEMPERATURE 77 /* 执行器温度 [℃] */
+#define KGU_MON_ECAT_LOSS 63   /* EtherCAT 通信丢帧次数，上电清零 */
+
+/* ESC 错误计数寄存器 0x0300..0x0313：各端口无效帧/物理层错误、转发错误、处理单元错误、链路丢失 */
+#define ESC_ERR_ADDR 0x0300u
+#define ESC_ERR_BYTES 20u
+
 #define KGU_OUT_BYTES 23
 #define KGU_IN_BYTES 16
 

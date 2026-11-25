@@ -242,11 +242,11 @@ class ArmsNode final : public rclcpp::Node
     /* 一次性可读状态：总线、保护、每个关节的模式和反馈 */
     void status(Trigger::Response &r)
     {
-        static const char *protect_names[] = {"none", "overspeed", "overtorque"};
+        static const char *protect_names[] = {"none", "overspeed", "overtorque", "overtemp"};
         arms_bus_stats b{};
         arms_get_stats(dev.driver, &b);
         std::string t;
-        const char *protect = b.protect.reason <= ARMS_PROTECT_OVERTORQUE ? protect_names[b.protect.reason] : "?";
+        const char *protect = b.protect.reason <= ARMS_PROTECT_OVERTEMP ? protect_names[b.protect.reason] : "?";
         t += format("session %s, trip %s (joints 0x%08x), protect %s", dev.cut ? "LATCHED" : "ok",
                     b.tripped ? "LATCHED" : "none", b.trip_joints, protect);
         if (b.protect.reason != ARMS_PROTECT_NONE)
@@ -263,7 +263,7 @@ class ArmsNode final : public rclcpp::Node
                         a.comm_failed ? "FAILED" : "ok", a.comm_drops);
         }
         t += "joint name                 mode         pos(rad)  vel(rad/s) torque(Nm)  SW     ERR    cmd_pos  kp      "
-             "kd     flags\n";
+             "kd     temp(C) drv_loss flags\n";
         arms_joint_state s[ARMS_JOINT_COUNT];
         size_t n = 0;
         arms_read(dev.driver, s, ARMS_JOINT_COUNT, &n);
@@ -273,12 +273,15 @@ class ArmsNode final : public rclcpp::Node
             if (s[i].cmd_limited) flags += 'L';
             if (s[i].cmd_timeout) flags += 'T';
             if (flags.empty()) flags = "-";
-            t += format("%-5d %-20s %-10s %9.4f %10.4f %10.4f  0x%04x 0x%04x %8.4f %7.2f %6.2f %s\n", s[i].joint,
-                        s[i].name ? s[i].name : "-", arms_joint_mode_name(s[i].mode), s[i].position, s[i].velocity,
-                        s[i].torque, s[i].status_word, s[i].error_code, s[i].cmd_position, s[i].cmd_kp, s[i].cmd_kd,
-                        flags.c_str());
+            const std::string temp = std::isnan(s[i].temperature) ? "-" : format("%.0f", s[i].temperature);
+            const std::string loss = s[i].drive_frame_loss < 0 ? "-" : std::to_string(s[i].drive_frame_loss);
+            t += format("%-5d %-20s %-10s %9.4f %10.4f %10.4f  0x%04x 0x%04x %8.4f %7.2f %6.2f %7s %8s %s\n",
+                        s[i].joint, s[i].name ? s[i].name : "-", arms_joint_mode_name(s[i].mode), s[i].position,
+                        s[i].velocity, s[i].torque, s[i].status_word, s[i].error_code, s[i].cmd_position, s[i].cmd_kp,
+                        s[i].cmd_kd, temp.c_str(), loss.c_str(), flags.c_str());
         }
-        t += "flags: H=hold (topic targets ignored), L=limited, T=command timeout";
+        t += "flags: H=hold (topic targets ignored), L=limited, T=command timeout; drv_loss = drive-reported "
+             "EtherCAT frame losses since power-up";
         r.success = healthy();
         r.message = t;
     }
@@ -409,8 +412,10 @@ class ArmsNode final : public rclcpp::Node
         a.position = j.position;
         a.velocity = j.velocity;
         a.effort = j.effort;
+        /* 驱动器只提供执行器温度（Pn002=77），填入 driver_temperature；电机温度未知 */
         const double unknown = std::numeric_limits<double>::quiet_NaN();
-        a.driver_temperature.assign(n, unknown);
+        for (size_t i = 0; i < n; i++)
+            a.driver_temperature.push_back(s[i].temperature);
         a.motor_temperature.assign(n, unknown);
         joint_pub->publish(j);
         state_pub->publish(a);
@@ -424,10 +429,21 @@ class ArmsNode final : public rclcpp::Node
         arms_joint_state states[ARMS_JOINT_COUNT];
         size_t n = 0;
         arms_mask faults[ARMS_ARM_COUNT]{};
+        double max_temp[ARMS_ARM_COUNT];
+        int64_t drive_loss[ARMS_ARM_COUNT]{}, esc_errors[ARMS_ARM_COUNT]{};
+        for (auto &t : max_temp)
+            t = std::numeric_limits<double>::quiet_NaN();
         arms_read(dev.driver, states, ARMS_JOINT_COUNT, &n);
         for (size_t k = 0; k < n; ++k) {
             const auto &s = states[k];
             if (s.mode == ARMS_JS_FAULT || s.error_code) faults[s.arm] |= ARMS_MASK_JOINT(s.joint);
+            if (!std::isnan(s.temperature) && (std::isnan(max_temp[s.arm]) || s.temperature > max_temp[s.arm]))
+                max_temp[s.arm] = s.temperature;
+            if (s.drive_frame_loss > 0)
+                drive_loss[s.arm] += s.drive_frame_loss;
+            for (int e = 0; e < 20; ++e)
+                if (e != 14 && e != 15)
+                    esc_errors[s.arm] += s.esc_errors[e];
         }
         for (int i = 0; i < ARMS_ARM_COUNT; i++) {
             auto &a = b.arm[i];
@@ -441,8 +457,9 @@ class ArmsNode final : public rclcpp::Node
                        a.wkc_last != a.wkc_expected)
                           ? 2
                           : 0;
-            d.message = prot ? (b.protect.reason == ARMS_PROTECT_OVERSPEED ? "overspeed protection latched"
-                                                                           : "overtorque protection latched")
+            d.message = prot ? (b.protect.reason == ARMS_PROTECT_OVERSPEED    ? "overspeed protection latched"
+                                : b.protect.reason == ARMS_PROTECT_OVERTORQUE ? "overtorque protection latched"
+                                                                               : "overtemperature protection latched")
                         : faults[i] ? "drive fault"
                         : d.level ? "communication fault or trip"
                                   : "online";
@@ -462,6 +479,9 @@ class ArmsNode final : public rclcpp::Node
             add("protect_value", b.protect.value);
             add("rejected_commands", rejected);
             add("held_joints", held);
+            add("max_temp_c", std::isnan(max_temp[i]) ? -1.0 : max_temp[i]);
+            add("drive_frame_loss", drive_loss[i]);
+            add("esc_error_sum", esc_errors[i]);
             msg.status.push_back(d);
         }
         diag_pub->publish(msg);

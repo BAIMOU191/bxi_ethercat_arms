@@ -136,8 +136,8 @@ static int cmd_status(int argc, char **argv)
     }
     if (selector && arms_parse_joints(selector, known, &sel, err, sizeof(err)))
         return failed("%s", err);
-    printf("%-3s %-20s %-11s %-8s %-6s %-6s %-6s %10s %10s %9s %10s %8s %8s %4s %5s\n", "关节", "名称", "臂/位置", "状态", "AL",
-           "SW", "ERR", "pos[rad]", "vel[rad/s]", "tor[N.m]", "cmd", "kp", "kd", "flag", "flt");
+    printf("%-3s %-20s %-11s %-8s %-6s %-6s %-6s %10s %10s %9s %10s %8s %8s %4s %5s %5s\n", "关节", "名称", "臂/位置", "状态",
+           "AL", "SW", "ERR", "pos[rad]", "vel[rad/s]", "tor[N.m]", "cmd", "kp", "kd", "flag", "flt", "温度℃");
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_joint_state s;
         char where[16], flags[4];
@@ -164,9 +164,14 @@ static int cmd_status(int argc, char **argv)
         if (s.cmd_timeout) flags[n++] = 'T';
         if (!n) flags[n++] = '-';
         flags[n] = '\0';
-        printf("%-3d %-20s %-11s %-8s 0x%02x   0x%04x 0x%04x %10.4f %10.4f %9.4f %10.4f %8.4f %8.4f %4s %5u\n", j, s.name ? s.name : "-",
-               where, arms_joint_mode_name(s.mode), s.al_state, s.status_word, s.error_code, s.position,
-               s.velocity, s.torque, s.cmd_position, s.cmd_kp, s.cmd_kd, flags, s.fault_count);
+        {
+            char temp[16];
+            if (isnan(s.temperature)) snprintf(temp, sizeof(temp), "-");
+            else snprintf(temp, sizeof(temp), "%.0f", s.temperature);
+            printf("%-3d %-20s %-11s %-8s 0x%02x   0x%04x 0x%04x %10.4f %10.4f %9.4f %10.4f %8.4f %8.4f %4s %5u %5s\n", j,
+                   s.name ? s.name : "-", where, arms_joint_mode_name(s.mode), s.al_state, s.status_word, s.error_code,
+                   s.position, s.velocity, s.torque, s.cmd_position, s.cmd_kp, s.cmd_kd, flags, s.fault_count, temp);
+        }
     }
     return ok();
 }
@@ -220,8 +225,10 @@ static void print_protection(const arms_bus_stats *st)
     if (st->offline_joints) print_mask_line("当前不在线", st->offline_joints);
     if (st->protect.reason != ARMS_PROTECT_NONE)
         printf("超限保护: [已触发] 关节 %d %s %.4f 超过阈值 %.4f，执行 reset 清除\n", st->protect.joint,
-               st->protect.reason == ARMS_PROTECT_OVERSPEED ? "速度(rad/s)" : "力矩(N.m)", st->protect.value,
-               st->protect.limit);
+               st->protect.reason == ARMS_PROTECT_OVERSPEED    ? "速度(rad/s)"
+               : st->protect.reason == ARMS_PROTECT_OVERTORQUE ? "力矩(N.m)"
+                                                                : "温度(℃)",
+               st->protect.value, st->protect.limit);
     else
         printf("超限保护: 正常\n");
 }
@@ -462,6 +469,70 @@ static int cmd_power(int argc, char **argv)
 }
 
 /* ---- commtest ---- */
+/*
+ * 打印执行器温度、驱动器丢帧次数和 ESC 错误计数。only_nonzero 时只列出有错误计数、
+ * 或驱动器丢帧次数相对 loss_base（按关节号索引，可为 NULL）增加的关节。返回列出的关节数。
+ */
+static int print_diag(arms_mask mask, bool only_nonzero, const int32_t *loss_base)
+{
+    int shown = 0;
+    bool header = false;
+    for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        arms_joint_state s;
+        char where[16], temp[16], loss[16];
+        const uint8_t *e;
+        bool nonzero = false;
+        if (!(mask & ARMS_MASK_JOINT(j)) || arms_read_joint(g_arms, j, &s) != ARMS_OK) continue;
+        e = s.esc_errors;
+        for (int b = 0; b < 20; ++b)
+            if (b != 14 && b != 15 && e[b]) nonzero = true;
+        if (s.drive_frame_loss > (loss_base && loss_base[j] >= 0 ? loss_base[j] : 0)) nonzero = true;
+        if (only_nonzero && !nonzero) continue;
+        if (!header) {
+            printf("%-3s %-20s %-7s %6s %9s  %-23s  %-23s  %8s %5s\n", "关节", "名称", "臂/位置", "温度℃", "驱动器丢帧",
+                   "端口0 无效/物理/转发/丢链", "端口1 无效/物理/转发/丢链", "处理单元", "PDI");
+            header = true;
+        }
+        snprintf(where, sizeof(where), "%s/%d", s.arm == 0 ? "L" : "R", s.slave);
+        if (isnan(s.temperature)) snprintf(temp, sizeof(temp), "-");
+        else snprintf(temp, sizeof(temp), "%.0f", s.temperature);
+        if (s.drive_frame_loss < 0) snprintf(loss, sizeof(loss), "-");
+        else snprintf(loss, sizeof(loss), "%d", s.drive_frame_loss);
+        if (!s.esc_valid) {
+            printf("%-3d %-20s %-7s %6s %9s  %s\n", j, s.name ? s.name : "-", where, temp, loss, "ESC 计数尚未读到");
+        } else {
+            printf("%-3d %-20s %-7s %6s %9s  %4u %4u %4u %4u            %4u %4u %4u %4u            %8u %5u\n", j,
+                   s.name ? s.name : "-", where, temp, loss, e[0], e[1], e[8], e[16], e[2], e[3], e[9], e[17], e[12],
+                   e[13]);
+        }
+        shown++;
+    }
+    return shown;
+}
+
+/* diag：执行器温度、驱动器丢帧次数和各从站 ESC 错误计数 */
+static int cmd_diag(int argc, char **argv)
+{
+    arms_mask m = arms_opened_joints(g_arms);
+    const char *selector = NULL;
+    bool reset = false;
+    for (int k = 1; k < argc; ++k) {
+        if (!strcmp(argv[k], "reset") && !reset) reset = true;
+        else if (!selector) selector = argv[k];
+        else return bad_args("参数为可选的关节和 reset");
+    }
+    if (selector && selection(selector, &m)) return -2;
+    if (reset) {
+        arms_clear_esc_counters(g_arms);
+        tlog("已请求清零全部从站的 ESC 错误计数，约 1 秒内生效；驱动器丢帧次数只能断电清零");
+        return ok();
+    }
+    print_diag(m, false, NULL);
+    printf("端口 0 接主站一侧，端口 1 接下一个从站。ESC 计数自预热完成（或 diag reset、通信恢复）起累计，到 255 停止。\n"
+           "某个从站端口 0 的计数增加，通常说明它和上一个从站之间的网线或接头有问题。\n");
+    return ok();
+}
+
 static int cmd_commtest(int argc, char **argv)
 {
     long seconds;
@@ -469,6 +540,7 @@ static int cmd_commtest(int argc, char **argv)
     arms_mask all = arms_opened_joints(g_arms);
     bool enabled = argc == 3, pass = true;
     const char *label = enabled ? "伺服使能，" : "";
+    int32_t loss_base[ARMS_JOINT_LAST + 1];
     long t;
     int i;
     if (!integer(argv[1], 1, 86400, &seconds)) return bad_args("秒数必须是 1..86400 的整数");
@@ -498,8 +570,13 @@ static int cmd_commtest(int argc, char **argv)
         }
     }
     arms_reset_stats(g_arms);
-    delay_ms(20);
-    tlog("通信测试开始: %s%ld 秒，回车或 Ctrl+C 提前结束", label, seconds);
+    arms_clear_esc_counters(g_arms);
+    for (int j = 0; j <= ARMS_JOINT_LAST; ++j) {
+        arms_joint_state s;
+        loss_base[j] = arms_read_joint(g_arms, j, &s) == ARMS_OK ? s.drive_frame_loss : -1;
+    }
+    delay_ms(300); /* 等 ESC 错误计数清零在各从站完成 */
+    tlog("通信测试开始: %s%ld 秒，回车或 Ctrl+C 提前结束（ESC 错误计数已清零）", label, seconds);
     for (t = 1; t <= seconds; ++t) {
         if (motion_wait_or_enter(1000)) {
             tlog("通信测试提前结束: 已运行 %ld 秒", t - 1);
@@ -523,6 +600,10 @@ static int cmd_commtest(int argc, char **argv)
         if (disable_joints(all, 20)) return -1;
     }
     print_stats(&st);
+    if (print_diag(all, true, loss_base) > 0) {
+        printf("以上关节在测试期间有 ESC 错误计数或驱动器自报丢帧（详见 diag 和通信事件日志）\n");
+        pass = false;
+    }
     for (i = 0; i < ARMS_ARM_COUNT; ++i)
         if (st.arm[i].present && (st.arm[i].wkc_bad || st.arm[i].send_errors || st.arm[i].comm_failed)) pass = false;
     if (st.overruns || st.skipped) pass = false;
@@ -664,7 +745,7 @@ static int cmd_selftest(int argc, char **argv)
     if (st.tripped)
         return failed("离线保护已锁定");
     if (st.protect.reason != ARMS_PROTECT_NONE)
-        return failed("超速/超力矩保护已锁定（关节 %d），执行 reset 清除", st.protect.joint);
+        return failed("超速/超力矩/过温保护已锁定（关节 %d），执行 reset 清除", st.protect.joint);
     for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; j++)
         if (arms_opened_joints(g_arms) & ARMS_MASK_JOINT(j)) {
             arms_joint_state s;
@@ -1042,8 +1123,17 @@ static const command commands[] = {
      "  关节写法: 21 | l_wrist_z | left | right | all | 15-18 | 21,28（默认全部已打开关节）\n"
      "  状态: offline / preop / safeop / locked（OP，伺服失能）/ enabled / FAULT\n"
      "        released / held（失能，且抱闸为强制松闸 / 强制抱闸）\n"
-     "  cmd、kp、kd 为实际下发的位置和增益；L=限幅，T=超时，flt=累计故障次数。",
+     "  cmd、kp、kd 为实际下发的位置和增益；L=限幅，T=超时，flt=累计故障次数。\n"
+     "  温度为执行器温度（Pn002=77 的监控量），约每 2 秒更新；- 表示尚未读到。",
      "  status\n  status left\n  status 21", cmd_status},
+    {"diag", "查看", "[关节] [reset]", 0, 2, "显示执行器温度、驱动器丢帧次数和各从站 ESC 错误计数",
+     "  驱动器丢帧: 驱动器自报的 EtherCAT 丢帧次数（Pn002=63），上电清零，不能由程序清零。\n"
+     "  ESC 错误计数: 从站通信芯片寄存器 0x0300..0x0313，按端口列出无效帧、物理层错误、转发错误、链路丢失，\n"
+     "    以及处理单元错误和 PDI 错误。自预热完成、diag reset 或通信恢复起累计，到 255 停止。\n"
+     "  端口 0 接主站一侧，端口 1 接下一个从站；哪个从站的端口 0 先出现计数，故障点通常在它与上一个从站之间。\n"
+     "  reset: 清零全部从站的 ESC 错误计数。计数增加、温度告警和过温保护都会写入通信事件日志。\n"
+     "  过温保护: 温度达到 safety.temp_max_c 时全部关节失能并锁定，降温后 reset；safety.temp_warn_c 只告警。",
+     "  diag\n  diag left\n  diag reset", cmd_diag},
     {"watch", "查看", "[关节] [刷新Hz]", 0, 2, "原地刷新显示关节状态、位置、速度、力矩，回车结束",
      "  每个关节一行，在同一块区域内刷新。刷新频率 1..50 Hz，默认 5。\n"
      "  使用 -T 启动时输出经过时间戳处理，改为每次刷新打印一组。",
@@ -1127,7 +1217,8 @@ static const command commands[] = {
     {"commtest", "测试", "<秒> [--enabled]", 1, 2, "测试通信质量；可选伺服使能测试",
      "  默认要求全部关节失能；--enabled 使能全部已打开关节并保持原位，结束或中止后全部失能。\n  清零统计后每 "
      "10 秒打印一次进度。\n"
-     "  通过条件: WKC 异常 0 次、发送错误 0 次、无超时周期、无跳过周期",
+     "  开始时清零 ESC 错误计数，结束时列出错误计数非零或驱动器丢帧增加的关节。\n"
+     "  通过条件: WKC 异常 0 次、发送错误 0 次、无超时周期、无跳过周期、无 ESC 错误计数、驱动器丢帧不增加",
      "  commtest 300\n  commtest 2 --enabled", cmd_commtest},
     {"version", "通用", "", 0, 0, "显示版本", "", "  version", cmd_version},
     {"quit", "通用", "", 0, 0, "退出：停止通信并释放主站", "  也可以用 exit 或 q", "  quit", cmd_quit},
@@ -1157,7 +1248,8 @@ static void complete_command(size_t argc, const char *const argv[], le_choices *
     const cmd_fn fn = c->fn;
     bool takes_joints = fn == cmd_status || fn == cmd_watch || fn == cmd_info || fn == cmd_enable ||
                         fn == cmd_disable || fn == cmd_reset || fn == cmd_hold || fn == cmd_mit || fn == cmd_home ||
-                        fn == cmd_swing || fn == cmd_free || fn == cmd_brake || fn == cmd_multi_service || fn == cmd_service || fn == cmd_parameter;
+                        fn == cmd_swing || fn == cmd_free || fn == cmd_brake || fn == cmd_multi_service ||
+                        fn == cmd_service || fn == cmd_parameter || fn == cmd_diag;
     if ((argc == 1 && takes_joints) ||
         (argc == 2 && c->fn == cmd_status && !strcmp(argv[1], "--raw"))) {
         bool single = fn == cmd_service || fn == cmd_parameter;
@@ -1189,6 +1281,7 @@ static void complete_command(size_t argc, const char *const argv[], le_choices *
         }
     }
     if (argc == 1 && c->fn == cmd_bus) le_add_choice(out, "reset");
+    if (argc <= 2 && c->fn == cmd_diag) le_add_choice(out, "reset");
     if (argc == 1 && c->fn == cmd_power) {
         le_add_choice(out, "on"); le_add_choice(out, "off"); le_add_choice(out, "status");
     }

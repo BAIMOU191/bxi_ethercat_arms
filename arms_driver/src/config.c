@@ -141,6 +141,9 @@ static void set_defaults(arms_config *c)
     c->overspeed_ms = 500;
     c->overtorque_ms = 100;
     c->op_timeout_ms = 30000;
+    c->drive_monitor = true;
+    c->temp_warn_c = 75;
+    c->temp_max_c = 90;
     c->vendor_id = KGU_VENDOR_ID;
     c->product_code = KGU_PRODUCT_CODE;
 }
@@ -423,6 +426,32 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
                 goto out;
             }
             c->overtorque_ms = (unsigned int)v;
+        }
+        {
+            const cJSON *dm = cJSON_GetObjectItemCaseSensitive(safety, "drive_monitor");
+            if (dm && !cJSON_IsBool(dm)) {
+                fail(error, size, "safety.drive_monitor 必须是 true/false");
+                goto out;
+            }
+            if (dm) c->drive_monitor = cJSON_IsTrue(dm);
+        }
+        if (cJSON_GetObjectItemCaseSensitive(safety, "temp_warn_c")) {
+            if (!get_int(safety, "temp_warn_c", 20, 150, &v)) {
+                fail(error, size, "safety.temp_warn_c 必须是 20..150");
+                goto out;
+            }
+            c->temp_warn_c = v;
+        }
+        if (cJSON_GetObjectItemCaseSensitive(safety, "temp_max_c")) {
+            if (!get_int(safety, "temp_max_c", 20, 150, &v)) {
+                fail(error, size, "safety.temp_max_c 必须是 20..150");
+                goto out;
+            }
+            c->temp_max_c = v;
+        }
+        if (c->temp_warn_c > c->temp_max_c) {
+            fail(error, size, "safety.temp_warn_c 不能大于 safety.temp_max_c");
+            goto out;
         }
         if (cJSON_GetObjectItemCaseSensitive(safety, "timeout_action") &&
             (!get_str(safety, "timeout_action", c->timeout_action, sizeof(c->timeout_action)) ||

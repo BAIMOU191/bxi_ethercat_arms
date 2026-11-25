@@ -70,7 +70,25 @@ typedef struct {
     void (*close)(bus_t *bus);
     int (*sdo)(bus_t *, int slave, uint16_t index, uint8_t sub, uint8_t *, size_t *, bool write,
                uint32_t *abort);
+
+    /*
+     * 异步请求，只在周期上下文中调用，均不阻塞。index 为第几个配置从站。
+     * 每个从站一个寄存器请求（ESC 错误计数）和一组监控量请求（写 Pn002、读 0x3000），
+     * 在 configure 中创建。start 类函数在上一次请求仍为 BUS_REQ_BUSY 时返回负值。
+     */
+    int (*esc_counters_read)(bus_t *bus, int index);
+    int (*esc_counters_clear)(bus_t *bus, int index);
+    /* 返回 BUS_REQ_*；为 BUS_REQ_DONE 且上一次是读时把 ESC_ERR_BYTES 字节写入 out */
+    int (*esc_counters_state)(bus_t *bus, int index, uint8_t *out);
+    int (*monitor_select)(bus_t *bus, int index, uint16_t code);
+    int (*monitor_read)(bus_t *bus, int index);
+    /* 返回 BUS_REQ_*；为 BUS_REQ_DONE 且上一次是读时写入 value */
+    int (*monitor_state)(bus_t *bus, int index, int32_t *value);
+    /* 取出一条 CoE 紧急报文（8 字节），可在非周期上下文调用；1 取到，0 没有，负值失败 */
+    int (*emerg_pop)(bus_t *bus, int index, uint8_t *msg);
 } bus_ops;
+
+enum { BUS_REQ_IDLE = 0, BUS_REQ_BUSY, BUS_REQ_DONE, BUS_REQ_ERROR };
 
 extern const bus_ops bus_mock_ops;
 #ifdef ARMS_HAVE_ETHERLAB

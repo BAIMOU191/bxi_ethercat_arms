@@ -67,8 +67,10 @@ static void check_protect(const arms_bus_stats *st)
     pthread_mutex_unlock(&lock);
     tlog_err("超限保护触发: 关节 %d(%s) %s %.4f 超过阈值 %.4f；全部关节已失能，执行 reset 清除",
              st->protect.joint, arms_joint_name(bus, st->protect.joint),
-             st->protect.reason == ARMS_PROTECT_OVERSPEED ? "速度(rad/s)" : "力矩(N.m)", st->protect.value,
-             st->protect.limit);
+             st->protect.reason == ARMS_PROTECT_OVERSPEED    ? "速度(rad/s)"
+             : st->protect.reason == ARMS_PROTECT_OVERTORQUE ? "力矩(N.m)"
+                                                              : "温度(℃)",
+             st->protect.value, st->protect.limit);
     if (!take_snapshot(&s)) return;
     for (i = 0; i < s.count; ++i) {
         const arms_joint_state *j = &s.joints[i];
