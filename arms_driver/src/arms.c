@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "arms/arms.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
@@ -1262,6 +1263,46 @@ static void *rt_main(void *arg)
     return NULL;
 }
 
+/*
+ * 主站激活时 EtherLab 创建的内核线程（EtherCAT-OP 等）不受 rt_setup.sh 的线程迁移约束，
+ * 其定时器会在实时 CPU 上到期并在实时线程的上下文中处理。激活后将这些线程限制到
+ * 实时 CPU 和网口中断 CPU 以外的 CPU；线程随主站释放而退出，无需还原。失败时只记录日志。
+ */
+static void confine_master_threads(arms_t *a)
+{
+    cpu_set_t set;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    int moved = 0, failed = 0, err = 0;
+    DIR *dir;
+    struct dirent *de;
+
+    if (a->rt_cpu < 0 && a->cfg.irq_cpu < 0) return;
+    CPU_ZERO(&set);
+    for (long c = 0; c < ncpu && c < CPU_SETSIZE; ++c)
+        if (c != a->rt_cpu && c != a->cfg.irq_cpu) CPU_SET((int)c, &set);
+    if (CPU_COUNT(&set) == 0) return;
+    dir = opendir("/proc");
+    if (!dir) return;
+    while ((de = readdir(dir)) != NULL) {
+        char path[64], comm[32] = "";
+        FILE *fp;
+        char *end;
+        long pid = strtol(de->d_name, &end, 10);
+        if (*end || pid <= 0) continue;
+        snprintf(path, sizeof(path), "/proc/%ld/comm", pid);
+        fp = fopen(path, "r");
+        if (!fp) continue;
+        if (!fgets(comm, sizeof(comm), fp)) comm[0] = '\0';
+        fclose(fp);
+        if (strncmp(comm, "EtherCAT-", 9) != 0) continue;
+        if (sched_setaffinity((pid_t)pid, sizeof(set), &set) == 0) moved++;
+        else { failed++; err = errno; }
+    }
+    closedir(dir);
+    if (failed) logf_(a, "警告: %d 个 EtherLab 内核线程未能限制 CPU: %s", failed, strerror(err));
+    else if (moved) logf_(a, "EtherLab 内核线程 %d 个，已限制在实时 CPU 和中断 CPU 以外", moved);
+}
+
 static arms_status start_rt(arms_t *a)
 {
     pthread_attr_t attr;
@@ -1593,6 +1634,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     }
     publish(a); /* 外部周期尚未运行时也能读取已配置的关节、主站和初始状态。 */
     a->activated_ns = mono_ns();
+    if (a->opt.backend != ARMS_BACKEND_MOCK) confine_master_threads(a);
 
     if (a->mode == ARMS_MODE_EXTERNAL) {
         logf_(a, "外部驱动模式: 周期 %u Hz, 等待调用方周期调用 arms_rx/arms_tx", a->cycle_hz);
