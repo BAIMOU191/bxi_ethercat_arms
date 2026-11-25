@@ -16,8 +16,7 @@ void motion_set_power_off(bool off);
 /* 离线保护触发时在监视线程中调用一次（用于切断电机电源） */
 void motion_set_trip_handler(void (*fn)(void));
 
-/* 指令直接下发，不做轨迹插值；kp、kd 为 NAN 表示使用每个关节的默认增益。 */
+/* 指令直接下发，不做轨迹插值和限幅；kp、kd 由调用方给出。 */
 int motion_mit(arms_mask mask, arms_command cmd);
-int motion_home(arms_mask mask);
 int motion_swing(arms_mask mask, double amplitude, double period, long count, double kp, double kd);
 #endif

@@ -121,22 +121,12 @@ class ArmsNode final : public rclcpp::Node
             arms_read_joint(dev.driver, j, &s);
             arms_command c{m.pos[i], m.vel[i], m.torque[i], m.kp[i], m.kd[i]};
             if (mask & bit || !std::isfinite(c.position) || !std::isfinite(c.velocity) ||
-                !std::isfinite(c.torque) || !std::isfinite(c.kp) || !std::isfinite(c.kd) || c.kp < 0 ||
-                c.kd < 0) {
+                !std::isfinite(c.torque)) {
                 reject("duplicate or invalid value");
                 return;
             }
             mask |= bit;
             cmds[j] = c;
-            if (s.mode != ARMS_JS_ENABLED)
-                continue;
-            arms_joint_limits l{};
-            arms_get_limits(dev.driver, j, &l);
-            if (c.position < l.pos_min || c.position > l.pos_max || std::abs(c.velocity) > l.vel_max ||
-                std::abs(c.torque) > l.tff_max || c.kp > l.kp_max || c.kd > l.kd_max) {
-                reject("configured joint limit");
-                return;
-            }
         }
         for (int j = 15; j <= 28; j++)
             if ((mask & ~held) & ARMS_MASK_JOINT(j)) {
@@ -270,7 +260,7 @@ class ArmsNode final : public rclcpp::Node
         for (size_t i = 0; i < n; i++) {
             std::string flags;
             if (held & ARMS_MASK_JOINT(s[i].joint)) flags += 'H';
-            if (s[i].cmd_limited) flags += 'L';
+            if (s[i].cmd_pos_blocked) flags += 'P';
             if (s[i].cmd_timeout) flags += 'T';
             if (flags.empty()) flags = "-";
             const std::string temp = std::isnan(s[i].temperature) ? "-" : format("%.0f", s[i].temperature);
@@ -280,7 +270,7 @@ class ArmsNode final : public rclcpp::Node
                         s[i].velocity, s[i].torque, s[i].status_word, s[i].error_code, s[i].cmd_position, s[i].cmd_kp,
                         s[i].cmd_kd, temp.c_str(), loss.c_str(), flags.c_str());
         }
-        t += "flags: H=hold (topic targets ignored), L=limited, T=command timeout; drv_loss = drive-reported "
+        t += "flags: H=hold (topic targets ignored), P=soft position limit blocking outward vel/torque, T=command timeout; drv_loss = drive-reported "
              "EtherCAT frame losses since power-up";
         r.success = healthy();
         r.message = t;

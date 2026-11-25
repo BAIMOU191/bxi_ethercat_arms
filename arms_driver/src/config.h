@@ -21,12 +21,9 @@ typedef struct {
     int slave;
     int direction;          /* +1 / -1 */
     double offset_rad;
-    double pos_min, pos_max;
-    double vel_max, tff_max;    /* 指令限幅 */
-    double vel_fault, tor_fault;/* 反馈超限保护阈值 */
-    double kp_max, kd_max;
-    double kp_default, kd_default;
-    double home;            /* 回零目标位置 [rad] */
+    /* 与参考 hw_lib 的 motor_info_t 对应，均只看反馈，不截断指令 */
+    double pos_limit_min, pos_limit_max; /* 软位置限位：实际位置越界后屏蔽朝外的速度和前馈 */
+    double vel_limit, tor_limit;         /* 反馈速度 / 力矩保护阈值 */
 } arms_joint_config;
 
 typedef struct {

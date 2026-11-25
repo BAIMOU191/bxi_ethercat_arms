@@ -263,7 +263,6 @@ typedef struct {
     unsigned int seq_seen;
     uint64_t fresh_cycle;
     arms_command cur;                 /* 当前生效的指令（关节侧，未限幅） */
-    double lim_min, lim_max;          /* 生效的位置限位，使能时若实际位置在限位外则放宽到该位置 */
     bool timed_out;
     bool was_fault;
     uint32_t fault_count;
@@ -491,8 +490,8 @@ static void check_limits(arms_t *a, int j, const arms_joint_state *s)
         c->over_vel = c->over_tor = 0;
         return;
     }
-    ov = fabs(s->velocity) > jc->vel_fault;
-    ot = fabs(s->torque) > jc->tor_fault;
+    ov = fabs(s->velocity) > jc->vel_limit;
+    ot = fabs(s->torque) > jc->tor_limit;
     c->over_vel = ov ? c->over_vel + 1 : (c->over_vel ? c->over_vel - 1 : 0);
     c->over_tor = ot ? c->over_tor + 1 : (c->over_tor ? c->over_tor - 1 : 0);
     if (a->protect.reason != ARMS_PROTECT_NONE) return;
@@ -500,12 +499,12 @@ static void check_limits(arms_t *a, int j, const arms_joint_state *s)
         a->protect.reason = ARMS_PROTECT_OVERSPEED;
         a->protect.joint = j;
         a->protect.value = s->velocity;
-        a->protect.limit = jc->vel_fault;
+        a->protect.limit = jc->vel_limit;
     } else if (c->over_tor >= a->overtorque_cycles) {
         a->protect.reason = ARMS_PROTECT_OVERTORQUE;
         a->protect.joint = j;
         a->protect.value = s->torque;
-        a->protect.limit = jc->tor_fault;
+        a->protect.limit = jc->tor_limit;
     }
 }
 
@@ -983,12 +982,6 @@ static void cycle_rx(arms_t *a, uint64_t now)
     }
 }
 
-static double clampd(double v, double lo, double hi, bool *limited)
-{
-    if (v < lo) { *limited = true; return lo; }
-    if (v > hi) { *limited = true; return hi; }
-    return v;
-}
 
 static void finish(arms_t *a, int j, unsigned int result)
 {
@@ -1026,7 +1019,7 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
     bool op = (r->al[k] & 0x0F) == 0x08;
     bool comm_ok = r->wkc_ok && !r->comm_failed;
     unsigned int req = atomic_exchange_explicit(&a->req[j], REQ_NONE, memory_order_acq_rel);
-    bool active, limited = false;
+    bool active, blocked = false;
 
     if (fault && !c->was_fault) c->fault_count++;
     c->was_fault = fault;
@@ -1058,13 +1051,12 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
         } else {
             c->phase = CTL_ENABLING;
             c->phase_cycle = a->cycles;
+            /* 与参考 hw_lib 一致：使能后指令为零（零力矩），目标位置取当前位置 */
             c->cur.position = s->position;
             c->cur.velocity = 0.0;
             c->cur.torque = 0.0;
-            c->cur.kp = jc->kp_default;
-            c->cur.kd = jc->kd_default;
-            c->lim_min = s->position < jc->pos_min ? s->position : jc->pos_min;
-            c->lim_max = s->position > jc->pos_max ? s->position : jc->pos_max;
+            c->cur.kp = 0.0;
+            c->cur.kd = 0.0;
             c->timed_out = false;
             c->seq_seen = atomic_load_explicit(&a->slot[j].seq, memory_order_acquire) & ~1u;
             c->fresh_cycle = a->cycles;
@@ -1161,12 +1153,23 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
 
     active = c->phase == CTL_ENABLING || c->phase == CTL_ON;
     if (active) {
-        double pos = clampd(c->cur.position, c->lim_min, c->lim_max, &limited);
-        double vel = clampd(c->cur.velocity, -jc->vel_max, jc->vel_max, &limited);
-        double tff = clampd(c->cur.torque, -jc->tff_max, jc->tff_max, &limited);
-        double kp = clampd(c->cur.kp, 0.0, jc->kp_max, &limited);
-        double kd = clampd(c->cur.kd, 0.0, jc->kd_max, &limited);
+        /* 指令原样下发；kp、kd 为负或 NaN 时按 0（同参考 pack_cmd） */
+        double pos = c->cur.position;
+        double vel = c->cur.velocity;
+        double tff = c->cur.torque;
+        double kp = c->cur.kp > 0.0 ? c->cur.kp : 0.0;
+        double kd = c->cur.kd > 0.0 ? c->cur.kd : 0.0;
         double d = (double)jc->direction;
+        /* 软位置限位（同参考 over_pos）：实际位置越界后清零朝越界方向的速度和前馈，不截断位置 */
+        if (s->position > jc->pos_limit_max) {
+            if (vel > 0.0 || tff > 0.0) blocked = true;
+            if (vel > 0.0) vel = 0.0;
+            if (tff > 0.0) tff = 0.0;
+        } else if (s->position < jc->pos_limit_min) {
+            if (vel < 0.0 || tff < 0.0) blocked = true;
+            if (vel < 0.0) vel = 0.0;
+            if (tff < 0.0) tff = 0.0;
+        }
         out->pos = (float)(d * (pos + atomic_load_explicit(&a->offset_rad[j], memory_order_relaxed)));
         out->vel = (float)(d * vel);
         out->tff = (float)(d * tff);
@@ -1183,7 +1186,7 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
         s->cmd_position = s->position;
         s->cmd_velocity = s->cmd_torque = s->cmd_kp = s->cmd_kd = 0.0;
     }
-    s->cmd_limited = limited;
+    s->cmd_pos_blocked = blocked;
     s->cmd_timeout = c->phase == CTL_ON && c->timed_out;
     s->fault_count = c->fault_count;
 }
@@ -2061,17 +2064,10 @@ arms_status arms_get_limits(const arms_t *a, int joint, arms_joint_limits *l)
     if (!a || !l || joint < ARMS_JOINT_FIRST || joint > ARMS_JOINT_LAST || !(a->joints & ARMS_MASK_JOINT(joint)))
         return ARMS_E_ARG;
     jc = &a->cfg.joint[joint];
-    l->pos_min = jc->pos_min;
-    l->pos_max = jc->pos_max;
-    l->vel_max = jc->vel_max;
-    l->tff_max = jc->tff_max;
-    l->kp_max = jc->kp_max;
-    l->kd_max = jc->kd_max;
-    l->kp_default = jc->kp_default;
-    l->kd_default = jc->kd_default;
-    l->home = jc->home;
-    l->vel_fault = jc->vel_fault;
-    l->torque_fault = jc->tor_fault;
+    l->pos_limit_min = jc->pos_limit_min;
+    l->pos_limit_max = jc->pos_limit_max;
+    l->vel_limit = jc->vel_limit;
+    l->tor_limit = jc->tor_limit;
     return ARMS_OK;
 }
 
@@ -2269,11 +2265,6 @@ arms_status arms_free(arms_t *a, arms_mask joints, double kd)
         set_error("零力矩拖动: kd 必须是非负数");
         return ARMS_E_ARG;
     }
-    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j)
-        if ((joints & ARMS_MASK_JOINT(j)) && kd > a->cfg.joint[j].kd_max) {
-            set_error("零力矩拖动: kd %.3f 超过关节 %d 的 gain_max.kd %.3f", kd, j, a->cfg.joint[j].kd_max);
-            return ARMS_E_ARG;
-        }
     if (zero_pending(a, joints, "零力矩拖动")) return ARMS_E_STATE;
     if ((st = brake_to_normal(a, joints, "零力矩拖动")) != ARMS_OK) return st;
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
@@ -2288,7 +2279,7 @@ arms_status arms_free(arms_t *a, arms_mask joints, double kd)
         arms_command c;
         if (!(joints & ARMS_MASK_JOINT(j))) continue;
         arms_read_joint(a, j, &s);
-        c.position = s.cmd_position; /* kp = 0 时不起作用，取当前指令以通过限位 */
+        c.position = s.cmd_position; /* kp = 0 时位置不起作用 */
         c.velocity = 0.0;
         c.torque = 0.0;
         c.kp = 0.0;
@@ -2331,9 +2322,9 @@ arms_status arms_set_command(arms_t *a, int joint, const arms_command *cmd)
         set_error("关节 %d 未打开", joint);
         return ARMS_E_ARG;
     }
-    if (!isfinite(cmd->position) || !isfinite(cmd->velocity) || !isfinite(cmd->torque) || !isfinite(cmd->kp) ||
-        !isfinite(cmd->kd) || cmd->kp < 0.0 || cmd->kd < 0.0) {
-        set_error("关节 %d 的指令无效（数值非有限或增益为负）", joint);
+    /* kp、kd 不检查：为负或 NaN 时周期内按 0 下发（同参考 pack_cmd） */
+    if (!isfinite(cmd->position) || !isfinite(cmd->velocity) || !isfinite(cmd->torque)) {
+        set_error("关节 %d 的指令无效（位置、速度或前馈不是有限值）", joint);
         return ARMS_E_ARG;
     }
     arms_read_joint(a, joint, &s);

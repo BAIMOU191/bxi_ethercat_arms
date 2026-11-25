@@ -14,7 +14,7 @@ ros2 run arms_ros arms_node --ros-args -p mock:=true -p config:=$(realpath arms_
 
 | 接口 | 类型 / 约定 |
 |---|---|
-| hardware/actuators_cmds | communication/msg/ActuatorCmds；按 actuators_name 匹配，支持整机帧；五个数值数组与名称等长。取最新帧，检查 header.stamp、数值、重复双臂关节和已使能关节限位。时间戳须与节点同一时钟；未使能关节不会被命令隐式使能。 |
+| hardware/actuators_cmds | communication/msg/ActuatorCmds；按 actuators_name 匹配，支持整机帧；五个数值数组与名称等长。取最新帧，检查 header.stamp、重复双臂关节以及位置、速度、前馈是否为有限值；不按限位拒绝，指令原样交给驱动（kp、kd 为负或 NaN 时按 0，软位置限位越界后只屏蔽朝外的速度和前馈）。enable 后增益为 0，需由话题给出 kp、kd 才会出力。时间戳须与节点同一时钟；未使能关节不会被命令隐式使能。 |
 | hardware/joint_states | sensor_msgs/msg/JointState，100 Hz，仅发布本会话已打开关节 |
 | hardware/actuator_states | communication/msg/ActuatorStates，100 Hz；PDO 不含温度，温度用 NaN 表示未知，不用零伪装有效值 |
 | hardware/arms/diagnostics | diagnostic_msgs/msg/DiagnosticArray，2 Hz，按臂报告链路、WKC、故障关节掩码（fault_joints）、保护关节、屏蔽、启动缺失、被拒绝的命令计数和保持中的关节（held_joints） |

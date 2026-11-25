@@ -19,9 +19,6 @@
 #define REFRESH_NS UINT64_C(10000000)
 #define SWING_NS UINT64_C(5000000)
 #define TAU 6.28318530717958647693
-#define SETTLE_VEL 0.02                       /* 停稳判定速度 [rad/s] */
-#define SETTLE_NS UINT64_C(200000000)         /* 停稳需持续的时间 */
-#define SETTLE_MAX_NS (5 * NS_PER_S)          /* 停稳最长等待时间 */
 
 static arms_t *bus;
 static volatile sig_atomic_t *interrupted;
@@ -347,7 +344,6 @@ int motion_hold(arms_mask mask)
 typedef struct {
     int joint;
     double center;
-    arms_joint_limits limits;
     arms_command cmd;
 } target;
 
@@ -374,34 +370,10 @@ static int prepare(trajectory *p, arms_mask mask, arms_command cmd)
         target *t = &p->items[p->count++];
         t->joint = s->joint;
         t->center = s->cmd_position;
-        if (arms_get_limits(bus, t->joint, &t->limits) != ARMS_OK) {
-            tlog_err("无法读取关节 %d 的限位", t->joint);
-            return -1;
-        }
         t->cmd = cmd;
-        if (isnan(cmd.kp)) t->cmd.kp = t->limits.kp_default;
-        if (isnan(cmd.kd)) t->cmd.kd = t->limits.kd_default;
     }
     if (!p->count) tlog_err("没有可执行运动的已使能关节");
     return p->count ? 0 : -1;
-}
-
-static int in_range(int joint, const char *name, double value, double min, double max)
-{
-    if (isfinite(value) && value >= min && value <= max) return 1;
-    tlog_err("关节 %d: %s %.4f 超出范围 [%.4f, %.4f]；未下发指令", joint, name, value, min, max);
-    return 0;
-}
-
-static int validate(const target *t, double amplitude, double speed)
-{
-    const arms_joint_limits *l = &t->limits;
-    const arms_command *c = &t->cmd;
-    return in_range(t->joint, "位置(rad)", c->position - amplitude, l->pos_min, l->pos_max) &&
-           in_range(t->joint, "位置(rad)", c->position + amplitude, l->pos_min, l->pos_max) &&
-           in_range(t->joint, "kp", c->kp, 0.0, l->kp_max) && in_range(t->joint, "kd", c->kd, 0.0, l->kd_max) &&
-           in_range(t->joint, "速度(rad/s)", speed, -l->vel_max, l->vel_max) &&
-           in_range(t->joint, "前馈(N.m)", c->torque, -l->tff_max, l->tff_max);
 }
 
 static int send_target(const target *t)
@@ -435,16 +407,14 @@ int motion_mit(arms_mask mask, arms_command cmd)
     trajectory p;
     bool dynamic = cmd.velocity != 0.0 || cmd.torque != 0.0;
     if (prepare(&p, mask, cmd)) return -1;
-    for (size_t i = 0; i < p.count; ++i)
-        if (!validate(&p.items[i], 0.0, cmd.velocity)) return -1;
     if (submit(&p, dynamic)) return -1;
     /* 等待两个周期，使随后的 status 显示新指令 */
     sleep_until(now_ns() + 2 * arms_period_ns(bus) + 1000000);
     return 0;
 }
 
-/* 确认驱动已在新的反馈周期中采用目标指令；report 时再等关节停稳并报告误差。 */
-static int await_targets(const trajectory *p, bool allow_abort, bool report)
+/* 确认驱动已在新的反馈周期中采用目标指令 */
+static int await_targets(const trajectory *p)
 {
     uint64_t sent = now_ns(), deadline = sent + 2 * NS_PER_S;
     arms_joint_state state[ARMS_JOINT_COUNT];
@@ -466,60 +436,9 @@ static int await_targets(const trajectory *p, bool allow_abort, bool report)
             motion_hold(p->mask);
             return -1;
         }
-        if (!allow_abort) sleep_until(now_ns() + REFRESH_NS);
-        else if (motion_wait_or_enter(10)) {
-            tlog("运动已中止，保持当前指令位置");
-            return motion_hold(p->mask);
-        }
-    }
-    if (report) {
-        /* 所有关节速度持续低于 SETTLE_VEL 达 SETTLE_NS 视为停稳，最多等 SETTLE_MAX_NS */
-        uint64_t settle_deadline = now_ns() + SETTLE_MAX_NS, still_since = 0;
-        for (;;) {
-            bool still = true;
-            for (size_t i = 0; i < p->count; ++i) {
-                if (arms_read_joint(bus, p->items[i].joint, &state[i]) != ARMS_OK ||
-                    state[i].mode != ARMS_JS_ENABLED) {
-                    tlog_err("关节 %d 反馈不可用或已退出使能，停止运动", p->items[i].joint);
-                    motion_hold(p->mask);
-                    return -1;
-                }
-                if (fabs(state[i].velocity) > SETTLE_VEL) still = false;
-            }
-            uint64_t now = now_ns();
-            if (!still) still_since = 0;
-            else if (!still_since) still_since = now;
-            if (still_since && now - still_since >= SETTLE_NS) break;
-            if (now >= settle_deadline) {
-                tlog("等待关节停稳超时，按当前反馈报告");
-                break;
-            }
-            if (!allow_abort) sleep_until(now + REFRESH_NS);
-            else if (motion_wait_or_enter(10)) {
-                tlog("运动已中止，保持当前指令位置");
-                return motion_hold(p->mask);
-            }
-        }
-        for (size_t i = 0; i < p->count; ++i) {
-            double goal = p->items[i].cmd.position, actual = state[i].position;
-            tlog("关节 %d 目标 %.4f 实际 %.4f 误差(目标-实际) %+.4f rad", p->items[i].joint, goal, actual, goal - actual);
-        }
+        sleep_until(now_ns() + REFRESH_NS);
     }
     return 0;
-}
-
-int motion_home(arms_mask mask)
-{
-    arms_command cmd = {.kp = NAN, .kd = NAN};
-    trajectory p;
-    if (prepare(&p, mask, cmd)) return -1;
-    for (size_t i = 0; i < p.count; ++i) {
-        p.items[i].cmd.position = p.items[i].limits.home;
-        if (!validate(&p.items[i], 0.0, 0.0)) return -1;
-    }
-    tlog("回零: 直接下发 home 目标；回车或 Ctrl+C 中止并保持");
-    if (submit(&p, false)) return -1;
-    return await_targets(&p, true, true);
 }
 
 int motion_swing(arms_mask mask, double amplitude, double period, long count, double kp, double kd)
@@ -533,11 +452,7 @@ int motion_swing(arms_mask mask, double amplitude, double period, long count, do
         return -1;
     }
     if (prepare(&p, mask, cmd)) return -1;
-    for (size_t i = 0; i < p.count; ++i) {
-        target *t = &p.items[i];
-        t->cmd.position = t->center;
-        if (!validate(t, amplitude, peak)) return -1;
-    }
+    for (size_t i = 0; i < p.count; ++i) p.items[i].cmd.position = p.items[i].center;
     motion_cancel_refresh(mask);
     tlog("正弦摆动: 幅值 %.4f rad 周期 %.4f s，共 %ld 次；回车或 Ctrl+C 中止", amplitude, period, count);
     uint64_t start = now_ns(), tick = start;
@@ -582,5 +497,5 @@ int motion_swing(arms_mask mask, double amplitude, double period, long count, do
         p.items[i].cmd.velocity = 0.0;
     }
     if (submit(&p, false)) return -1;
-    return await_targets(&p, false, false);
+    return await_targets(&p);
 }

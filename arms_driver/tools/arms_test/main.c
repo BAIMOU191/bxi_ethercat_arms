@@ -48,7 +48,8 @@ static void on_sigint(int sig)
     int saved_errno = errno;
     if (sig == SIGTERM) {
         g_terminate = 1;
-        (void)write(stop_pipe[1], "!", 1);
+        ssize_t n = write(stop_pipe[1], "!", 1);
+        (void)n;
     }
     g_interrupted = 1;
     errno = saved_errno;
@@ -160,7 +161,7 @@ static int cmd_status(int argc, char **argv)
             continue;
         }
         snprintf(where, sizeof(where), "%s/%d", s.arm == 0 ? "L" : "R", s.slave);
-        if (s.cmd_limited) flags[n++] = 'L';
+        if (s.cmd_pos_blocked) flags[n++] = 'P';
         if (s.cmd_timeout) flags[n++] = 'T';
         if (!n) flags[n++] = '-';
         flags[n] = '\0';
@@ -331,6 +332,7 @@ static int cmd_enable(int argc, char **argv)
         return bad_args("-t 需要非负整数毫秒数");
     if (arms_enable(g_arms, mask, (unsigned int)ms) != ARMS_OK) return failed("使能失败: %s", arms_last_error());
     show_modes(mask, true);
+    tlog("注意: 使能后指令为零（kp=0、kd=0，零力矩），抱闸已松开，受重力的关节会下落；用 mit 下发指令");
     return ok();
 }
 
@@ -364,35 +366,26 @@ static int cmd_hold(int argc, char **argv)
 static int cmd_mit(int argc, char **argv)
 {
     arms_mask mask;
-    arms_command c = {.kp = NAN, .kd = NAN};
+    arms_command c = {0};
     double *fields[] = {&c.position, &c.kp, &c.kd, &c.velocity, &c.torque};
-    if (argc < 3 || argc > 7) return bad_args("请指定关节、目标位置及可选参数");
+    if (argc < 5 || argc > 7) return bad_args("请指定关节、位置、kp、kd，速度和前馈可选");
     if (selection(argv[1], &mask)) return -2;
     for (int i = 2; i < argc; ++i)
         if (!number(argv[i], fields[i - 2])) return bad_args("运动参数必须是有限数值");
     return motion_mit(mask, c) ? -2 : ok();
 }
 
-static int cmd_home(int argc, char **argv)
-{
-    arms_mask mask;
-    if (argc > 2) return bad_args("只接受一个可选的关节参数");
-    if (selection(argc == 2 ? argv[1] : NULL, &mask)) return -2;
-    if (argc == 1) mask &= motion_enabled();
-    return motion_home(mask) ? -2 : ok();
-}
-
 static int cmd_swing(int argc, char **argv)
 {
     arms_mask mask;
-    double amplitude, period = 4.0, kp = NAN, kd = NAN;
-    long count = 3;
+    double amplitude, period, kp, kd;
+    long count;
     if (selection(argv[1], &mask)) return -2;
     if (!number(argv[2], &amplitude) || amplitude < 0.0) return bad_args("幅值必须为非负有限数值");
-    if (argc > 3 && (!number(argv[3], &period) || period <= 0.0)) return bad_args("周期必须为正数");
-    if (argc > 4 && !integer(argv[4], 1, LONG_MAX, &count)) return bad_args("次数必须为正整数");
-    if (argc > 5 && !number(argv[5], &kp)) return bad_args("kp 必须是有限数值");
-    if (argc > 6 && !number(argv[6], &kd)) return bad_args("kd 必须是有限数值");
+    if (!number(argv[3], &period) || period <= 0.0) return bad_args("周期必须为正数");
+    if (!integer(argv[4], 1, LONG_MAX, &count)) return bad_args("次数必须为正整数");
+    if (!number(argv[5], &kp)) return bad_args("kp 必须是有限数值");
+    if (!number(argv[6], &kd)) return bad_args("kd 必须是有限数值");
     return motion_swing(mask, amplitude, period, count, kp, kd) ? -2 : ok();
 }
 
@@ -545,31 +538,32 @@ static int cmd_commtest(int argc, char **argv)
     long seconds;
     arms_bus_stats st;
     arms_mask all = arms_opened_joints(g_arms);
-    bool enabled = argc == 3, pass = true;
+    bool enabled = argc == 5, pass = true;
     const char *label = enabled ? "伺服使能，" : "";
     int32_t loss_base[ARMS_JOINT_LAST + 1];
+    double hold_kp = 0.0, hold_kd = 0.0;
     long t;
     int i;
     if (!integer(argv[1], 1, 86400, &seconds)) return bad_args("秒数必须是 1..86400 的整数");
-    if (enabled && strcmp(argv[2], "--enabled")) return bad_args("可选参数为 --enabled");
-    if (!enabled && motion_enabled()) return failed("常规通信测试需要全部关节失能；带载测试请使用 --enabled");
+    if (argc != 2 && (argc != 5 || strcmp(argv[2], "--enabled") || !number(argv[3], &hold_kp) ||
+                      !number(argv[4], &hold_kd)))
+        return bad_args("可选参数为 --enabled <kp> <kd>（使能后以该增益保持当前位置）");
+    if (!enabled && motion_enabled()) return failed("常规通信测试需要全部关节失能；带载测试请使用 --enabled <kp> <kd>");
     if (enabled) {
-        arms_mask already = motion_enabled();
         if (motion_hold(all)) goto enable_error;
         if (arms_enable(g_arms, all, 0) != ARMS_OK) {
             failed("伺服使能失败: %s", arms_last_error());
             goto enable_error;
         }
-        /* 新使能的关节由驱动保持原位；原先已使能的关节也须撤销原运动目标。 */
+        /* 使能后指令为零，立即以给定增益保持当前位置 */
         for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
             arms_joint_state s;
-            arms_joint_limits l;
-            if (!(already & ARMS_MASK_JOINT(j))) continue;
-            if (arms_read_joint(g_arms, j, &s) != ARMS_OK || arms_get_limits(g_arms, j, &l) != ARMS_OK) {
-                failed("无法读取关节 %d 的原位与默认增益", j);
+            if (!(all & ARMS_MASK_JOINT(j))) continue;
+            if (arms_read_joint(g_arms, j, &s) != ARMS_OK) {
+                failed("无法读取关节 %d 的当前位置", j);
                 goto enable_error;
             }
-            arms_command cmd = {.position = s.position, .kp = l.kp_default, .kd = l.kd_default};
+            arms_command cmd = {.position = s.position, .kp = hold_kp, .kd = hold_kd};
             if (arms_set_command(g_arms, j, &cmd) != ARMS_OK) {
                 failed("关节 %d 无法保持原位: %s", j, arms_last_error());
                 goto enable_error;
@@ -721,10 +715,10 @@ static int cmd_info(int argc, char **argv)
             arms_joint_limits l;
             arms_get_joint_info(g_arms, j, &q);
             arms_get_limits(g_arms, j, &l);
-            printf("    方向 %+d 偏置 %.6f rad 回零位置 %.4f rad\n", q.direction, q.offset_rad, l.home);
-            printf("    指令限幅: 位置 [%.3f, %.3f] rad 速度 %.3f rad/s 前馈 %.3f N.m Kp/Kd上限 %.2f/%.2f\n",
-                   l.pos_min, l.pos_max, l.vel_max, l.tff_max, l.kp_max, l.kd_max);
-            printf("    反馈保护: 速度 %.3f rad/s 力矩 %.3f N.m\n", l.vel_fault, l.torque_fault);
+            printf("    方向 %+d 偏置 %.6f rad\n", q.direction, q.offset_rad);
+            printf("    软位置限位 pos_limit [%.3f, %.3f] rad（越界后屏蔽朝外的速度和前馈，不截断指令）\n",
+                   l.pos_limit_min, l.pos_limit_max);
+            printf("    反馈保护: vel_limit %.3f rad/s  tor_limit %.3f N.m\n", l.vel_limit, l.tor_limit);
         }
     }
     return ok();
@@ -1136,7 +1130,8 @@ static const command commands[] = {
      "  关节写法: 21 | l_wrist_z | left | right | all | 15-18 | 21,28（默认全部已打开关节）\n"
      "  状态: offline / preop / safeop / locked（OP，伺服失能）/ enabled / FAULT\n"
      "        released / held（失能，且抱闸为强制松闸 / 强制抱闸）\n"
-     "  cmd、kp、kd 为实际下发的位置和增益；L=限幅，T=超时，flt=累计故障次数。\n"
+     "  cmd、kp、kd 为实际下发的位置和增益；P=实际位置超出 pos_limit，朝外的速度和前馈已清零，\n"
+     "  T=超时，flt=累计故障次数。\n"
      "  温度为执行器温度（Pn002=77 的监控量），约每 2 秒更新；- 表示尚未读到。",
      "  status\n  status left\n  status 21", cmd_status},
     {"diag", "查看", "[关节] [reset]", 0, 2, "显示执行器温度、驱动器丢帧次数和各从站 ESC 错误计数",
@@ -1160,7 +1155,9 @@ static const command commands[] = {
      "  bus\n  bus reset", cmd_bus},
     {"info", "查看", "[关节]", 0, 1, "显示版本、配置文件、周期、实时 CPU、关节与总线位置的对应关系", "",
      "  info", cmd_info},
-    {"enable", "控制", "<关节> [-t 毫秒]", 1, 3, "使能并显示模式和当前位置",
+    {"enable", "控制", "<关节> [-t 毫秒]", 1, 3, "使能并显示模式和当前位置（使能后零力矩）",
+     "  与参考 hw_lib 一致，使能后指令为零：kp=0、kd=0、速度 0、前馈 0。正常控制抱闸下使能会松开抱闸，\n"
+     "  受重力的关节会下落，先托住，或使能后立即用 mit 下发带增益的指令。\n"
      "  -t 指定等待超时；0 或省略时使用驱动默认值。\n"
      "  抱闸为强制松闸（Pn075=1）或强制抱闸（Pn075=2）的关节，先自动切回正常控制抱闸（Pn075=0），不保存。",
      "  enable left -t 2000", cmd_enable},
@@ -1168,26 +1165,25 @@ static const command commands[] = {
      cmd_disable},
     {"reset", "控制", "<关节>", 1, 1, "故障复位并显示模式", "  复位后处于失能状态，运动前须重新使能。",
      "  reset 17", cmd_reset},
-    {"mit", "控制", "<关节> <位置> [kp] [kd] [速度] [前馈]", 2, 6, "下发 MIT 指令",
-     "  位置单位 rad，速度 rad/s，前馈 N.m。增益默认取各关节配置，速度和前馈默认为 0。\n"
-     "  指令下一周期直接生效，不做轨迹插值：目标离当前位置较远时关节会快速跳向目标，\n"
-     "  请小步给定或降低 kp。非零速度或前馈持续刷新。所有关节均须已使能且目标不超限。",
-     "  mit 17 0.1\n  mit 18 0.1 2 0.1 0.05", cmd_mit},
+    {"mit", "控制", "<关节> <位置> <kp> <kd> [速度] [前馈]", 4, 6, "下发 MIT 指令",
+     "  位置单位 rad，速度 rad/s，前馈 N.m；kp、kd 必填，速度和前馈默认为 0。\n"
+     "  与参考 hw_lib 一致，指令原样下发，不插值、不限幅：目标离当前位置较远时关节会快速跳向目标，\n"
+     "  请小步给定或降低 kp。kp、kd 为负时按 0 下发。实际位置超出 pos_limit 时，朝外的速度和前馈被清零。\n"
+     "  非零速度或前馈持续刷新。所有关节均须已使能。",
+     "  mit 17 0.1 5 0.5\n  mit 18 0.1 2 0.1 0.05", cmd_mit},
     {"hold", "控制", "[关节]", 0, 1, "停止刷新并保持当前指令位置",
-     "  清零速度与前馈，保留增益；缺省作用于全部已打开关节。", "  hold", cmd_hold},
-    {"home", "控制", "[关节]", 0, 1, "以默认增益直接下发各关节的 home 位置",
-     "  不做轨迹插值，关节以默认增益跳向 home。不指定关节时只作用于已使能关节。\n"
-     "  等关节停稳后报告误差；回车或 Ctrl+C 中止并保持。", "  home all", cmd_home},
-    {"swing", "测试", "<关节> <幅值> [周期秒] [次数] [kp] [kd]", 2, 6, "以当前指令位置为中心正弦摆动",
-     "  幅值单位 rad，默认周期 4 秒、3 次、各关节默认增益。结束时回到中心；回车或 Ctrl+C 中止并保持当前指令位置。",
-     "  swing 17 0.05 1 1", cmd_swing},
+     "  清零速度与前馈，保留当前的 kp、kd 和位置；缺省作用于全部已打开关节。\n"
+     "  使能后尚未下发过指令时 kp=0，hold 不产生保持力。", "  hold", cmd_hold},
+    {"swing", "测试", "<关节> <幅值> <周期秒> <次数> <kp> <kd>", 6, 6, "以当前指令位置为中心正弦摆动",
+     "  幅值单位 rad。结束时回到中心；回车或 Ctrl+C 中止并保持当前指令位置。",
+     "  swing 17 0.05 4 3 5 0.5", cmd_swing},
     {"selftest", "查看", "", 0, 0, "检查在线状态、故障与保护锁定", "不使能或移动关节。", "  selftest",
      cmd_selftest},
     {"identify", "查看", "<关节>", 1, 1, "读取从站身份、序列号与配置映射", "不移动关节。", "  identify 21",
      cmd_service},
     {"free", "控制", "<关节> [kd]", 1, 2, "零力矩拖动：使能后 kp=0，可用手转动关节",
-     "  关节写法同 status：21 | 15-18 | left | right | all。kd 为阻尼，默认 0（最轻），不超过 gain_max.kd。\n"
-     "  关节没有保持力，肩、肘会因重力下落，执行前先托住。超过 vel_fault 会触发超速保护。\n"
+     "  关节写法同 status：21 | 15-18 | left | right | all。kd 为阻尼，默认 0（最轻）。\n"
+     "  关节没有保持力，肩、肘会因重力下落，执行前先托住。超过 vel_limit 会触发超速保护。\n"
      "  先支撑关节再 disable；hold 保留 kp=0，不会恢复位置保持力。\n  抱闸为强制松闸或强制抱闸时，先自动切回正常控制抱闸（Pn075=0）。",
      "  free 21\n  free left 0.2", cmd_free},
     {"brake", "维护", "<关节> [normal|release|hold]", 1, 2, "查看或临时设置抱闸模式（Pn075）",
@@ -1230,13 +1226,14 @@ static const command commands[] = {
      "  外部断电或断线时同样会在恢复后自动重连，不需要重启程序。\n"
      "  仅支持具备 PCI 电源接口的硬件会话。",
      "  power off\n  power on\n  power status", cmd_power},
-    {"commtest", "测试", "<秒> [--enabled]", 1, 2, "测试通信质量；可选伺服使能测试",
-     "  默认要求全部关节失能；--enabled 使能全部已打开关节并保持原位，结束或中止后全部失能。\n  清零统计后每 "
+    {"commtest", "测试", "<秒> [--enabled <kp> <kd>]", 1, 4, "测试通信质量；可选伺服使能测试",
+     "  默认要求全部关节失能；--enabled 使能全部已打开关节，并以给定 kp、kd 保持当前位置，\n"
+     "  结束或中止后全部失能。使能到下发保持指令之间是零力矩，先托住手臂。\n  清零统计后每 "
      "10 秒打印一次进度。\n"
      "  开始时清零 ESC 错误计数，结束时列出错误计数非零或驱动器丢帧增加的关节。\n"
      "  通过条件: WKC 异常 0 次、发送错误 0 次、无超时周期、无跳过周期、无线路类 ESC 错误计数、驱动器丢帧不增加；\n"
      "  只有处理类计数（从站拒绝的帧）时给出提示，不判为不通过",
-     "  commtest 300\n  commtest 2 --enabled", cmd_commtest},
+     "  commtest 300\n  commtest 60 --enabled 5 0.5", cmd_commtest},
     {"version", "通用", "", 0, 0, "显示版本", "", "  version", cmd_version},
     {"quit", "通用", "", 0, 0, "退出：停止通信并释放主站", "  也可以用 exit 或 q", "  quit", cmd_quit},
 };
@@ -1264,7 +1261,7 @@ static void complete_command(size_t argc, const char *const argv[], le_choices *
     if (argc == 1) le_add_choice(out, "--help");
     const cmd_fn fn = c->fn;
     bool takes_joints = fn == cmd_status || fn == cmd_watch || fn == cmd_info || fn == cmd_enable ||
-                        fn == cmd_disable || fn == cmd_reset || fn == cmd_hold || fn == cmd_mit || fn == cmd_home ||
+                        fn == cmd_disable || fn == cmd_reset || fn == cmd_hold || fn == cmd_mit ||
                         fn == cmd_swing || fn == cmd_free || fn == cmd_brake || fn == cmd_multi_service ||
                         fn == cmd_service || fn == cmd_parameter || fn == cmd_diag;
     if ((argc == 1 && takes_joints) ||

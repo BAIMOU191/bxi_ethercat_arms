@@ -112,8 +112,8 @@ if(BUILD_TESTING)
   add_test(NAME comm_event_log COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_events.py
     $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
   add_test(NAME mock_session COMMAND arms_test --mock -c ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json
-           -e "status" -e "bus" -e "enable all" -e "mit 17 0.1" -e "home all"
-           -e "swing 17 0.05 1 1" -e "mit 18 0.1 2 0.1 0.05" -e "hold" -e "commtest 2 --enabled"
+           -e "status" -e "bus" -e "enable all" -e "mit 17 0.1 5 0.5"
+           -e "swing 17 0.05 1 1 5 0.5" -e "mit 18 0.1 2 0.1 0.05" -e "hold" -e "commtest 2 --enabled 5 0.5"
            -e "disable" -e "status" -e "help")
 endif()
 

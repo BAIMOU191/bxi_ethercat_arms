@@ -128,13 +128,13 @@ typedef struct {
     double torque;          /**< 输出端力矩 [N.m] */
     uint64_t sample_ns;     /**< 采样时刻，CLOCK_MONOTONIC */
 
-    /* 本周期实际下发的指令（关节侧，已限幅） */
+    /* 本周期实际下发的指令（关节侧） */
     double cmd_position;    /**< [rad] */
     double cmd_velocity;    /**< [rad/s] */
     double cmd_torque;      /**< 前馈力矩 [N.m] */
     double cmd_kp;
     double cmd_kd;
-    bool cmd_limited;       /**< 本周期指令被限幅 */
+    bool cmd_pos_blocked;   /**< 实际位置超出软位置限位，本周期朝外的速度和前馈已清零 */
     bool cmd_timeout;       /**< 指令超时，已按 safety.timeout_action 处理 */
     uint32_t fault_count;   /**< 打开以来进入故障的次数 */
 
@@ -180,8 +180,8 @@ typedef struct {
 /** 保护原因 */
 typedef enum {
     ARMS_PROTECT_NONE = 0,
-    ARMS_PROTECT_OVERSPEED,  /**< 反馈速度超过 limit.vel_fault 累计 safety.overspeed_ms */
-    ARMS_PROTECT_OVERTORQUE, /**< 反馈力矩超过 limit.torque_fault 累计 safety.overtorque_ms */
+    ARMS_PROTECT_OVERSPEED,  /**< 反馈速度超过 vel_limit 累计 safety.overspeed_ms */
+    ARMS_PROTECT_OVERTORQUE, /**< 反馈力矩超过 tor_limit 累计 safety.overtorque_ms */
     ARMS_PROTECT_OVERTEMP,   /**< 执行器温度达到 safety.temp_max_c */
 } arms_protect_reason;
 
@@ -321,16 +321,15 @@ int arms_joint_by_name(const arms_t *arms, const char *name);
 /** @brief 臂名称 "left" / "right" */
 const char *arms_arm_name(int arm);
 
-/** 关节限位与默认增益（关节侧） */
+/**
+ * 关节限位（关节侧），与参考 hw_lib 的 motor_info_t 对应，均只看反馈、不截断指令：
+ * 实际位置超出 pos_limit 后，朝越界方向的速度和前馈被清零（软位置限位）；
+ * 实际速度、力矩持续超过 vel_limit、tor_limit 触发超速、超力矩保护。
+ */
 typedef struct {
-    double pos_min, pos_max;  /**< [rad] */
-    double vel_max;           /**< [rad/s] */
-    double tff_max;           /**< [N.m] */
-    double kp_max, kd_max;
-    double kp_default, kd_default;
-    double home;              /**< 回零位置 [rad] */
-    double vel_fault;         /**< 反馈速度保护阈值 [rad/s] */
-    double torque_fault;      /**< 反馈力矩保护阈值 [N.m] */
+    double pos_limit_min, pos_limit_max; /**< [rad] */
+    double vel_limit;                    /**< [rad/s] */
+    double tor_limit;                    /**< [N.m] */
 } arms_joint_limits;
 
 /** @brief 读取关节限位，关节未打开时返回 ARMS_E_ARG */
@@ -341,7 +340,8 @@ arms_status arms_get_limits(const arms_t *arms, int joint, arms_joint_limits *li
  * @param joints 关节掩码，只作用于已打开的关节
  * @param timeout_ms 等待全部关节进入使能的超时，0 表示 1000 ms
  *
- * 使能时目标位置取当前实际位置，增益为 gain_default，因此关节保持原位。
+ * 与参考 hw_lib 一致，使能后指令为零：目标位置取当前实际位置，kp、kd、速度、前馈均为 0，
+ * 即零力矩。正常控制抱闸下使能会松开抱闸，受重力的关节会下落，须先支撑或在使能后立即下发指令。
  * 已使能的关节不受影响。处于故障的关节需先 arms_reset()。
  * 所选关节的 Pn075 为 1（强制松闸）或 2（强制抱闸）时，先自动写回 0（正常控制抱闸）
  * 并回读确认，不保存到驱动器；写入或回读失败则拒绝使能。
@@ -372,8 +372,10 @@ typedef struct {
 /**
  * @brief 写入单个关节的 MIT 指令，下一周期原样生效
  *
- * 驱动不做轨迹插值，平滑由调用方负责。只对已使能的关节有效。各量在周期内按
- * limit / gain_max 限幅。调用方需在 safety.command_timeout_ms 内持续刷新，否则按
+ * 驱动不做轨迹插值，也不限幅，与参考 hw_lib 一致：位置、速度、前馈原样下发，kp、kd 为负或
+ * NaN 时按 0 下发（同参考 pack_cmd）。唯一的调整是软位置限位：实际位置越界后，朝越界方向的
+ * 速度和前馈被清零。位置、速度、前馈必须是有限值，否则返回 ARMS_E_ARG。
+ * 只对已使能的关节有效。调用方需在 safety.command_timeout_ms 内持续刷新，否则按
  * safety.timeout_action 处理。可在任意非实时线程调用。
  */
 arms_status arms_set_command(arms_t *arms, int joint, const arms_command *command);
@@ -383,7 +385,7 @@ arms_status arms_hold(arms_t *arms, arms_mask joints);
 
 /**
  * @brief 零力矩拖动：使能关节（已使能的保持使能），下发 kp = 0、速度 0、前馈 0、阻尼 kd
- * @param kd 阻尼，0 表示完全自由，须不超过 gain_max.kd
+ * @param kd 阻尼，0 表示完全自由，须为非负有限值
  *
  * 关节没有保持力，会受重力下落。先支撑关节再失能；arms_hold() 保留 kp=0，不会恢复位置保持力。
  * 抱闸模式处理同 arms_enable()：强制松闸或强制抱闸的关节先自动切回正常控制抱闸。

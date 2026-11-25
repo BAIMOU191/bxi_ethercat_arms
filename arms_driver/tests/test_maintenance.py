@@ -47,11 +47,12 @@ with tempfile.TemporaryDirectory() as tmp:
     assert out.count('release (Pn075=1') >= 2 and '自动切为正常控制' not in out, out
     # 使能中的关节拒绝强制松闸
     run('enable 21', 'brake 21 release', ok=False)
-    # 零力矩拖动：kp = 0；kd 不超过上限
+    # 零力矩拖动：kp = 0；kd 不设上限，只要求非负有限值
     out = run('free 21 0.2', 'status 21')
     row = next(l.split() for l in out.splitlines() if l.startswith('21 ') and 'L/6' in l)
     assert row[3] == 'enabled' and float(row[11]) == 0.0 and abs(float(row[12]) - 0.2) < 1e-9, row
-    run('free 21 99', ok=False)
+    run('free 21 99')
+    run('free 21 -1', ok=False)
     # 参数读写、保存、硬件校零
     out = run('pn 21 Pn075', 'pn 21 028 12', 'pn 21 28', 'sdo 21 0x2028 0',
               'pn_save all', 'zero 21')
@@ -144,13 +145,28 @@ with tempfile.TemporaryDirectory() as tmp:
         run(cmd, env={'ARMS_MOCK_PN075_UNREADABLE': '1'}, ok=False)
     # 修改副本中的安全字段类型时，启动必须报配置错误，而不能沿用默认值。
     valid = config.read_text()
-    for parent, field in [(data['joints'][0]['limit'], 'vel'), (data['joints'][0], 'offset_rad'),
-                          (data, 'safety'), (data['joints'][0], 'gain_max')]:
+    for parent, field in [(data['joint_defaults'], 'vel_limit'), (data['joints'][0], 'offset_rad'),
+                          (data, 'safety'), (data['joint_defaults'], 'pos_limit')]:
         previous = parent[field]
         parent[field] = 'bad-type'
         config.write_text(json.dumps(data))
         run('check', ok=False)
         parent[field] = previous
+    config.write_text(valid)
+    # 旧格式字段（limit、gain_max、gain_default、home）直接报错，提示用转换脚本
+    for field, value in [('limit', {'vel': 1.0}), ('gain_max', {'kp': 5}), ('gain_default', {'kp': 5}), ('home', 0.0)]:
+        data['joints'][0][field] = value
+        config.write_text(json.dumps(data))
+        out = run('check', ok=False)
+        assert 'migrate_config.py' in out, out
+        del data['joints'][0][field]
+    # 关节可以单独覆盖 joint_defaults 中的保护参数
+    data['joints'][0]['pos_limit'] = [-1.0, 1.0]
+    data['joints'][0]['tor_limit'] = 12.5
+    config.write_text(json.dumps(data))
+    out = run('info 15')
+    assert '[-1.000, 1.000]' in out and 'tor_limit 12.500' in out, out
+    del data['joints'][0]['pos_limit'], data['joints'][0]['tor_limit']
     config.write_text(valid)
     env={'ARMS_MOCK_SLAVES':'5'}
     run('check',env=env,options=('--check',),ok=False)
