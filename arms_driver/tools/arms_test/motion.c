@@ -178,10 +178,24 @@ static int take_snapshot(snapshot *s)
            arms_get_stats(bus, &s->stats) == ARMS_OK;
 }
 
+/* 把驱动记录的通信事件写入日志文件；写入失败只提示一次 */
+static void flush_events(void)
+{
+    static bool warned;
+    int n = arms_log_events(bus);
+    if (n > 0) {
+        tlog("已记录 %d 条通信事件: %s", n, arms_event_log_path(bus));
+    } else if (n < 0 && !warned) {
+        tlog_err("通信事件日志写入失败: %s", arms_last_error());
+        warned = true;
+    }
+}
+
 static void monitor_faults(void)
 {
     snapshot s;
     bool report[ARMS_ARM_COUNT] = {false};
+    flush_events();
     if (!take_snapshot(&s)) return;
     /* 同一会话中，arms_read 始终按相同顺序返回全部已打开关节。 */
     for (size_t i = 0; i < s.count; ++i) {

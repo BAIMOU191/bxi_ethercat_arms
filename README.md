@@ -139,3 +139,9 @@ cd arms_driver
 ```
 
 维护、自检、校零、设备身份校验和现场验收见 [阶段 4/5 使用说明](docs/phase4-5.md)。ROS 构建、服务和话题见 [arms_ros](arms_ros/README.md)。开机服务模板在 deploy/，不会在构建或安装源码时启用。
+
+## 通信事件日志
+
+`arms_test` 和 `arms_node` 运行时，驱动在实时线程中记录最近 64 个周期的时序，发生以下事件时把它连同两臂链路、WKC 计数和各从站 AL 状态追加到日志文件：WKC 异常（每臂每秒最多一条）、通信失败、通信恢复、周期延迟（两次周期开始间隔超过 1.5 个周期，每秒最多一条）、离线保护触发。
+
+默认文件为 `arms_driver/logs/comm_events.log`（配置文件所在 `config/` 目录旁的 `logs/`），`arms_test --event-log FILE` 或 ROS 参数 `event_log` 可指定其他路径；无法写入时改用 `/tmp/arms_comm_events.log`。每条事件给出发生时刻和对照内核日志的命令，表中“发送→接收us”是上一周期发送结束到本周期接收的间隔，正常接近一个周期；接近 0 说明帧尚未返回就被读取。

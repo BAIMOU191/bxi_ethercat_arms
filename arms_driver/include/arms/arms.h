@@ -90,6 +90,7 @@ typedef struct {
     int64_t ignore_mask;          /**< 屏蔽掩码，第 n 位对应关节 n，屏蔽的关节不打开、不检查；-1 取配置 */
     arms_log_fn log;              /**< 启动过程日志 */
     void *log_user;
+    const char *event_log;        /**< 通信事件日志文件；NULL 表示配置目录旁的 logs/comm_events.log */
 } arms_options;
 
 /** @brief 填充 arms_options 默认值 */
@@ -251,6 +252,21 @@ arms_status arms_get_stats(arms_t *arms, arms_bus_stats *stats);
 
 /** @brief 清零通信统计（下一周期生效） */
 void arms_reset_stats(arms_t *arms);
+
+/**
+ * @brief 把周期上下文记录的通信事件追加到日志文件
+ *
+ * 在非实时线程中周期调用（例如每 100 ms），退出前再调用一次。记录的事件：
+ * WKC 异常（每臂每秒最多一条，其余计入下一条的“限速期间另有”）、通信失败、通信恢复、
+ * 周期延迟（两次周期开始间隔超过 1.5 个周期，每秒最多一条）、离线保护触发。
+ * 每条事件附带此前最近 64 个周期的时序（周期间隔、唤醒延迟、发送结束到接收的间隔、
+ * 处理耗时、两臂 WKC），以及两臂链路、WKC 计数和各从站 AL 状态。
+ * @return 本次写入的事件数；无法写入时返回 -1，arms_last_error() 说明原因
+ */
+int arms_log_events(arms_t *arms);
+
+/** @brief 通信事件日志文件路径（无法写入原路径时会改用 /tmp/arms_comm_events.log） */
+const char *arms_event_log_path(const arms_t *arms);
 
 unsigned int arms_cycle_hz(const arms_t *arms);
 arms_run_mode arms_mode(const arms_t *arms);

@@ -10,7 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -139,6 +141,44 @@ typedef struct {
     double recv_us_max, send_us_max;
 } arm_rt;
 
+/* ---- 通信事件记录：周期上下文写入，管理线程读出后写日志文件 ---- */
+#define TRACE_LEN 64u   /* 每条事件附带的最近周期数 */
+#define EVENT_RING 16u  /* 尚未写出的事件最多保留条数 */
+enum { EVT_WKC = 0, EVT_FAIL, EVT_RECOVER, EVT_LATE, EVT_TRIP, EVT_KINDS };
+
+typedef struct {
+    uint64_t cycle;
+    uint64_t start_ns;          /* 周期开始时刻（CLOCK_MONOTONIC） */
+    uint32_t period_ns;         /* 与上一周期开始的间隔 */
+    uint32_t late_ns;           /* 唤醒延迟（独立模式） */
+    uint32_t gap_ns;            /* 上一周期发送结束到本周期开始接收的间隔 */
+    uint32_t work_ns;           /* 本周期从接收开始到发送结束的耗时 */
+    uint16_t wkc[ARMS_ARM_COUNT];
+} trace_entry;
+
+typedef struct {
+    int kind, which_arm;        /* which_arm 为 -1 表示与具体臂无关 */
+    uint32_t suppressed;        /* 限速期间未单独记录的同类事件数 */
+    uint64_t cycle, mono_ns;
+    int64_t real_ns;
+    uint64_t skipped, overruns;
+    struct {
+        bool used, link_up, comm_failed;
+        int count;
+        uint32_t wkc, wkc_expected, consecutive;
+        uint64_t wkc_bad;
+        uint8_t al[BUS_MAX_SLAVES];
+    } arm[ARMS_ARM_COUNT];
+    unsigned int n;             /* trace 中的有效条数 */
+    trace_entry trace[TRACE_LEN]; /* 旧 → 新 */
+} event_record;
+
+#define WORDS_UP(T) ((sizeof(T) + sizeof(uintptr_t) - 1) / sizeof(uintptr_t))
+typedef union {
+    event_record r;
+    uintptr_t w[WORDS_UP(event_record)];
+} event_buf;
+
 typedef struct {
     arms_joint_state s[ARMS_JOINT_LAST + 1];
     arms_bus_stats stats;
@@ -249,6 +289,20 @@ struct arms {
     uint64_t stable_cycles, ready_cycles;
     uint64_t open_ns, activated_ns;   /* arms_open 开始、主站激活的时刻 */
     atomic_ullong ready_ns;           /* 预热完成的时刻 */
+
+    /* 通信事件记录。trace 与限速计数仅在周期上下文访问；事件环按 seqlock 方式发布 */
+    trace_entry trace[TRACE_LEN];
+    uint64_t trace_count;
+    uint64_t wake_late_ns, last_tx_end_ns;
+    uint64_t evt_last_ns[EVT_KINDS][ARMS_ARM_COUNT];
+    uint32_t evt_suppressed[EVT_KINDS][ARMS_ARM_COUNT];
+    event_buf evt_scratch;
+    atomic_uintptr_t evt_words[EVENT_RING][WORDS_UP(event_record)];
+    atomic_ullong evt_begin;          /* 正在写入的事件序号 + 1 */
+    atomic_ullong evt_count;          /* 已完整写入的事件数 */
+    uint64_t evt_read;                /* 已写到日志文件的事件数，仅管理线程访问 */
+    bool evt_header_done;
+    char event_log[PATH_MAX];
 };
 
 static void post(arms_t *a, arms_mask joints, unsigned int req);
@@ -412,22 +466,99 @@ static void check_limits(arms_t *a, int j, const arms_joint_state *s)
     }
 }
 
+/*
+ * 记录一条通信事件（周期上下文）：复制最近的周期时序和两臂状态，按 seqlock 方式发布到事件环。
+ * WKC 异常和周期延迟每臂每秒最多记录一条，其余计入下一条的 suppressed。
+ */
+static void record_event(arms_t *a, int kind, int arm, uint64_t now)
+{
+    int ai = arm < 0 ? 0 : arm;
+    uint64_t n = atomic_load_explicit(&a->evt_count, memory_order_relaxed);
+    event_record *e = &a->evt_scratch.r;
+    struct timespec rt;
+    unsigned int k;
+
+    if ((kind == EVT_WKC || kind == EVT_LATE) && a->evt_last_ns[kind][ai] &&
+        now - a->evt_last_ns[kind][ai] < 1000000000ull) {
+        a->evt_suppressed[kind][ai]++;
+        return;
+    }
+    a->evt_last_ns[kind][ai] = now;
+    memset(&a->evt_scratch, 0, sizeof(a->evt_scratch));
+    e->kind = kind;
+    e->which_arm = arm;
+    e->suppressed = a->evt_suppressed[kind][ai];
+    a->evt_suppressed[kind][ai] = 0;
+    e->cycle = a->cycles;
+    e->mono_ns = now;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    e->real_ns = (int64_t)rt.tv_sec * 1000000000LL + rt.tv_nsec;
+    e->skipped = a->skipped;
+    e->overruns = a->overruns;
+    for (int i = 0; i < ARMS_ARM_COUNT; ++i) {
+        const arm_rt *r = &a->arm[i];
+        e->arm[i].used = r->used;
+        if (!r->used) continue;
+        e->arm[i].link_up = r->link_up;
+        e->arm[i].comm_failed = r->comm_failed;
+        e->arm[i].count = r->count;
+        e->arm[i].wkc = r->wkc_last;
+        e->arm[i].wkc_expected = r->wkc_expected;
+        e->arm[i].consecutive = r->consecutive;
+        e->arm[i].wkc_bad = r->wkc_bad;
+        memcpy(e->arm[i].al, r->al, sizeof(e->arm[i].al));
+    }
+    e->n = a->trace_count < TRACE_LEN ? (unsigned int)a->trace_count : TRACE_LEN;
+    for (k = 0; k < e->n; ++k) e->trace[k] = a->trace[(a->trace_count - e->n + k) % TRACE_LEN];
+
+    atomic_store_explicit(&a->evt_begin, n + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    store_words(a->evt_words[n % EVENT_RING], &a->evt_scratch, WORDS_UP(event_record));
+    atomic_store_explicit(&a->evt_count, n + 1, memory_order_release);
+}
+
+/* 通信事件日志的默认位置：配置文件在 config/ 目录时为同级的 logs/，否则为配置目录下的 logs/ */
+static void resolve_event_log(arms_t *a, const char *path)
+{
+    char dir[PATH_MAX], abs_dir[PATH_MAX];
+    const char *slash, *base;
+    if (path && *path) {
+        snprintf(a->event_log, sizeof(a->event_log), "%s", path);
+        return;
+    }
+    slash = strrchr(a->cfg.path, '/');
+    if (slash) snprintf(dir, sizeof(dir), "%.*s", (int)(slash - a->cfg.path), a->cfg.path);
+    else snprintf(dir, sizeof(dir), ".");
+    if (realpath(dir, abs_dir)) snprintf(dir, sizeof(dir), "%s", abs_dir);
+    base = strrchr(dir, '/');
+    base = base ? base + 1 : dir;
+    snprintf(a->event_log, sizeof(a->event_log), strcmp(base, "config") == 0 ? "%s/../logs/comm_events.log"
+                                                                              : "%s/logs/comm_events.log", dir);
+}
+
 /* ---- 周期处理，独立模式与外部驱动模式共用 ---- */
 
 static void cycle_rx(arms_t *a, uint64_t now)
 {
     bool ready = atomic_load_explicit(&a->ready, memory_order_relaxed);
-    bool all_good = true;
+    bool all_good = true, trip_now = false, late_cycle = false;
+    bool ev_wkc[ARMS_ARM_COUNT] = {false}, ev_fail[ARMS_ARM_COUNT] = {false}, ev_rec[ARMS_ARM_COUNT] = {false};
+    uint64_t dt = 0, gap = 0, rx_ns;
     int i, k;
 
     if (atomic_exchange_explicit(&a->reset_stats, false, memory_order_acq_rel)) do_reset_stats(a);
     a->cycle_start_ns = now;
     if (a->last_start_ns && now > a->last_start_ns) {
-        uint64_t dt = now - a->last_start_ns;
+        dt = now - a->last_start_ns;
         rs_add(&a->period, (double)dt);
-        if (dt * 2 > a->period_ns * 3) a->overruns++;
+        if (dt * 2 > a->period_ns * 3) {
+            a->overruns++;
+            late_cycle = true;
+        }
     }
     a->last_start_ns = now;
+    rx_ns = mono_ns();
+    if (a->last_tx_end_ns && rx_ns > a->last_tx_end_ns) gap = rx_ns - a->last_tx_end_ns;
 
     for (i = 0; i < ARMS_ARM_COUNT; ++i) {
         arm_rt *r = &a->arm[i];
@@ -450,8 +581,10 @@ static void cycle_rx(arms_t *a, uint64_t now)
                 r->wkc_bad++;
                 r->consecutive++;
                 if (r->consecutive > r->consecutive_max) r->consecutive_max = r->consecutive;
+                if (r->consecutive == 1 && !r->comm_failed) ev_wkc[i] = true;
                 if (r->consecutive >= a->cfg.wkc_tolerance && !r->comm_failed) {
                     r->comm_failed = true;
+                    ev_fail[i] = true;
                     for (int k = 0; k < r->count; ++k) {
                         arms_mask bit = ARMS_MASK_JOINT(r->slot_joint[k]);
                         atomic_fetch_and(&a->brake_known, ~bit);
@@ -497,7 +630,21 @@ static void cycle_rx(arms_t *a, uint64_t now)
             r->consecutive = 0;
             r->recoveries++;
             r->auto_reset = true;
+            ev_rec[i] = true;
         }
+    }
+
+    {
+        trace_entry *t = &a->trace[a->trace_count % TRACE_LEN];
+        t->cycle = a->cycles;
+        t->start_ns = now;
+        t->period_ns = dt > UINT32_MAX ? UINT32_MAX : (uint32_t)dt;
+        t->late_ns = a->wake_late_ns > UINT32_MAX ? UINT32_MAX : (uint32_t)a->wake_late_ns;
+        t->gap_ns = gap > UINT32_MAX ? UINT32_MAX : (uint32_t)gap;
+        t->work_ns = 0;
+        for (i = 0; i < ARMS_ARM_COUNT; ++i)
+            t->wkc[i] = a->arm[i].used ? (uint16_t)a->arm[i].wkc_last : 0;
+        a->trace_count++;
     }
 
     if (++a->poll_cnt >= a->poll_div) {
@@ -528,7 +675,18 @@ static void cycle_rx(arms_t *a, uint64_t now)
         if (ready && a->power_off_action && !a->tripped && (offline || failed)) {
             a->tripped = true;
             a->trip_joints = offline ? offline : failed;
+            trip_now = true;
         }
+    }
+
+    if (ready) {
+        for (i = 0; i < ARMS_ARM_COUNT; ++i) {
+            if (ev_fail[i]) record_event(a, EVT_FAIL, i, now);
+            else if (ev_wkc[i]) record_event(a, EVT_WKC, i, now);
+            if (ev_rec[i]) record_event(a, EVT_RECOVER, i, now);
+        }
+        if (late_cycle) record_event(a, EVT_LATE, -1, now);
+        if (trip_now) record_event(a, EVT_TRIP, -1, now);
     }
 
     if (!ready) {
@@ -776,6 +934,11 @@ static void cycle_tx(arms_t *a, uint64_t now)
     end = mono_ns();
     if (end > a->cycle_start_ns && (double)(end - a->cycle_start_ns) > a->work_max)
         a->work_max = (double)(end - a->cycle_start_ns);
+    a->last_tx_end_ns = end;
+    if (a->trace_count && end > a->cycle_start_ns) {
+        uint64_t w = end - a->cycle_start_ns;
+        a->trace[(a->trace_count - 1) % TRACE_LEN].work_ns = w > UINT32_MAX ? UINT32_MAX : (uint32_t)w;
+    }
     publish(a);
 }
 
@@ -794,13 +957,18 @@ static void *rt_main(void *arg)
         start = mono_ns();
         late = start > next_ns ? start - next_ns : 0;
 
+        a->wake_late_ns = late;
         cycle_rx(a, start);
         if ((double)late > a->wake_late_max) a->wake_late_max = (double)late;
         cycle_tx(a, mono_ns());
 
+        /*
+         * 下一次接收与本次发送至少间隔半个周期，保证本次发出的帧已绕链返回。
+         * 周期迟到后若紧接着接收，帧尚未返回，两臂会同时读到 WKC 为 0。
+         */
         next_ns += a->period_ns;
         start = mono_ns();
-        while (next_ns <= start) {
+        while (next_ns < start + a->period_ns / 2) {
             next_ns += a->period_ns;
             a->skipped++;
         }
@@ -959,6 +1127,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     a->ignored = (options->ignore_mask >= 0 ? (arms_mask)options->ignore_mask : a->cfg.ignore_mask) & ARMS_MASK_ALL;
     check = options->check_motors >= 0 ? options->check_motors != 0 : a->cfg.check_motors;
     a->power_off_action = strcmp(a->cfg.offline_action, "power_off") == 0;
+    resolve_event_log(a, options->event_log);
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         atomic_init(&a->offset_rad[j], a->cfg.joint[j].offset_rad);
         if (!a->cfg.joint[j].present) continue;
@@ -1273,6 +1442,123 @@ arms_run_mode arms_mode(const arms_t *a) { return a ? a->mode : ARMS_MODE_CONFIG
 int arms_rt_cpu(const arms_t *a) { return a ? a->rt_cpu : -1; }
 const char *arms_backend_name(const arms_t *a) { return a && a->ops ? a->ops->name : "?"; }
 const char *arms_config_path(const arms_t *a) { return a ? a->cfg.path : ""; }
+const char *arms_event_log_path(const arms_t *a) { return a ? a->event_log : ""; }
+
+static const char *event_name(int kind)
+{
+    switch (kind) {
+    case EVT_WKC: return "WKC 异常";
+    case EVT_FAIL: return "通信失败";
+    case EVT_RECOVER: return "通信恢复";
+    case EVT_LATE: return "周期延迟";
+    case EVT_TRIP: return "离线保护触发";
+    default: return "?";
+    }
+}
+
+/* 本地时间 YYYY-mm-dd HH:MM:SS，micro 为 true 时附加微秒 */
+static void format_real(int64_t ns, bool micro, char *buf, size_t size)
+{
+    time_t sec = (time_t)(ns / 1000000000LL);
+    struct tm tm;
+    char head[32];
+    localtime_r(&sec, &tm);
+    strftime(head, sizeof(head), "%Y-%m-%d %H:%M:%S", &tm);
+    if (micro) snprintf(buf, size, "%s.%06ld", head, (long)(ns % 1000000000LL / 1000));
+    else snprintf(buf, size, "%s", head);
+}
+
+static FILE *open_event_log(arms_t *a)
+{
+    char dir[PATH_MAX];
+    const char *slash;
+    FILE *fp;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        slash = strrchr(a->event_log, '/');
+        if (slash) {
+            snprintf(dir, sizeof(dir), "%.*s", (int)(slash - a->event_log), a->event_log);
+            (void)mkdir(dir, 0755); /* 已存在或无法创建时由 fopen 报告 */
+        }
+        fp = fopen(a->event_log, "a");
+        if (fp) return fp;
+        if (strcmp(a->event_log, "/tmp/arms_comm_events.log") == 0) break;
+        logf_(a, "通信事件日志无法写入 %s（%s），改写到 /tmp/arms_comm_events.log", a->event_log, strerror(errno));
+        snprintf(a->event_log, sizeof(a->event_log), "/tmp/arms_comm_events.log");
+    }
+    set_error("无法写入通信事件日志 %s: %s", a->event_log, strerror(errno));
+    return NULL;
+}
+
+static void write_event(arms_t *a, FILE *fp, const event_record *e)
+{
+    char when[48], since[48];
+    unsigned int shown = (e->kind == EVT_FAIL || e->kind == EVT_TRIP) ? e->n : (e->n < 16 ? e->n : 16);
+    format_real(e->real_ns, true, when, sizeof(when));
+    format_real(e->real_ns - 2000000000LL, false, since, sizeof(since));
+    fprintf(fp, "==== %s  %s", when, event_name(e->kind));
+    if (e->which_arm >= 0) fprintf(fp, "  %s 臂", arms_arm_name(e->which_arm));
+    fprintf(fp, "  周期 %llu\n", (unsigned long long)e->cycle);
+    if (e->suppressed) fprintf(fp, "  此前 1 秒内另有 %u 次同类事件未单独记录\n", e->suppressed);
+    fprintf(fp, "  跳过周期 %llu  迟到周期(>1.5T) %llu  周期 %u Hz\n", (unsigned long long)e->skipped,
+            (unsigned long long)e->overruns, a->cycle_hz);
+    for (int i = 0; i < ARMS_ARM_COUNT; ++i) {
+        if (!e->arm[i].used) continue;
+        fprintf(fp, "  %-5s 链路 %s  通信%s  WKC %u/%u  连续异常 %u  累计异常 %llu  AL", arms_arm_name(i),
+                e->arm[i].link_up ? "UP" : "DOWN", e->arm[i].comm_failed ? "失败" : "正常", e->arm[i].wkc,
+                e->arm[i].wkc_expected, e->arm[i].consecutive, (unsigned long long)e->arm[i].wkc_bad);
+        for (int k = 0; k < e->arm[i].count; ++k) fprintf(fp, " %02x", e->arm[i].al[k]);
+        fputc('\n', fp);
+    }
+    fprintf(fp, "  最近 %u 个周期（旧 → 新；时刻相对本事件）:\n", shown);
+    fprintf(fp, "     相对ms        周期    间隔us  唤醒延迟us  发送→接收us   处理us  WKC左 WKC右\n");
+    for (unsigned int k = e->n - shown; k < e->n; ++k) {
+        const trace_entry *t = &e->trace[k];
+        fprintf(fp, "  %9.3f  %10llu  %8.1f  %10.1f  %11.1f  %7.1f  %5u %5u\n",
+                ((double)t->start_ns - (double)e->mono_ns) / 1e6, (unsigned long long)t->cycle, t->period_ns / 1e3,
+                t->late_ns / 1e3, t->gap_ns / 1e3, t->work_ns / 1e3, t->wkc[0], t->wkc[1]);
+    }
+    fprintf(fp, "  对照内核日志: journalctl -k -o short-precise --since \"%s\"\n\n", since);
+}
+
+int arms_log_events(arms_t *a)
+{
+    uint64_t total, i;
+    int written = 0;
+    FILE *fp;
+    if (!a) return -1;
+    total = atomic_load_explicit(&a->evt_count, memory_order_acquire);
+    if (total == a->evt_read) return 0;
+    fp = open_event_log(a);
+    if (!fp) return -1;
+    if (!a->evt_header_done) {
+        struct timespec rt;
+        char when[48];
+        clock_gettime(CLOCK_REALTIME, &rt);
+        format_real((int64_t)rt.tv_sec * 1000000000LL + rt.tv_nsec, false, when, sizeof(when));
+        fprintf(fp, "#### 会话 %s  arms_driver %s  后端 %s  配置 %s  WKC 容忍 %u 次  离线处理 %s\n\n", when,
+                arms_version(), arms_backend_name(a), a->cfg.path, a->cfg.wkc_tolerance, a->cfg.offline_action);
+        a->evt_header_done = true;
+    }
+    if (total - a->evt_read > EVENT_RING) {
+        fprintf(fp, "==== %llu 条通信事件因产生过快被覆盖，未写入\n\n",
+                (unsigned long long)(total - a->evt_read - EVENT_RING));
+        a->evt_read = total - EVENT_RING;
+    }
+    for (i = a->evt_read; i < total; ++i) {
+        event_buf b;
+        load_words(&b, a->evt_words[i % EVENT_RING], WORDS_UP(event_record));
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&a->evt_begin, memory_order_relaxed) > i + EVENT_RING) {
+            fprintf(fp, "==== 1 条通信事件在读取时被新事件覆盖，未写入\n\n");
+            continue;
+        }
+        write_event(a, fp, &b.r);
+        written++;
+    }
+    a->evt_read = total;
+    fclose(fp);
+    return written;
+}
 arms_mask arms_opened_joints(const arms_t *a) { return a ? a->joints : 0; }
 arms_mask arms_ignored_joints(const arms_t *a) { return a ? a->ignored : 0; }
 arms_mask arms_missing_joints(const arms_t *a) { return a ? a->missing : 0; }

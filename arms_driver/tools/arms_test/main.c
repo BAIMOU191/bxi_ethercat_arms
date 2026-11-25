@@ -512,7 +512,7 @@ static int cmd_commtest(int argc, char **argv)
         }
         if (t % 10 == 0 || t == seconds) {
             arms_get_stats(g_arms, &st);
-            tlog("  %3ld s  周期 %llu  WKC异常 左 %llu 右 %llu  周期最长 %.4f us", t, (unsigned long long)st.cycles,
+            tlog("  %3ld s  周期 %llu  WKC异常次数 左 %llu 右 %llu  周期最长 %.4f us", t, (unsigned long long)st.cycles,
                  (unsigned long long)st.arm[0].wkc_bad, (unsigned long long)st.arm[1].wkc_bad, st.period.max);
         }
     }
@@ -1334,6 +1334,8 @@ static void usage(FILE *out)
         "safety.ignore_mask）\n"
         "      --check / --no-check  本次要求 / 不要求未屏蔽关节全部在线（不改变运行时掉线策略）\n"
         "      --check-motor 0|1     显式选择启动检查；--motor-disable MASK 等价于 --mask\n"
+        "      --event-log FILE  通信事件日志（默认 arms_driver/logs/comm_events.log，即配置目录旁的 logs/）。\n"
+        "                       WKC 异常、通信失败与恢复、周期延迟、离线保护触发时，追加事件前 64 个周期的时序和从站状态\n"
         "\n"
         "维护命令在同一会话中直接执行；交互输入可按 Tab 补全，回车才执行。\n"
         "用手拖动关节用 free（使能后 kp=0）；驱动器失能时电机阻尼很大，仅松开抱闸仍难以转动。\n"
@@ -1378,6 +1380,7 @@ int main(int argc, char **argv)
         {"motor-disable", required_argument, NULL, 'm'},
         {"mask", required_argument, NULL, 'm'},
         {"no-check", no_argument, NULL, 'N'},
+        {"event-log", required_argument, NULL, 1002},
         {NULL, 0, NULL, 0},
     };
     arms_options opt;
@@ -1442,6 +1445,7 @@ int main(int argc, char **argv)
             opt.check_motors = optarg[0] - '0';
             break;
         case 'N': opt.check_motors = 0; break;
+        case 1002: opt.event_log = optarg; break;
         case 'r': {
             char *end;
             long v = strtol(optarg, &end, 10);
@@ -1533,6 +1537,7 @@ int main(int argc, char **argv)
         arms_get_stats(g_arms, &bs);
         print_stats(&bs);
     }
+    tlog("通信事件日志: %s", arms_event_log_path(g_arms));
     if (g_terminate) goto close_session;
     startup_selftest();
     motion_set_trip_handler(on_trip);
@@ -1583,6 +1588,7 @@ int main(int argc, char **argv)
     motion_stop();
     if (motion_enabled() && disable_joints(arms_opened_joints(g_arms), 50)) rc = 1;
 close_session:
+    if (arms_log_events(g_arms) > 0) tlog("已记录通信事件: %s", arms_event_log_path(g_arms));
     tlog("退出: 停止通信并释放主站");
     arms_close(g_arms);
     if (powered) {

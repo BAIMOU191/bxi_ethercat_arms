@@ -57,6 +57,7 @@ struct Device {
         if (driver) {
             arms_disable(driver, arms_opened_joints(driver));
             std::this_thread::sleep_for(50ms);
+            arms_log_events(driver);
             arms_close(driver);
         }
         if (owns_power.exchange(false))
@@ -70,7 +71,7 @@ struct Device {
 class ArmsNode final : public rclcpp::Node
 {
     Device dev;
-    std::string config;
+    std::string config, event_log;
     rclcpp::Publisher<Joint>::SharedPtr joint_pub;
     rclcpp::Publisher<State>::SharedPtr state_pub;
     rclcpp::Publisher<Diag>::SharedPtr diag_pub;
@@ -480,6 +481,9 @@ class ArmsNode final : public rclcpp::Node
         auto check = declare_parameter<int64_t>("check_motor", -1);
         opt.ignore_mask = declare_parameter<int64_t>("motor_disable", -1);
         opt.log = [](void *, const char *line) { RCLCPP_INFO(rclcpp::get_logger("arms_node"), "%s", line); };
+        event_log = declare_parameter<std::string>("event_log", "");
+        if (!event_log.empty())
+            opt.event_log = event_log.c_str();
         max_age_ms = declare_parameter<int64_t>("command_max_age_ms", 100);
         if (check < -1 || check > 1 || opt.ignore_mask < -1 || opt.ignore_mask > 0x7fffffff ||
             max_age_ms < 1 || max_age_ms > 1000)
@@ -552,9 +556,23 @@ class ArmsNode final : public rclcpp::Node
                                       std::shared_ptr<ReadParam::Response> r) { read_param(*q, *r); }));
         tick = create_wall_timer(10ms, [this] { feedback(); });
         report = create_wall_timer(500ms, [this] { diagnostics(); });
+        RCLCPP_INFO(get_logger(), "communication event log: %s", arms_event_log_path(dev.driver));
         dev.watchdog = std::thread([this] {
+            unsigned tick = 0;
+            bool log_warned = false;
             while (!dev.stop) {
                 arms_bus_stats s{};
+                if (++tick % 10 == 0) {
+                    /* 每 100 ms 把通信事件写入日志文件 */
+                    int n = arms_log_events(dev.driver);
+                    if (n > 0)
+                        RCLCPP_WARN(get_logger(), "%d communication event(s) logged to %s", n,
+                                    arms_event_log_path(dev.driver));
+                    else if (n < 0 && !log_warned) {
+                        RCLCPP_ERROR(get_logger(), "communication event log failed: %s", arms_last_error());
+                        log_warned = true;
+                    }
+                }
                 arms_get_stats(dev.driver, &s);
                 if (s.tripped && !dev.cut.exchange(true)) {
                     arms_disable(dev.driver, arms_opened_joints(dev.driver));
