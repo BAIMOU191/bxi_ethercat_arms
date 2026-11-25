@@ -1,4 +1,4 @@
-/* 单元测试：使能、MIT 指令、过渡、限幅、超时、故障与复位（模拟后端，独立模式） */
+/* 单元测试：使能、MIT 指令、限幅、超时、故障与复位（模拟后端，独立模式） */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,7 +48,7 @@ int main(int argc, char **argv)
 
     /* 未使能时不接受指令 */
     cmd.position = 0.0; cmd.velocity = 0.0; cmd.torque = 0.0; cmd.kp = 1.0; cmd.kd = 0.1;
-    CHECK(arms_set_command(a, 17, &cmd, 0.0) == ARMS_E_STATE, "command before enable");
+    CHECK(arms_set_command(a, 17, &cmd) == ARMS_E_STATE, "command before enable");
 
     /* 使能后保持原位 */
     s = rd(a, 17);
@@ -65,26 +65,21 @@ int main(int argc, char **argv)
     CHECK(fabs(rd(a, 21).cmd_position - s.position) < 1e-3, "out-of-range joint holds in place");
     CHECK(!rd(a, 21).cmd_limited, "out-of-range hold not limited");
 
-    /* 带过渡的位置指令 */
+    /* 位置指令下一周期原样生效，不做插值 */
     CHECK(arms_get_limits(a, 17, &lim) == ARMS_OK, "limits");
     cmd.position = 0.2;
-    CHECK(arms_set_command(a, 17, &cmd, 0.3) == ARMS_OK, arms_last_error());
-    usleep(100000);
+    CHECK(arms_set_command(a, 17, &cmd) == ARMS_OK, arms_last_error());
+    usleep(10000);
     s = rd(a, 17);
-    CHECK(s.cmd_moving, "moving");
-    arms_reset_stats(a);
-    usleep(15000);
-    CHECK(rd(a, 17).cmd_moving, "resetting statistics must not finish a move");
-    usleep(400000);
+    CHECK(fabs(s.cmd_position - 0.2) < 1e-6, "target applied immediately");
+    usleep(500000);
     s = rd(a, 17);
-    CHECK(!s.cmd_moving, "move finished");
-    CHECK(fabs(s.cmd_position - 0.2) < 1e-6, "move target");
     CHECK(fabs(s.position - 0.2) < 0.02, "mock follows");
 
     /* 限幅 */
     cmd.position = lim.pos_max + 1.0;
     cmd.kp = lim.kp_max * 10.0;
-    CHECK(arms_set_command(a, 17, &cmd, 0.0) == ARMS_OK, arms_last_error());
+    CHECK(arms_set_command(a, 17, &cmd) == ARMS_OK, arms_last_error());
     usleep(20000);
     s = rd(a, 17);
     CHECK(s.cmd_limited, "limited flag");
@@ -93,16 +88,16 @@ int main(int argc, char **argv)
 
     /* 无效指令 */
     cmd.position = NAN;
-    CHECK(arms_set_command(a, 17, &cmd, 0.0) == ARMS_E_ARG, "nan rejected");
+    CHECK(arms_set_command(a, 17, &cmd) == ARMS_E_ARG, "nan rejected");
     cmd.position = 0.0;
     cmd.kp = -1.0;
-    CHECK(arms_set_command(a, 17, &cmd, 0.0) == ARMS_E_ARG, "negative kp rejected");
+    CHECK(arms_set_command(a, 17, &cmd) == ARMS_E_ARG, "negative kp rejected");
 
     /* 超时：速度与前馈清零 */
     cmd.kp = 1.0;
     cmd.velocity = 0.1;
     cmd.torque = 0.2;
-    CHECK(arms_set_command(a, 17, &cmd, 0.0) == ARMS_OK, arms_last_error());
+    CHECK(arms_set_command(a, 17, &cmd) == ARMS_OK, arms_last_error());
     usleep(10000);
     CHECK(fabs(rd(a, 17).cmd_velocity - 0.1) < 1e-6, "velocity applied");
     usleep(200000);

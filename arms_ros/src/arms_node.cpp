@@ -120,7 +120,7 @@ class ArmsNode final : public rclcpp::Node
             if (mask & ARMS_MASK_JOINT(j)) {
                 arms_joint_state s{};
                 arms_read_joint(dev.driver, j, &s);
-                if (s.mode == ARMS_JS_ENABLED && arms_set_command(dev.driver, j, &cmds[j], 0) != ARMS_OK) {
+                if (s.mode == ARMS_JS_ENABLED && arms_set_command(dev.driver, j, &cmds[j]) != ARMS_OK) {
                     arms_disable(dev.driver, mask);
                     reject("driver rejected command");
                     return;

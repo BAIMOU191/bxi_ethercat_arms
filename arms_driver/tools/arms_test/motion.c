@@ -19,7 +19,9 @@
 #define REFRESH_NS UINT64_C(10000000)
 #define SWING_NS UINT64_C(5000000)
 #define TAU 6.28318530717958647693
-#define MOVE_MAX_S 60.0
+#define SETTLE_VEL 0.02                       /* 停稳判定速度 [rad/s] */
+#define SETTLE_NS UINT64_C(200000000)         /* 停稳需持续的时间 */
+#define SETTLE_MAX_NS (5 * NS_PER_S)          /* 停稳最长等待时间 */
 
 static arms_t *bus;
 static volatile sig_atomic_t *interrupted;
@@ -235,7 +237,7 @@ static void *refresh_main(void *arg)
         for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
             arms_mask bit = ARMS_MASK_JOINT(j);
             /* 驱动在每次写入时检查使能状态。检查和发送均在取消刷新的互斥区内。 */
-            if ((refreshing & bit) && arms_set_command(bus, j, &latest[j], 0.0) != ARMS_OK) {
+            if ((refreshing & bit) && arms_set_command(bus, j, &latest[j]) != ARMS_OK) {
                 refreshing &= ~bit;
                 tlog_err("关节 %d 停止刷新: %s", j, arms_last_error());
             }
@@ -315,7 +317,7 @@ int motion_hold(arms_mask mask)
         for (size_t i = 0; i < n; ++i) {
             const arms_joint_state *s = &states[i];
             if ((mask & ARMS_MASK_JOINT(s->joint)) && s->mode == ARMS_JS_ENABLED &&
-                (s->sample_ns <= sent || s->cmd_moving || s->cmd_velocity != 0.0 || s->cmd_torque != 0.0)) held = false;
+                (s->sample_ns <= sent || s->cmd_velocity != 0.0 || s->cmd_torque != 0.0)) held = false;
         }
         if (held) break;
         if (now_ns() >= deadline) {
@@ -328,7 +330,7 @@ int motion_hold(arms_mask mask)
 
 typedef struct {
     int joint;
-    double center, move;
+    double center;
     arms_joint_limits limits;
     arms_command cmd;
 } target;
@@ -383,13 +385,12 @@ static int validate(const target *t, double amplitude, double speed)
            in_range(t->joint, "位置(rad)", c->position + amplitude, l->pos_min, l->pos_max) &&
            in_range(t->joint, "kp", c->kp, 0.0, l->kp_max) && in_range(t->joint, "kd", c->kd, 0.0, l->kd_max) &&
            in_range(t->joint, "速度(rad/s)", speed, -l->vel_max, l->vel_max) &&
-           in_range(t->joint, "前馈(N.m)", c->torque, -l->tff_max, l->tff_max) &&
-           in_range(t->joint, "过渡时间(s)", t->move, 0.0, MOVE_MAX_S);
+           in_range(t->joint, "前馈(N.m)", c->torque, -l->tff_max, l->tff_max);
 }
 
-static int send_target(const target *t, double move)
+static int send_target(const target *t)
 {
-    if (arms_set_command(bus, t->joint, &t->cmd, move) == ARMS_OK) return 0;
+    if (arms_set_command(bus, t->joint, &t->cmd) == ARMS_OK) return 0;
     tlog_err("关节 %d 指令失败: %s", t->joint, arms_last_error());
     return -1;
 }
@@ -399,7 +400,7 @@ static int submit(trajectory *p, bool refresh)
     motion_cancel_refresh(p->mask);
     for (size_t i = 0; i < p->count; ++i) {
         const target *t = &p->items[i];
-        if (send_target(t, t->move)) {
+        if (send_target(t)) {
             motion_hold(p->mask);
             return -1;
         }
@@ -413,34 +414,23 @@ static int submit(trajectory *p, bool refresh)
     return 0;
 }
 
-static double transition(const target *t, double minimum)
-{
-    double distance = fabs(t->cmd.position - t->center);
-    if (distance == 0.0) return minimum;
-    if (t->limits.vel_max <= 0.0) return INFINITY;
-    return fmax(minimum, distance / (0.5 * t->limits.vel_max));
-}
-
-int motion_mit(arms_mask mask, arms_command cmd, double move_s)
+int motion_mit(arms_mask mask, arms_command cmd)
 {
     trajectory p;
     bool dynamic = cmd.velocity != 0.0 || cmd.torque != 0.0;
     if (prepare(&p, mask, cmd)) return -1;
-    for (size_t i = 0; i < p.count; ++i) {
-        target *t = &p.items[i];
-        t->move = dynamic ? 0.0 : (move_s < 0.0 ? transition(t, 0.5) : move_s);
-        if (!validate(t, 0.0, cmd.velocity)) return -1;
-    }
+    for (size_t i = 0; i < p.count; ++i)
+        if (!validate(&p.items[i], 0.0, cmd.velocity)) return -1;
     if (submit(&p, dynamic)) return -1;
     /* 等待两个周期，使随后的 status 显示新指令 */
     sleep_until(now_ns() + 2 * arms_period_ns(bus) + 1000000);
     return 0;
 }
 
-/* 等到下发后的反馈确实到达目标，避免将上一周期的 cmd_moving=false 当作结束。 */
-static int await_targets(const trajectory *p, double move, bool allow_abort, bool report)
+/* 确认驱动已在新的反馈周期中采用目标指令；report 时再等关节停稳并报告误差。 */
+static int await_targets(const trajectory *p, bool allow_abort, bool report)
 {
-    uint64_t sent = now_ns(), deadline = sent + (uint64_t)((move + 2.0) * NS_PER_S);
+    uint64_t sent = now_ns(), deadline = sent + 2 * NS_PER_S;
     arms_joint_state state[ARMS_JOINT_COUNT];
     for (;;) {
         bool done = true;
@@ -452,7 +442,7 @@ static int await_targets(const trajectory *p, double move, bool allow_abort, boo
                 motion_hold(p->mask);
                 return -1;
             }
-            if (s->sample_ns <= sent || s->cmd_moving || s->cmd_position != t->cmd.position) done = false;
+            if (s->sample_ns <= sent || s->cmd_position != t->cmd.position) done = false;
         }
         if (done) break;
         if (now_ns() >= deadline) {
@@ -467,6 +457,33 @@ static int await_targets(const trajectory *p, double move, bool allow_abort, boo
         }
     }
     if (report) {
+        /* 所有关节速度持续低于 SETTLE_VEL 达 SETTLE_NS 视为停稳，最多等 SETTLE_MAX_NS */
+        uint64_t settle_deadline = now_ns() + SETTLE_MAX_NS, still_since = 0;
+        for (;;) {
+            bool still = true;
+            for (size_t i = 0; i < p->count; ++i) {
+                if (arms_read_joint(bus, p->items[i].joint, &state[i]) != ARMS_OK ||
+                    state[i].mode != ARMS_JS_ENABLED) {
+                    tlog_err("关节 %d 反馈不可用或已退出使能，停止运动", p->items[i].joint);
+                    motion_hold(p->mask);
+                    return -1;
+                }
+                if (fabs(state[i].velocity) > SETTLE_VEL) still = false;
+            }
+            uint64_t now = now_ns();
+            if (!still) still_since = 0;
+            else if (!still_since) still_since = now;
+            if (still_since && now - still_since >= SETTLE_NS) break;
+            if (now >= settle_deadline) {
+                tlog("等待关节停稳超时，按当前反馈报告");
+                break;
+            }
+            if (!allow_abort) sleep_until(now + REFRESH_NS);
+            else if (motion_wait_or_enter(10)) {
+                tlog("运动已中止，保持当前指令位置");
+                return motion_hold(p->mask);
+            }
+        }
         for (size_t i = 0; i < p->count; ++i) {
             double goal = p->items[i].cmd.position, actual = state[i].position;
             tlog("关节 %d 目标 %.4f 实际 %.4f 误差(目标-实际) %+.4f rad", p->items[i].joint, goal, actual, goal - actual);
@@ -475,24 +492,18 @@ static int await_targets(const trajectory *p, double move, bool allow_abort, boo
     return 0;
 }
 
-int motion_home(arms_mask mask, double move_s)
+int motion_home(arms_mask mask)
 {
     arms_command cmd = {.kp = NAN, .kd = NAN};
     trajectory p;
-    double common = move_s < 0.0 ? 1.0 : move_s;
     if (prepare(&p, mask, cmd)) return -1;
     for (size_t i = 0; i < p.count; ++i) {
-        target *t = &p.items[i];
-        t->cmd.position = t->limits.home;
-        if (move_s < 0.0) common = fmax(common, transition(t, 1.0));
-    }
-    for (size_t i = 0; i < p.count; ++i) {
-        p.items[i].move = common;
+        p.items[i].cmd.position = p.items[i].limits.home;
         if (!validate(&p.items[i], 0.0, 0.0)) return -1;
     }
-    tlog("回零: 过渡 %.4f s；回车或 Ctrl+C 中止", common);
+    tlog("回零: 直接下发 home 目标；回车或 Ctrl+C 中止并保持");
     if (submit(&p, false)) return -1;
-    return await_targets(&p, common, true, true);
+    return await_targets(&p, true, true);
 }
 
 int motion_swing(arms_mask mask, double amplitude, double period, long count, double kp, double kd)
@@ -509,7 +520,6 @@ int motion_swing(arms_mask mask, double amplitude, double period, long count, do
     for (size_t i = 0; i < p.count; ++i) {
         target *t = &p.items[i];
         t->cmd.position = t->center;
-        t->move = 0.0;
         if (!validate(t, amplitude, peak)) return -1;
     }
     motion_cancel_refresh(mask);
@@ -535,7 +545,7 @@ int motion_swing(arms_mask mask, double amplitude, double period, long count, do
             arms_joint_state s;
             t->cmd.position = t->center + offset;
             t->cmd.velocity = velocity;
-            if (send_target(t, 0.0) || arms_read_joint(bus, t->joint, &s) != ARMS_OK) {
+            if (send_target(t) || arms_read_joint(bus, t->joint, &s) != ARMS_OK) {
                 motion_hold(mask);
                 return -1;
             }
@@ -547,13 +557,14 @@ int motion_swing(arms_mask mask, double amplitude, double period, long count, do
             break;
         }
     }
-    double move = aborted ? 1.0 : 0.0;
-    if (aborted) tlog("摆动已中止，以 1.0000 s 过渡返回中心");
+    if (aborted) {
+        tlog("摆动已中止，保持当前指令位置");
+        return motion_hold(mask);
+    }
     for (size_t i = 0; i < p.count; ++i) {
         p.items[i].cmd.position = p.items[i].center;
         p.items[i].cmd.velocity = 0.0;
-        p.items[i].move = move;
     }
     if (submit(&p, false)) return -1;
-    return await_targets(&p, move, false, false);
+    return await_targets(&p, false, false);
 }

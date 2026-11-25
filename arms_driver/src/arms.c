@@ -28,7 +28,6 @@
 #define DEFAULT_WAIT_MS 1000u          /* 使能、复位的默认等待时间 */
 #define RESET_PULSE_MS 20u             /* 故障复位控制字 0x0080 保持时间 */
 #define RECOVER_STABLE_MS 500u         /* 通信失败后，恢复稳定该时长才清除失败标志 */
-#define MOVE_MAX_S 60.0
 
 /* 非实时线程向周期上下文发出的关节请求 */
 enum { REQ_NONE = 0, REQ_ENABLE, REQ_DISABLE, REQ_RESET, REQ_HOLD };
@@ -149,7 +148,6 @@ typedef struct {
 #define WORDS_OF(T) (sizeof(T) / sizeof(uintptr_t))
 typedef struct {
     arms_command cmd;
-    double move_s;
 } cmd_payload;
 _Static_assert(sizeof(shared_snapshot) % sizeof(uintptr_t) == 0, "snapshot word alignment");
 _Static_assert(sizeof(cmd_payload) % sizeof(uintptr_t) == 0, "command word alignment");
@@ -187,9 +185,6 @@ typedef struct {
     uint64_t fresh_cycle;
     arms_command cur;                 /* 当前生效的指令（关节侧，未限幅） */
     double lim_min, lim_max;          /* 生效的位置限位，使能时若实际位置在限位外则放宽到该位置 */
-    bool moving;
-    double mv_from, mv_to;
-    uint64_t mv_start, mv_len;
     bool timed_out;
     bool was_fault;
     uint32_t fault_count;
@@ -553,7 +548,7 @@ static void finish(arms_t *a, int j, unsigned int result)
 }
 
 /* 尝试读取指令槽；有新指令时返回 true */
-static bool fetch_command(arms_t *a, int j, arms_command *cmd, double *move_s)
+static bool fetch_command(arms_t *a, int j, arms_command *cmd)
 {
     cmd_slot *sl = &a->slot[j];
     joint_ctl *c = &a->ctl[j];
@@ -568,7 +563,6 @@ static bool fetch_command(arms_t *a, int j, arms_command *cmd, double *move_s)
     if (s1 != s2) return false;
     c->seq_seen = s1;
     *cmd = data.cmd;
-    *move_s = data.move_s;
     return true;
 }
 
@@ -623,7 +617,6 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
             c->cur.kd = jc->kd_default;
             c->lim_min = s->position < jc->pos_min ? s->position : jc->pos_min;
             c->lim_max = s->position > jc->pos_max ? s->position : jc->pos_max;
-            c->moving = false;
             c->timed_out = false;
             c->seq_seen = atomic_load_explicit(&a->slot[j].seq, memory_order_acquire) & ~1u;
             c->fresh_cycle = a->cycles;
@@ -636,7 +629,6 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
         break;
     case REQ_HOLD:
         if (c->phase == CTL_ON) {
-            c->moving = false;
             c->cur.velocity = 0.0;
             c->cur.torque = 0.0;
             c->fresh_cycle = a->cycles;
@@ -678,37 +670,13 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
     }
     case CTL_ON: {
         arms_command cmd;
-        double mv;
         out->controlword = KGU_CW_ENABLE;
-        if (fetch_command(a, j, &cmd, &mv)) {
+        if (fetch_command(a, j, &cmd)) {
             c->fresh_cycle = a->cycles;
             c->timed_out = false;
-            if (mv > 0.0) {
-                c->moving = true;
-                c->mv_from = c->cur.position;
-                c->mv_to = cmd.position;
-                c->mv_start = a->cycles;
-                c->mv_len = (uint64_t)(mv * (double)a->cycle_hz);
-                if (c->mv_len == 0) c->mv_len = 1;
-                c->cur.velocity = 0.0;
-                c->cur.torque = 0.0;
-                c->cur.kp = cmd.kp;
-                c->cur.kd = cmd.kd;
-            } else {
-                c->moving = false;
-                c->cur = cmd;
-            }
+            c->cur = cmd;
         }
-        if (c->moving) {
-            double t = (double)(a->cycles - c->mv_start) / (double)c->mv_len;
-            if (t >= 1.0) {
-                c->cur.position = c->mv_to;
-                c->moving = false;
-                c->fresh_cycle = a->cycles;
-            } else {
-                c->cur.position = c->mv_from + (c->mv_to - c->mv_from) * 0.5 * (1.0 - cos(M_PI * t));
-            }
-        } else if (a->cycles - c->fresh_cycle > a->timeout_cycles && !c->timed_out) {
+        if (a->cycles - c->fresh_cycle > a->timeout_cycles && !c->timed_out) {
             c->timed_out = true;
             if (strcmp(a->cfg.timeout_action, "disable") == 0) {
                 c->phase = CTL_OFF;
@@ -767,7 +735,6 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
         s->cmd_position = s->position;
         s->cmd_velocity = s->cmd_torque = s->cmd_kp = s->cmd_kd = 0.0;
     }
-    s->cmd_moving = active && c->moving;
     s->cmd_limited = limited;
     s->cmd_timeout = c->phase == CTL_ON && c->timed_out;
     s->fault_count = c->fault_count;
@@ -1570,7 +1537,7 @@ arms_status arms_free(arms_t *a, arms_mask joints, double kd)
         c.torque = 0.0;
         c.kp = 0.0;
         c.kd = kd;
-        if ((st = arms_set_command(a, j, &c, 0.0)) != ARMS_OK) return st;
+        if ((st = arms_set_command(a, j, &c)) != ARMS_OK) return st;
     }
     wait_snapshot(a);
     return ARMS_OK;
@@ -1600,7 +1567,7 @@ arms_status arms_hold(arms_t *a, arms_mask joints)
     return ARMS_OK;
 }
 
-arms_status arms_set_command(arms_t *a, int joint, const arms_command *cmd, double move_s)
+arms_status arms_set_command(arms_t *a, int joint, const arms_command *cmd)
 {
     arms_joint_state s;
     cmd_slot *sl;
@@ -1609,9 +1576,8 @@ arms_status arms_set_command(arms_t *a, int joint, const arms_command *cmd, doub
         return ARMS_E_ARG;
     }
     if (!isfinite(cmd->position) || !isfinite(cmd->velocity) || !isfinite(cmd->torque) || !isfinite(cmd->kp) ||
-        !isfinite(cmd->kd) || cmd->kp < 0.0 || cmd->kd < 0.0 || !isfinite(move_s) || move_s < 0.0 ||
-        move_s > MOVE_MAX_S) {
-        set_error("关节 %d 的指令无效（数值非有限、增益为负或过渡时间超出 0..%.0f s）", joint, MOVE_MAX_S);
+        !isfinite(cmd->kd) || cmd->kp < 0.0 || cmd->kd < 0.0) {
+        set_error("关节 %d 的指令无效（数值非有限或增益为负）", joint);
         return ARMS_E_ARG;
     }
     arms_read_joint(a, joint, &s);
@@ -1623,7 +1589,7 @@ arms_status arms_set_command(arms_t *a, int joint, const arms_command *cmd, doub
     pthread_mutex_lock(&a->cmd_lock);
     atomic_fetch_add_explicit(&sl->seq, 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
-    cmd_payload data = {*cmd, move_s};
+    cmd_payload data = {*cmd};
     store_words(sl->data, &data, WORDS_OF(cmd_payload));
     atomic_fetch_add_explicit(&sl->seq, 1, memory_order_release);
     pthread_mutex_unlock(&a->cmd_lock);

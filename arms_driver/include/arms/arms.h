@@ -133,7 +133,6 @@ typedef struct {
     double cmd_torque;      /**< 前馈力矩 [N.m] */
     double cmd_kp;
     double cmd_kd;
-    bool cmd_moving;        /**< 正在执行带过渡时间的指令 */
     bool cmd_limited;       /**< 本周期指令被限幅 */
     bool cmd_timeout;       /**< 指令超时，已按 safety.timeout_action 处理 */
     uint32_t fault_count;   /**< 打开以来进入故障的次数 */
@@ -336,15 +335,13 @@ typedef struct {
 } arms_command;
 
 /**
- * @brief 写入单个关节的 MIT 指令，下一周期生效
- * @param move_s 过渡时间 [s]。0 表示立即生效；大于 0 时目标位置从当前指令位置
- *               按余弦曲线过渡，期间速度与前馈为 0，增益立即生效
+ * @brief 写入单个关节的 MIT 指令，下一周期原样生效
  *
- * 只对已使能的关节有效。各量在周期内按 limit / gain_max 限幅。
- * 调用方需在 safety.command_timeout_ms 内持续刷新，否则按 safety.timeout_action 处理；
- * 过渡期间不计超时。可在任意非实时线程调用。
+ * 驱动不做轨迹插值，平滑由调用方负责。只对已使能的关节有效。各量在周期内按
+ * limit / gain_max 限幅。调用方需在 safety.command_timeout_ms 内持续刷新，否则按
+ * safety.timeout_action 处理。可在任意非实时线程调用。
  */
-arms_status arms_set_command(arms_t *arms, int joint, const arms_command *command, double move_s);
+arms_status arms_set_command(arms_t *arms, int joint, const arms_command *command);
 
 /** @brief 关节保持当前指令位置：速度与前馈清零，增益不变 */
 arms_status arms_hold(arms_t *arms, arms_mask joints);

@@ -160,7 +160,6 @@ static int cmd_status(int argc, char **argv)
             continue;
         }
         snprintf(where, sizeof(where), "%s/%d", s.arm == 0 ? "L" : "R", s.slave);
-        if (s.cmd_moving) flags[n++] = 'M';
         if (s.cmd_limited) flags[n++] = 'L';
         if (s.cmd_timeout) flags[n++] = 'T';
         if (!n) flags[n++] = '-';
@@ -290,17 +289,6 @@ static bool integer(const char *s, long lo, long hi, long *v)
     return end != s && !*end && !errno && *v >= lo && *v <= hi;
 }
 
-static int move_option(int *argc, char **argv, double *move)
-{
-    *move = -1.0;
-    if (*argc >= 3 && strcmp(argv[*argc - 2], "-m") == 0) {
-        if (!number(argv[*argc - 1], move) || *move < 0.0 || *move > 60.0)
-            return bad_args("-m 需要 0..60 秒的过渡时间");
-        *argc -= 2;
-    }
-    return 0;
-}
-
 static void delay_ms(unsigned int ms)
 {
     struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
@@ -370,25 +358,21 @@ static int cmd_mit(int argc, char **argv)
 {
     arms_mask mask;
     arms_command c = {.kp = NAN, .kd = NAN};
-    double move;
     double *fields[] = {&c.position, &c.kp, &c.kd, &c.velocity, &c.torque};
-    if (move_option(&argc, argv, &move)) return -2;
     if (argc < 3 || argc > 7) return bad_args("请指定关节、目标位置及可选参数");
     if (selection(argv[1], &mask)) return -2;
     for (int i = 2; i < argc; ++i)
         if (!number(argv[i], fields[i - 2])) return bad_args("运动参数必须是有限数值");
-    return motion_mit(mask, c, move) ? -2 : ok();
+    return motion_mit(mask, c) ? -2 : ok();
 }
 
 static int cmd_home(int argc, char **argv)
 {
     arms_mask mask;
-    double move;
-    if (move_option(&argc, argv, &move)) return -2;
-    if (argc > 2) return bad_args("可选参数为关节和 -m 秒");
+    if (argc > 2) return bad_args("只接受一个可选的关节参数");
     if (selection(argc == 2 ? argv[1] : NULL, &mask)) return -2;
     if (argc == 1) mask &= motion_enabled();
-    return motion_home(mask, move) ? -2 : ok();
+    return motion_home(mask) ? -2 : ok();
 }
 
 static int cmd_swing(int argc, char **argv)
@@ -507,7 +491,7 @@ static int cmd_commtest(int argc, char **argv)
                 goto enable_error;
             }
             arms_command cmd = {.position = s.position, .kp = l.kp_default, .kd = l.kd_default};
-            if (arms_set_command(g_arms, j, &cmd, 0.0) != ARMS_OK) {
+            if (arms_set_command(g_arms, j, &cmd) != ARMS_OK) {
                 failed("关节 %d 无法保持原位: %s", j, arms_last_error());
                 goto enable_error;
             }
@@ -1055,7 +1039,7 @@ static const command commands[] = {
      "  关节写法: 21 | l_wrist_z | left | right | all | 15-18 | 21,28（默认全部已打开关节）\n"
      "  状态: offline / preop / safeop / locked（OP，伺服失能）/ enabled / FAULT\n"
      "        released / held（失能，且抱闸为强制松闸 / 强制抱闸）\n"
-     "  cmd、kp、kd 为实际下发的位置和增益；M=过渡中，L=限幅，T=超时，flt=累计故障次数。",
+     "  cmd、kp、kd 为实际下发的位置和增益；L=限幅，T=超时，flt=累计故障次数。",
      "  status\n  status left\n  status 21", cmd_status},
     {"watch", "查看", "[关节] [刷新Hz]", 0, 2, "原地刷新显示关节状态、位置、速度、力矩，回车结束",
      "  每个关节一行，在同一块区域内刷新。刷新频率 1..50 Hz，默认 5。\n"
@@ -1073,16 +1057,18 @@ static const command commands[] = {
      cmd_disable},
     {"reset", "控制", "<关节>", 1, 1, "故障复位并显示模式", "  复位后处于失能状态，运动前须重新使能。",
      "  reset 17", cmd_reset},
-    {"mit", "控制", "<关节> <位置> [kp] [kd] [速度] [前馈] [-m 秒]", 2, 8, "下发 MIT 指令",
-     "  位置单位 rad，速度 rad/s，前馈 N.m。增益默认取各关节配置；位置过渡时间默认按限速计算。\n"
-     "  非零速度或前馈立即生效并持续刷新。所有关节均须已使能且目标不超限。",
-     "  mit 17 0.1 -m 0.3\n  mit 18 0.1 2 0.1 0.05", cmd_mit},
+    {"mit", "控制", "<关节> <位置> [kp] [kd] [速度] [前馈]", 2, 6, "下发 MIT 指令",
+     "  位置单位 rad，速度 rad/s，前馈 N.m。增益默认取各关节配置，速度和前馈默认为 0。\n"
+     "  指令下一周期直接生效，不做轨迹插值：目标离当前位置较远时关节会快速跳向目标，\n"
+     "  请小步给定或降低 kp。非零速度或前馈持续刷新。所有关节均须已使能且目标不超限。",
+     "  mit 17 0.1\n  mit 18 0.1 2 0.1 0.05", cmd_mit},
     {"hold", "控制", "[关节]", 0, 1, "停止刷新并保持当前指令位置",
      "  清零速度与前馈，保留增益；缺省作用于全部已打开关节。", "  hold", cmd_hold},
-    {"home", "控制", "[关节] [-m 秒]", 0, 3, "同步回到各关节的 home 位置",
-     "  不指定关节时只回零已使能关节。回车或 Ctrl+C 中止并保持。", "  home all -m 0.5", cmd_home},
+    {"home", "控制", "[关节]", 0, 1, "以默认增益直接下发各关节的 home 位置",
+     "  不做轨迹插值，关节以默认增益跳向 home。不指定关节时只作用于已使能关节。\n"
+     "  等关节停稳后报告误差；回车或 Ctrl+C 中止并保持。", "  home all", cmd_home},
     {"swing", "测试", "<关节> <幅值> [周期秒] [次数] [kp] [kd]", 2, 6, "以当前指令位置为中心正弦摆动",
-     "  幅值单位 rad，默认周期 4 秒、3 次、各关节默认增益。回车或 Ctrl+C 中止，1 秒过渡返回中心。",
+     "  幅值单位 rad，默认周期 4 秒、3 次、各关节默认增益。结束时回到中心；回车或 Ctrl+C 中止并保持当前指令位置。",
      "  swing 17 0.05 1 1", cmd_swing},
     {"selftest", "查看", "", 0, 0, "检查在线状态、故障与保护锁定", "不使能或移动关节。", "  selftest",
      cmd_selftest},
@@ -1205,10 +1191,6 @@ static void complete_command(size_t argc, const char *const argv[], le_choices *
     if (argc == 2 && !strcmp(c->name, "zero")) le_add_choice(out, "--hw");
     if (argc == 2 && c->fn == cmd_enable) le_add_choice(out, "-t");
     if (argc == 2 && c->fn == cmd_commtest) le_add_choice(out, "--enabled");
-    if ((c->fn == cmd_home && argc <= 2) || (c->fn == cmd_mit && argc >= 3 && argc <= 7)) {
-        for (size_t i = 1; i < argc; ++i) if (!strcmp(argv[i], "-m")) return;
-        le_add_choice(out, "-m");
-    }
 }
 
 static int cmd_help(int argc, char **argv)
