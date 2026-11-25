@@ -35,7 +35,7 @@ with tempfile.TemporaryDirectory() as tmp:
                              (b'brake 15 rel\t', b'> brake 15 release '),
                              (b'zero l_shoulder_y\t', b'> zero l_shoulder_y_joint '),
                              (b'status 15,rig\t', b'> status 15,right '),
-                             (b'zero 15 --h\t', b'> zero 15 --hw '),
+                             (b'zero 15 --s\t', b'> zero 15 --soft '),
                              (b'stat 15\x01' + b'\x06' * 4 + b'\t', b'> status 15')]:
             os.write(master, typed)
             expect(master, shown + b'\x1b[0K')

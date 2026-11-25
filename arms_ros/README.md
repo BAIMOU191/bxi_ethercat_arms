@@ -22,7 +22,7 @@ ros2 run arms_ros arms_node --ros-args -p mock:=true -p config:=$(realpath arms_
 | arms/status | std_srvs/srv/Trigger：返回可读文本，包括会话与掉线保护锁定、超速/超力矩保护、屏蔽与缺失关节、两臂链路/OP/WKC，以及每个关节的模式、位置、速度、力矩、状态字、错误码和实际下发的指令。success 与 selftest 相同。 |
 | arms/clear_trip | std_srvs/srv/Trigger：解除掉线保护锁定。manage_power 为 true 时先重新上电；最多等 15 s 通信恢复，要求全部已打开关节在线后清除锁定，关节保持失能；检查失败时本次上的电会再次切断。恢复后的驱动器故障用 reset 清除，再 enable。等待期间节点暂停发布状态。 |
 | arms/read_param | arms_ros/srv/ReadParam：只读。pn 为十进制 Pn 编号（如 75 读 Pn075，即 0x2075:00），值按 INT16 返回；pn = -1 时按 index / subindex 读对象字典（如 0x1018:01），值按小端无符号返回。raw 为原始字节。写参数、保存参数仍只在 arms_test 中进行。 |
-| arms/enable、disable、reset、selftest、free、brake_normal、brake_release、brake_hold、zero | arms_ros/srv/JointOperation：joints 是关节位掩码，confirm 是操作确认（disable 和 selftest 除外）；hardware_zero 仅对 zero 有效。free 为零力矩拖动（kp=0、kd=0）。brake_normal / brake_release / brake_hold 临时设置 Pn075 = 0（正常控制抱闸）/ 1（强制松闸）/ 2（强制抱闸），不保存；brake_release / brake_hold 要求关节失能。enable 和 free 会先把所选关节中 Pn075 非 0 的自动写回 0 并回读确认（不保存），失败时拒绝。zero 按关节判断：已使能先失能，已失能不重复操作，反馈确认静止后再写入；完成后不重新使能。软件零位立即生效。 |
+| arms/enable、disable、reset、selftest、free、brake_normal、brake_release、brake_hold、zero | arms_ros/srv/JointOperation：joints 是关节位掩码，confirm 是操作确认（disable 和 selftest 除外）；soft_zero 仅对 zero 有效：false（默认）为硬件校零（Pn101，同时把 offset_rad 写为 0，驱动器重新上电后生效，之前该关节拒绝 enable / free），true 为软件校零。free 为零力矩拖动（kp=0、kd=0）。brake_normal / brake_release / brake_hold 临时设置 Pn075 = 0（正常控制抱闸）/ 1（强制松闸）/ 2（强制抱闸），不保存；brake_release / brake_hold 要求关节失能。enable 和 free 会先把所选关节中 Pn075 非 0 的自动写回 0 并回读确认（不保存），失败时拒绝。zero 按关节判断：已使能先失能，已失能不重复操作，反馈确认静止后再写入；完成后不重新使能。软件零位立即生效。 |
 
 状态和目标使用 SensorDataQoS / depth 1，诊断使用可靠 QoS。发生 power_off 保护时，独立监视线程请求失能；如节点拥有电源则请求断电，并保持会话锁定。恢复接线并确认安全后调用 arms/clear_trip（或重新启动节点），不自动恢复使能。
 

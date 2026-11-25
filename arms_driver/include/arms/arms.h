@@ -397,8 +397,10 @@ arms_status arms_brake_scan(arms_t *arms, arms_mask *released, arms_mask *held, 
 
 /** 维护操作 */
 typedef enum {
-    ARMS_ZERO_SOFT, /**< 以当前位置为零点：写入配置 offset_rad 并立即生效；要求关节失能、静止 */
-    ARMS_ZERO_HW,   /**< Pn101 清零脉冲，驱动器重新上电后生效；要求关节失能、静止、抱闸为正常模式 */
+    ARMS_ZERO_SOFT, /**< 软件校零：以当前位置为零点写入配置 offset_rad 并立即生效；要求关节失能、静止 */
+    ARMS_ZERO_HW,   /**< 硬件校零：Pn101 清零脉冲，驱动器重新上电后生效；要求关节失能、静止、抱闸为正常模式。
+                         成功后配置中的 offset_rad 立即写为 0；运行中的偏置保持原值，直到该臂通信中断
+                         （驱动器断电）时切换为 0。期间该关节拒绝 enable、free 和软件校零。 */
     ARMS_SAVE,      /**< Pn097 参数保存脉冲；不检查或更改抱闸模式 */
 } arms_service_op;
 
@@ -425,6 +427,9 @@ typedef struct {
     int direction;     /**< +1 / -1 */
     double offset_rad; /**< 零位偏置 */
 } arms_joint_info;
+
+/** @brief 已硬件校零、等待驱动器重新上电的关节 */
+arms_mask arms_zero_pending(const arms_t *arms);
 
 /** @brief 读取关节的方向与零位偏置 */
 arms_status arms_get_joint_info(const arms_t *arms, int joint, arms_joint_info *info);

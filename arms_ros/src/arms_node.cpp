@@ -225,7 +225,7 @@ class ArmsNode final : public rclcpp::Node
                 else if (name == "brake_hold")
                     one = arms_set_brake(dev.driver, j, ARMS_BRAKE_HOLD, q.confirm);
                 else
-                    one = arms_service(dev.driver, j, q.hardware_zero ? ARMS_ZERO_HW : ARMS_ZERO_SOFT, q.confirm);
+                    one = arms_service(dev.driver, j, q.soft_zero ? ARMS_ZERO_SOFT : ARMS_ZERO_HW, q.confirm);
                 if (one != ARMS_OK)
                     failed += std::to_string(j) + ": " + arms_last_error() + "; ";
             }
@@ -250,8 +250,9 @@ class ArmsNode final : public rclcpp::Node
                     b.tripped ? "LATCHED" : "none", b.trip_joints, protect);
         if (b.protect.reason != ARMS_PROTECT_NONE)
             t += format(" joint %d value %.3f limit %.3f", b.protect.joint, b.protect.value, b.protect.limit);
-        t += format("\nignored 0x%08x  missing 0x%08x  held 0x%08x  rejected_commands %u\n",
-                    arms_ignored_joints(dev.driver), arms_missing_joints(dev.driver), held, rejected);
+        t += format("\nignored 0x%08x  missing 0x%08x  held 0x%08x  zero_pending 0x%08x  rejected_commands %u\n",
+                    arms_ignored_joints(dev.driver), arms_missing_joints(dev.driver), held,
+                    arms_zero_pending(dev.driver), rejected);
         for (int i = 0; i < ARMS_ARM_COUNT; i++) {
             const auto &a = b.arm[i];
             if (!a.present)

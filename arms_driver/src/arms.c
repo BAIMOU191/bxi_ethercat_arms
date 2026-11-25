@@ -197,6 +197,7 @@ struct arms {
     atomic_uint brake_held;           /* Pn075 = 2 的关节 */
     atomic_uint brake_known;          /* 最近一次 Pn075 回读有效的关节 */
     _Atomic double offset_rad[ARMS_JOINT_LAST + 1]; /* 管理线程更新，周期线程读取 */
+    atomic_uint zero_pending;         /* 已硬件校零、等待驱动器重新上电的关节 */
     arms_mask brake_touched;          /* 本次会话改动过抱闸模式的关节 */
     arms_config cfg;
     arms_options opt;
@@ -451,8 +452,13 @@ static void cycle_rx(arms_t *a, uint64_t now)
                 if (r->consecutive > r->consecutive_max) r->consecutive_max = r->consecutive;
                 if (r->consecutive >= a->cfg.wkc_tolerance && !r->comm_failed) {
                     r->comm_failed = true;
-                    for (int k = 0; k < r->count; ++k)
-                        atomic_fetch_and(&a->brake_known, ~ARMS_MASK_JOINT(r->slot_joint[k]));
+                    for (int k = 0; k < r->count; ++k) {
+                        arms_mask bit = ARMS_MASK_JOINT(r->slot_joint[k]);
+                        atomic_fetch_and(&a->brake_known, ~bit);
+                        /* 驱动器断电后硬件零点生效，软件偏置同时切换为配置中已写入的 0 */
+                        if (atomic_fetch_and(&a->zero_pending, ~bit) & bit)
+                            atomic_store(&a->offset_rad[r->slot_joint[k]], 0.0);
+                    }
                     r->drops++;
                 }
             }
@@ -1528,10 +1534,26 @@ static arms_status brake_to_normal(arms_t *a, arms_mask mask, const char *what)
     return ARMS_OK;
 }
 
+/* 硬件校零后、驱动器重新上电前，拒绝对该关节执行 what */
+static bool zero_pending(arms_t *a, arms_mask mask, const char *what)
+{
+    arms_mask p = atomic_load(&a->zero_pending) & mask & a->joints;
+    if (!p) return false;
+    set_error("%s被拒绝: 关节 %d 已硬件校零（Pn101），需给该臂驱动器断电并重新上电后零点才生效", what,
+              __builtin_ctz(p));
+    return true;
+}
+
+arms_mask arms_zero_pending(const arms_t *a)
+{
+    return a ? atomic_load(&((arms_t *)a)->zero_pending) : 0;
+}
+
 arms_status arms_enable(arms_t *a, arms_mask joints, unsigned int timeout_ms)
 {
     arms_status st;
     if (!a) return ARMS_E_ARG;
+    if (zero_pending(a, joints, "使能")) return ARMS_E_STATE;
     if ((st = brake_to_normal(a, joints, "使能")) != ARMS_OK) return st;
     return request_and_wait(a, joints, REQ_ENABLE, timeout_ms, "使能");
 }
@@ -1556,6 +1578,7 @@ arms_status arms_free(arms_t *a, arms_mask joints, double kd)
             set_error("零力矩拖动: kd %.3f 超过关节 %d 的 gain_max.kd %.3f", kd, j, a->cfg.joint[j].kd_max);
             return ARMS_E_ARG;
         }
+    if (zero_pending(a, joints, "零力矩拖动")) return ARMS_E_STATE;
     if ((st = brake_to_normal(a, joints, "零力矩拖动")) != ARMS_OK) return st;
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_joint_state s;
@@ -1915,6 +1938,8 @@ arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
 {
     arms_joint_state s;
     if (op != ARMS_ZERO_SOFT && op != ARMS_ZERO_HW && op != ARMS_SAVE) return ARMS_E_ARG;
+    if (j < ARMS_JOINT_FIRST || j > ARMS_JOINT_LAST) return ARMS_E_ARG;
+    if (op == ARMS_ZERO_SOFT && zero_pending(a, ARMS_MASK_JOINT(j), "软件校零")) return ARMS_E_STATE;
     arms_status st = prepare_stationary(a, j, confirmed, &s, op == ARMS_SAVE ? "保存参数" : "校零");
     if (st != ARMS_OK)
         return st;
@@ -1946,7 +1971,15 @@ arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
         st = verified(a, j, pn, 1);
         usleep(100000);
         arms_status reset = verified(a, j, pn, 0);
-        return reset != ARMS_OK ? reset : st;
+        if (reset != ARMS_OK) return reset;
+        if (st != ARMS_OK || op != ARMS_ZERO_HW) return st;
+        /* 硬件零点取代软件偏置：配置立即写 0，运行中的偏置在驱动器断电时切换 */
+        atomic_fetch_or(&a->zero_pending, ARMS_MASK_JOINT(j));
+        if (!arms_store_offset(a->cfg.path, j, 0.0)) {
+            set_error("关节 %d 已发出硬件清零脉冲，但无法把 %s 中的 offset_rad 写为 0，请手动修改", j, a->cfg.path);
+            return ARMS_E_SYSTEM;
+        }
+        return ARMS_OK;
     }
     default:
         return ARMS_E_ARG;

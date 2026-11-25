@@ -24,8 +24,8 @@ def request(cls,name,q):
     cli=test.create_client(cls,ns+'/arms/'+name)
     assert cli.wait_for_service(timeout_sec=12),name
     f=cli.call_async(q);until(f.done,30);r=f.result();test.destroy_client(cli);return r
-def call(name,confirm=False,joint=21,joints=None):
-    q=JointOperation.Request();q.joints=joints if joints is not None else 1<<joint;q.confirm=confirm
+def call(name,confirm=False,joint=21,joints=None,soft=False):
+    q=JointOperation.Request();q.joints=joints if joints is not None else 1<<joint;q.confirm=confirm;q.soft_zero=soft
     return request(JointOperation,name,q)
 def trigger(name):
     return request(Trigger,name,Trigger.Request())
@@ -67,7 +67,7 @@ try:
         assert call('free',True).success
         # free 后校零与已失能后校零共用驱动路径；ROS 的授权字段保持兼容。
         assert not call('zero').success
-        assert call('zero',True).success and call('zero',True).success
+        assert call('zero',True,soft=True).success and call('zero',True,soft=True).success
         assert call('free',True).success
         # 使能中拒绝强制松闸
         assert not call('brake_release',True).success
@@ -97,6 +97,9 @@ try:
         r=read_param(21,index=0x1018,sub=1);assert r.success and len(r.raw)==4,r
         assert not read_param(21,pn=1000).success and not read_param(14,pn=75).success
         r=trigger('clear_trip');assert r.success and 'no protection trip' in r.message,r
+        # 默认硬件校零：重新上电前拒绝使能
+        assert call('zero',True,joint=22).success
+        assert not call('enable',True,joint=22).success and 'zero_pending 0x00400000' in trigger('status').message
         m.pos=[];pub.publish(m)
         until(lambda:any(k.key=='rejected_commands' and int(k.value)>0 for k in seen['arms/diagnostics'].status[0].values))
         assert call('disable').success

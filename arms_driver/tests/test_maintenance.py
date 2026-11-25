@@ -54,7 +54,7 @@ with tempfile.TemporaryDirectory() as tmp:
     run('free 21 99', ok=False)
     # 参数读写、保存、硬件校零
     out = run('pn 21 Pn075', 'pn 21 028 12', 'pn 21 28', 'sdo 21 0x2028 0',
-              'pn_save all', 'zero 21 --hw')
+              'pn_save all', 'zero 21')
     assert '(12)' in out, out
     assert '(13)' in run('sdo 21 0x2028 0 13', 'pn 21 28')
     run('zero 21 --bad', ok=False)
@@ -68,19 +68,27 @@ with tempfile.TemporaryDirectory() as tmp:
     assert result.count('已发送参数保存脉冲并回读（Pn097）') == 3 and 'hold    (Pn075=2' in result, result
     run('free 21', 'disable 21', 'pn_save 21')
     assert config.read_bytes() == before_save
-    run('brake 21 hold', 'zero 21 --hw', ok=False)
+    run('brake 21 hold', 'zero 21', ok=False)
     # 无失能反馈时不能校零或改文件；正常的硬件校零则按需失能。
     before = config.read_bytes()
-    for cmd in ('zero 21', 'zero 21 --hw', 'pn_save 21'):
+    for cmd in ('zero 21 --soft', 'zero 21', 'pn_save 21'):
         result = run('free 21', cmd, env={'ARMS_MOCK_STUCK_ENABLED': '1'}, ok=False)
         assert '未确认失能并静止' in result and '已发送参数保存脉冲' not in result, result
     assert config.read_bytes() == before
-    result = run('free 21', 'zero 21 --hw', 'status 21')
+    result = run('free 21', 'zero 21', 'status 21')
     assert any(l.startswith('21 ') and 'locked' in l for l in result.splitlines()), result
+    # 硬件校零：offset_rad 写为 0；重新上电前拒绝使能、拖动和软件校零
+    run('zero 21 --soft')
+    assert next(j for j in json.loads(config.read_text())['joints'] if j['joint'] == 21)['offset_rad'] != 0.0
+    for cmd in ('enable 21', 'free 21', 'zero 21 --soft'):
+        result = run('zero 21', cmd, ok=False)
+        assert '重新上电' in result, result
+    assert next(j for j in json.loads(config.read_text())['joints'] if j['joint'] == 21)['offset_rad'] == 0.0
+    run('zero 21', 'enable 22')
     run('sdo 21 0x6040 0 15', ok=False)
     # 软件校零：立即生效，只改动该关节的 offset_rad，保留其余文本
     before = config.read_text()
-    out = run('free 21', 'zero 21', 'status 21')
+    out = run('free 21', 'zero 21 --soft', 'status 21')
     assert any(l.startswith('21 ') and 'locked' in l for l in out.splitlines()), out
     assert abs(pos(out, 21)) < 1e-3, out
     after = config.read_text()
@@ -90,10 +98,10 @@ with tempfile.TemporaryDirectory() as tmp:
     out = run('status 21')
     assert abs(pos(out, 21)) < 1e-3, out
     # 多关节校零
-    mixed = run('free 15,22', 'zero left', 'status 15,22')
+    mixed = run('free 15,22', 'zero left --soft', 'status 15,22')
     assert any(l.startswith('15 ') and 'locked' in l for l in mixed.splitlines()), mixed
     assert any(l.startswith('22 ') and 'enabled' in l for l in mixed.splitlines()), mixed
-    run('free 21', 'disable 21', 'zero 21')
+    run('free 21', 'disable 21', 'zero 21 --soft')
     data = json.loads(config.read_text())
     assert all(j['offset_rad'] != 0.0 for j in data['joints'] if 15 <= j['joint'] <= 21), data
     # 字段顺序不影响校零，也不允许误改嵌套元数据或相邻关节。
@@ -102,13 +110,13 @@ with tempfile.TemporaryDirectory() as tmp:
     joint['metadata'] = {'joint': 21, 'offset_rad': 17.5}
     joint['joint'] = joint.pop('joint')  # joint 位于对象末尾
     config.write_text(json.dumps(data, indent=2))
-    run('zero 21')
+    run('zero 21 --soft')
     joint['offset_rad'] = 0.7
     assert json.loads(config.read_text()) == data
     joint['joint'] = joint.pop('joint')  # offset_rad 在 joint 之前
     joint['offset_rad'] = -0.25
     config.write_text(json.dumps(data, indent=2))
-    run('zero 21')
+    run('zero 21 --soft')
     joint['offset_rad'] = 0.7
     assert json.loads(config.read_text()) == data
     # SIGTERM 不能退回提示符，即便标准输入保持打开、命令只输入一半。

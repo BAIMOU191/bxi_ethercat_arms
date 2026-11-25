@@ -2,7 +2,8 @@
 # brake_* and zero process each selected joint; a failure does not undo earlier joints.
 uint32 joints
 bool confirm
-bool hardware_zero
+# zero: false = hardware zero (Pn101, default), true = software zero (offset_rad)
+bool soft_zero
 ---
 bool success
 string message

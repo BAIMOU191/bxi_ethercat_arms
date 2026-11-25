@@ -799,10 +799,11 @@ static int cmd_multi_service(int argc, char **argv)
 {
     arms_mask m;
     bool zero = !strcmp(argv[0], "zero");
-    bool hw = zero && argc == 3 && !strcmp(argv[2], "--hw");
+    bool soft = zero && argc == 3 && !strcmp(argv[2], "--soft");
+    bool hw = zero && !soft;
     int j, failures = 0;
     if (need_session() || selection(argv[1], &m)) return -2;
-    if (argc > 2 && !hw) return bad_args("zero 只接受可选参数 --hw");
+    if (argc > 2 && !soft && strcmp(argv[2], "--hw")) return bad_args("zero 只接受可选参数 --soft（软件校零）");
     motion_cancel_refresh(m);
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_service_op op = !zero ? ARMS_SAVE : hw ? ARMS_ZERO_HW : ARMS_ZERO_SOFT;
@@ -819,11 +820,13 @@ static int cmd_multi_service(int argc, char **argv)
                    q.offset_rad);
         } else {
             printf("%d %-20s %s\n", j, arms_joint_name(g_arms, j),
-                   op == ARMS_ZERO_HW ? "已发出硬件清零脉冲（Pn101），重新上电后生效" : "已发送参数保存脉冲并回读（Pn097）");
+                   op == ARMS_ZERO_HW ? "已发出硬件清零脉冲（Pn101）并回读确认，配置中的 offset_rad 已写为 0"
+                                      : "已发送参数保存脉冲并回读（Pn097）");
         }
     }
     if (hw && failures < __builtin_popcount(m))
-        tlog("硬件校零后请把这些关节配置中的 offset_rad 改为 0，避免与软件偏置叠加");
+        tlog("硬件零点在驱动器重新上电后生效：执行 power off、power on（或断开再接通电机电源），再用 status 核对位置。"
+             "重新上电前这些关节拒绝 enable / free，且不要退出本程序");
     return failures ? failed("%d 个关节未完成", failures) : ok();
 }
 
@@ -1090,18 +1093,20 @@ static const command commands[] = {
      "  brake 只临时修改，不触发参数保存。\n"
      "  quit 时尝试恢复本次改动过的关节为 normal，但不改写已保存的参数。",
      "  brake all\n  brake 16 normal\n  brake left hold", cmd_brake},
-    {"zero", "维护", "<关节> [--hw]", 1, 2, "以当前位置为零点",
+    {"zero", "维护", "<关节> [--soft]", 1, 2, "以当前位置为零点（默认硬件校零）",
      "  关节写法同 status，可一次校多个关节。使能关节先自动失能；已失能不重复操作，确认静止后校零，不重新使能。\n"
-     "  默认写入配置文件的 offset_rad 并立即生效，只改该数值，不改变文件排版。\n"
-     "  --hw 向驱动器发送 Pn101 清零脉冲，驱动器重新上电后生效，之后应把 offset_rad 改为 0。\n"
-     "  流程: free <关节> → 托住并停在机械零位 → zero <关节>",
-     "  zero 21\n  zero left\n  zero 21 --hw", cmd_multi_service},
+     "  默认硬件校零：向驱动器发送 Pn101 清零脉冲，零点保存在驱动器中；要求抱闸为 normal（Pn075=0）。\n"
+     "    同时把配置中该关节的 offset_rad 写为 0，避免与软件偏置叠加。\n"
+     "    驱动器重新上电后生效：执行 power off、power on 后用 status 核对；上电前该关节拒绝 enable、free。\n"
+     "  --soft 软件校零：只把当前位置写入配置文件的 offset_rad 并立即生效，不改驱动器，不改变文件排版。\n"
+     "  流程: free <关节> → 托住并停在机械零位 → zero <关节> → power off → power on → status <关节>",
+     "  zero 21\n  zero left\n  zero 21 --soft", cmd_multi_service},
     {"pn_save", "维护", "<关节>", 1, 1, "发送参数保存脉冲（Pn097），写入驱动器掉电保存区",
      "  先支撑负载。对选中关节按需失能，确认静止后发送 Pn097，不重新使能。\n"
      "  不检查或更改 Pn075；强制松闸时不能依靠抱闸承重。持久化结果须重新上电后验读。",
      "  pn_save 21\n  pn_save all", cmd_multi_service},
     {"pn", "维护", "<关节> <编号|别名> [值] | list | help <编号|别名>", 1, 3, "按编号读写；list 仅列手册参考项",
-     "普通写要求失能，不自动回读或保存。Pn075/097/101 走 brake/pn_save/zero --hw 流程。",
+     "普通写要求失能，不自动回读或保存。Pn075/097/101 走 brake/pn_save/zero 流程。",
      "  pn list\n  pn help brake_voltage\n  pn 15 Pn026", cmd_parameter},
     {"sdo", "维护", "<关节> <索引> <子索引> [值]", 3, 4, "按索引及子索引读写对象字典",
      "写值默认 i16；可用 i8/u8/i16/u16/i32/u32/i64/u64:值 或 hex:小端字节串。", "  sdo 15 0x2026 0", cmd_parameter},
@@ -1191,7 +1196,7 @@ static void complete_command(size_t argc, const char *const argv[], le_choices *
     if (argc == 2 && c->fn == cmd_brake) {
         le_add_choice(out, "normal"); le_add_choice(out, "release"); le_add_choice(out, "hold");
     }
-    if (argc == 2 && !strcmp(c->name, "zero")) le_add_choice(out, "--hw");
+    if (argc == 2 && !strcmp(c->name, "zero")) le_add_choice(out, "--soft");
     if (argc == 2 && c->fn == cmd_enable) le_add_choice(out, "-t");
     if (argc == 2 && c->fn == cmd_commtest) le_add_choice(out, "--enabled");
 }
