@@ -31,16 +31,16 @@
 #define KGU_OUT_BYTES 23
 #define KGU_IN_BYTES 16
 
-/* RxPDO 0x1601 (master -> drive) */
+/* RxPDO 0x1601（主站 → 驱动器） */
 #define KGU_OUT_CONTROLWORD 0  /* 0x6040 u16 */
-#define KGU_OUT_TARGET_POS 2   /* 0x4010 f32 rad (output side) */
+#define KGU_OUT_TARGET_POS 2   /* 0x4010 f32 rad（输出端） */
 #define KGU_OUT_TARGET_VEL 6   /* 0x4011 f32 rad/s */
 #define KGU_OUT_TARGET_TFF 10  /* 0x4012 f32 N.m */
 #define KGU_OUT_KP 14          /* 0x4013 f32 */
 #define KGU_OUT_KD 18          /* 0x4014 f32 */
 #define KGU_OUT_MODE 22        /* 0x6060 i8 */
 
-/* TxPDO 0x1A01 (drive -> master) */
+/* TxPDO 0x1A01（驱动器 → 主站） */
 #define KGU_IN_STATUSWORD 0    /* 0x6041 u16 */
 #define KGU_IN_POS 2           /* 0x4000 f32 rad */
 #define KGU_IN_VEL 6           /* 0x4001 f32 rad/s */

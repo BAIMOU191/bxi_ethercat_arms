@@ -159,12 +159,12 @@ cd arms_driver
 
 `safety.drive_monitor`（默认 true）开启后，实时线程用异步请求轮流读取每个从站，不阻塞控制周期：
 
-- **执行器温度**：写 Pn002=77 选择监控量，等待 100 ms 后读对象 0x3000；每个关节约 2 秒更新一次，显示在 `status` 末列、`diag` 和 ROS `actuator_states.driver_temperature`。达到 `safety.temp_warn_c`（默认 75 ℃）记录告警；达到 `safety.temp_max_c`（默认 90 ℃，须低于驱动器自身的 Pn039 报警阈值）全部关节失能并锁定，降温后 `reset`。轮询会改变驱动器数码管显示的监控量，轮询期间不要执行 `pn_save`。
+- **执行器温度**：写 Pn002=77 选择监控量，等待 100 ms 后读对象 0x3000；每个关节约 2 秒更新一次，显示在 `status` 末列和 ROS `actuator_states.driver_temperature`。达到 `safety.temp_warn_c`（默认 75 ℃）记录告警；达到 `safety.temp_max_c`（默认 90 ℃，须低于驱动器自身的 Pn039 报警阈值）全部关节失能并锁定，降温后 `reset`。轮询会改变驱动器数码管显示的监控量，轮询期间不要执行 `pn_save`。
 - **驱动器自报丢帧次数**：Pn002=63，上电清零；增加时记录事件。
 - **ESC 错误计数**：每 10 ms 读一个从站的寄存器 0x0300..0x0313（各端口无效帧、物理层错误、转发错误、链路丢失，以及处理单元和 PDI 错误）。预热完成、通信恢复和 `diag reset` 时清零；增加时记录事件。端口 0 接主站一侧，端口 1 接下一个从站。
 - **CoE 紧急报文**：每个从站保留 8 条，写事件日志时取出。
 
-`diag [关节] [reset]` 查看上述数据；`commtest` 开始时清零 ESC 计数，结束时列出计数非零或驱动器丢帧增加的关节，并判为不通过。ROS 诊断增加 `max_temp_c`、`drive_frame_loss`、`esc_error_sum`。这些事件都写入通信事件日志。
+`diag [关节] [reset]` 查看驱动器丢帧次数和 ESC 错误计数（温度见 `status`）；`commtest` 开始时清零 ESC 计数，结束时列出计数非零或驱动器丢帧增加的关节，并判为不通过。ROS 诊断增加 `max_temp_c`、`drive_frame_loss`、`esc_error_sum`。这些事件都写入通信事件日志。
 
 ### ESC 错误计数分类与 EtherCAT 网口隔离
 

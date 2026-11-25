@@ -70,7 +70,7 @@ int arms_env_start_master(void)
     }
     tlog("启动 EtherLab 主站");
     if (run(MASTER_INIT " start > /dev/null 2>&1") != 0) {
-        tlog_err("EtherLab 主站启动失败，请检查 /etc/sysconfig/ethercat");
+        tlog_err("EtherLab 主站启动失败（配置文件 /etc/sysconfig/ethercat）");
         return -1;
     }
     for (i = 0; i < 50 && access(MASTER_PARAM, R_OK) != 0; ++i) usleep(100000);
@@ -176,6 +176,6 @@ void arms_env_rt_revert(void)
     if (!g_rt_applied || !g_rt_script[0]) return;
     if (run_rt((char *[]){g_rt_script, "revert", NULL}) == 0)
         tlog("实时环境: 已还原");
-    else tlog_err("实时环境还原失败，请执行 sudo %s revert", g_rt_script);
+    else tlog_err("实时环境还原失败，需执行 sudo %s revert", g_rt_script);
     g_rt_applied = false;
 }

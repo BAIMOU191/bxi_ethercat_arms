@@ -25,7 +25,7 @@ const char *const arms_standard_joint_names[31] = {
 
 bool arms_cycle_hz_supported(unsigned int hz)
 {
-    /* KGU manual (Er301): 0.5, 1, 2, 4, 5, 8 ms */
+    /* KGU 手册（Er301）支持的周期: 0.5、1、2、4、5、8 ms */
     return hz == 2000u || hz == 1000u || hz == 500u || hz == 250u || hz == 200u || hz == 125u;
 }
 
@@ -153,7 +153,7 @@ static bool parse_arm(const cJSON *node, arms_arm_config *arm, const char *label
 {
     long master = -1;
     const cJSON *m;
-    if (!node) return true; /* arm absent */
+    if (!node) return true; /* 未配置该臂 */
     arm->present = true;
     arm->master = -1;
     if (!get_str(node, "interface", arm->interface, sizeof(arm->interface)) || arm->interface[0] == '\0') {
@@ -175,7 +175,7 @@ static bool parse_arm(const cJSON *node, arms_arm_config *arm, const char *label
     return true;
 }
 
-/* 允许省略使用默认值，但不把已填写的错误类型静默当作未配置。 */
+/* 字段可省略并使用默认值；已填写但类型错误时报错。 */
 static bool optional_number(const cJSON *object, const char *key, double *out)
 {
     return !cJSON_GetObjectItemCaseSensitive(object, key) || get_num(object, key, out);
@@ -514,7 +514,7 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
         goto out;
     }
     {
-        /* 内置默认值与参考 hw_lib 的电机表一致（pos_limit ±3 rad），速度、力矩阈值沿用原 vel_fault、torque_fault */
+        /* 内置默认值: pos_limit ±3 rad，vel_limit 3 rad/s，tor_limit 30 N·m */
         joint_limits base = {-3.0, 3.0, 3.0, 30.0};
         const cJSON *defaults = cJSON_GetObjectItemCaseSensitive(root, "joint_defaults");
         if (defaults && (!cJSON_IsObject(defaults) || !parse_limits(defaults, &base, "joint_defaults", error, size)))

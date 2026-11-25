@@ -9,7 +9,7 @@
 # apply:  EtherCAT 网口中断绑定到 irq_cpu；ksoftirqd/<irq_cpu> 设为 SCHED_FIFO；
 #         其他线程和非绑定工作队列限制到其余 CPU；实时 CPU 调频设为 performance；
 #         暂停 kerneloops；EtherCAT 网口退出 NetworkManager 管理、去掉 IPv4 地址、关闭 IPv6，
-#         使主机的 DHCP、mDNS、IPv6 等普通报文不再发到 EtherCAT 链上（链路保持 UP，不影响主站）。
+#         链路保持 UP。
 #         参数默认取配置文件 realtime 段和 arms 段，命令行参数优先。
 # revert: 按状态文件逐项还原（网口交还 NetworkManager，或恢复原有地址和 IPv6 设置）。
 set -euo pipefail
@@ -81,7 +81,7 @@ nm_managed() {
   [[ -n $st && $st != unmanaged ]]
 }
 
-# 让主机网络栈不再使用 EtherCAT 网口。EtherLab 通用驱动直接收发原始帧，不需要 IP 地址。
+# 主机网络栈停用 EtherCAT 网口；EtherLab 通用驱动收发原始帧，不使用 IP 地址
 isolate_iface() {
   local ifc=$1 addr v6=/proc/sys/net/ipv6/conf/$1/disable_ipv6
   [[ -d /sys/class/net/$ifc ]] || return 0
@@ -90,7 +90,7 @@ isolate_iface() {
     nmcli device set "$ifc" managed no
     echo "  $ifc 退出 NetworkManager 管理"
   else
-    # 不由 NetworkManager 管理的地址记录下来，还原时重新添加
+    # 记录不由 NetworkManager 管理的地址，还原时重新添加
     for addr in $(ip -4 -o addr show dev "$ifc" | awk '{print $4}'); do
       echo "addr4 $ifc $addr" >> "$STATE"
     done
@@ -115,7 +115,7 @@ check_params() {
 
 apply() {
   need_root apply
-  [[ -e $STATE ]] && { echo "已有未还原的设置 ($STATE)，请先执行 revert" >&2; exit 1; }
+  [[ -e $STATE ]] && { echo "存在未还原的设置 ($STATE)，需先执行 revert" >&2; exit 1; }
   load_config
   check_params
   local housekeeping; housekeeping=$(cpu_list_without "$RT_CPU" "$IRQ_CPU")
@@ -184,7 +184,7 @@ revert() {
       svc) systemctl start "$a" ;;
       ipv6) [[ -w /proc/sys/net/ipv6/conf/$a/disable_ipv6 ]] && echo "$b" > /proc/sys/net/ipv6/conf/$a/disable_ipv6 ;;
       addr4) ip -4 addr add "$b" dev "$a" 2>/dev/null || true ;;
-      nm) nmcli device set "$a" managed yes 2>/dev/null || echo "  $a 交还 NetworkManager 失败，可执行 nmcli device set $a managed yes" ;;
+      nm) nmcli device set "$a" managed yes 2>/dev/null || echo "  $a 交还 NetworkManager 失败" ;;
     esac
   done < "$STATE"
   rm -f "$STATE"

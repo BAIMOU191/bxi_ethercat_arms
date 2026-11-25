@@ -269,7 +269,7 @@ static int cmd_bus(int argc, char **argv)
 static int bad_args(const char *reason)
 {
     failed("%s", reason);
-    return -2; /* 由命令分派器统一打印用法。 */
+    return -2; /* 由命令分派器打印用法 */
 }
 
 static int selection(const char *text, arms_mask *mask)
@@ -332,7 +332,7 @@ static int cmd_enable(int argc, char **argv)
         return bad_args("-t 需要非负整数毫秒数");
     if (arms_enable(g_arms, mask, (unsigned int)ms) != ARMS_OK) return failed("使能失败: %s", arms_last_error());
     show_modes(mask, true);
-    tlog("注意: 使能后指令为零（kp=0、kd=0，零力矩），抱闸已松开，受重力的关节会下落；用 mit 下发指令");
+    tlog("使能后指令为零（kp=0、kd=0），关节无保持力矩");
     return ok();
 }
 
@@ -368,7 +368,7 @@ static int cmd_mit(int argc, char **argv)
     arms_mask mask;
     arms_command c = {0};
     double *fields[] = {&c.position, &c.kp, &c.kd, &c.velocity, &c.torque};
-    if (argc < 5 || argc > 7) return bad_args("请指定关节、位置、kp、kd，速度和前馈可选");
+    if (argc < 5 || argc > 7) return bad_args("参数: <关节> <位置> <kp> <kd> [速度] [前馈]");
     if (selection(argv[1], &mask)) return -2;
     for (int i = 2; i < argc; ++i)
         if (!number(argv[i], fields[i - 2])) return bad_args("运动参数必须是有限数值");
@@ -409,7 +409,7 @@ static int wait_bus_online(unsigned int timeout_ms)
     return -1;
 }
 
-/* 命令线程与掉线监视线程共用 PCI 句柄；锁仅覆盖 SDK 调用，不覆盖总线恢复等待。 */
+/* 命令线程与掉线监视线程共用 PCI 句柄；锁只保护 SDK 调用，不包含总线恢复等待 */
 static int request_power(bool on)
 {
     int rc;
@@ -433,7 +433,7 @@ static int cmd_power(int argc, char **argv)
     if (!arms_power_available()) return failed("本程序不支持 PCI 电源控制");
     if (mock_backend) return failed("模拟后端不访问 PCI 电源");
     if (!strcmp(op, "status")) {
-        printf("电源: %s（以现场指示为准）\n", !power_known ? "状态未知" : powered ? "已请求上电" : "已请求断电");
+        printf("电源: %s（本程序的请求状态，非硬件回读）\n", !power_known ? "状态未知" : powered ? "已请求上电" : "已请求断电");
     } else if (!strcmp(op, "on")) {
         if (request_power(true) != 0) {
             return failed("上电失败");
@@ -447,15 +447,15 @@ static int cmd_power(int argc, char **argv)
             if (request_power(false) == 0) {
                 return failed("上电后在线检查未通过，已重新下电。%s", why);
             }
-            return failed("上电后在线检查未通过，下电失败，请立即手动断电。%s", why);
+            return failed("上电后在线检查未通过，下电失败，需手动断电。%s", why);
         }
         if (arms_clear_trip(g_arms) != ARMS_OK) return failed("离线保护未能清除: %s", arms_last_error());
-        tlog("在线检查通过，通信正常；未请求使能");
+        tlog("在线检查通过，关节保持失能");
     } else {
         if (!powered && !power_known) return failed("未接管电源，无法确认或切断外部供电");
         if (motion_enabled() && disable_joints(arms_opened_joints(g_arms), 50)) return -1;
         if (request_power(false) != 0) {
-            return failed("断电失败，请核对现场电源状态");
+            return failed("断电失败，电源状态未知");
         }
     }
     return ok();
@@ -466,8 +466,8 @@ static int cmd_power(int argc, char **argv)
 enum { DIAG_LINE = 1, DIAG_PROC = 2, DIAG_LOSS = 4 };
 
 /*
- * 打印执行器温度、驱动器丢帧次数和 ESC 错误计数，线路类（无效帧、物理层错误、链路丢失）与
- * 处理类（转发错误、处理单元错误、PDI 错误）分列。only_nonzero 时只列出有计数、或驱动器丢帧次数
+ * 打印驱动器丢帧次数和 ESC 错误计数，线路类（无效帧、物理层错误、链路丢失）与处理类
+ * （转发错误、处理单元错误、PDI 错误）分列。only_nonzero 为真时只列出存在计数或驱动器丢帧次数
  * 相对 loss_base（按关节号索引，可为 NULL）增加的关节。返回 DIAG_* 位的组合。
  */
 static int print_diag(arms_mask mask, bool only_nonzero, const int32_t *loss_base)
@@ -476,7 +476,7 @@ static int print_diag(arms_mask mask, bool only_nonzero, const int32_t *loss_bas
     bool header = false;
     for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_joint_state s;
-        char where[16], temp[16], loss[16];
+        char where[16], loss[16];
         const uint8_t *e;
         int flags = 0;
         if (!(mask & ARMS_MASK_JOINT(j)) || arms_read_joint(g_arms, j, &s) != ARMS_OK) continue;
@@ -489,27 +489,25 @@ static int print_diag(arms_mask mask, bool only_nonzero, const int32_t *loss_bas
         if (only_nonzero && !flags) continue;
         found |= flags;
         if (!header) {
-            printf("%-3s %-20s %-7s %6s %9s  %-24s  %-24s  %s\n", "关节", "名称", "臂/位置", "温度℃", "驱动器丢帧",
+            printf("%-3s %-20s %-7s %9s  %-24s  %-24s  %s\n", "关节", "名称", "臂/位置", "驱动器丢帧",
                    "线路类 端口0 无效/物理/丢链", "线路类 端口1 无效/物理/丢链", "处理类 转发0/转发1/处理单元/PDI");
             header = true;
         }
         snprintf(where, sizeof(where), "%s/%d", s.arm == 0 ? "L" : "R", s.slave);
-        if (isnan(s.temperature)) snprintf(temp, sizeof(temp), "-");
-        else snprintf(temp, sizeof(temp), "%.0f", s.temperature);
         if (s.drive_frame_loss < 0) snprintf(loss, sizeof(loss), "-");
         else snprintf(loss, sizeof(loss), "%d", s.drive_frame_loss);
         if (!s.esc_valid) {
-            printf("%-3d %-20s %-7s %6s %9s  %s\n", j, s.name ? s.name : "-", where, temp, loss, "ESC 计数尚未读到");
+            printf("%-3d %-20s %-7s %9s  %s\n", j, s.name ? s.name : "-", where, loss, "ESC 计数尚未读到");
         } else {
-            printf("%-3d %-20s %-7s %6s %9s  %4u %4u %4u               %4u %4u %4u               %4u %4u %4u %4u\n", j,
-                   s.name ? s.name : "-", where, temp, loss, e[0], e[1], e[16], e[2], e[3], e[17], e[8], e[9], e[12],
+            printf("%-3d %-20s %-7s %9s  %4u %4u %4u               %4u %4u %4u               %4u %4u %4u %4u\n", j,
+                   s.name ? s.name : "-", where, loss, e[0], e[1], e[16], e[2], e[3], e[17], e[8], e[9], e[12],
                    e[13]);
         }
     }
     return found;
 }
 
-/* diag：执行器温度、驱动器丢帧次数和各从站 ESC 错误计数 */
+/* diag：驱动器丢帧次数和各从站 ESC 错误计数 */
 static int cmd_diag(int argc, char **argv)
 {
     arms_mask m = arms_opened_joints(g_arms);
@@ -523,13 +521,10 @@ static int cmd_diag(int argc, char **argv)
     if (selector && selection(selector, &m)) return -2;
     if (reset) {
         arms_clear_esc_counters(g_arms);
-        tlog("已请求清零全部从站的 ESC 错误计数，约 1 秒内生效；驱动器丢帧次数只能断电清零");
+        tlog("已请求清零全部从站的 ESC 错误计数，约 1 秒内生效");
         return ok();
     }
     print_diag(m, false, NULL);
-    printf("端口 0 接主站一侧，端口 1 接下一个从站。ESC 计数自预热完成（或 diag reset、通信恢复）起累计，到 255 停止。\n"
-           "线路类计数增加指向网线、接头或从站网口：哪个从站端口 0 先出现计数，问题通常在它和上一个从站之间。\n"
-           "只有处理类计数时帧在电气上完好，只是被从站拒绝，通常是主机发往 EtherCAT 网口的普通网络报文。\n");
     return ok();
 }
 
@@ -547,8 +542,8 @@ static int cmd_commtest(int argc, char **argv)
     if (!integer(argv[1], 1, 86400, &seconds)) return bad_args("秒数必须是 1..86400 的整数");
     if (argc != 2 && (argc != 5 || strcmp(argv[2], "--enabled") || !number(argv[3], &hold_kp) ||
                       !number(argv[4], &hold_kd)))
-        return bad_args("可选参数为 --enabled <kp> <kd>（使能后以该增益保持当前位置）");
-    if (!enabled && motion_enabled()) return failed("常规通信测试需要全部关节失能；带载测试请使用 --enabled <kp> <kd>");
+        return bad_args("可选参数: --enabled <kp> <kd>");
+    if (!enabled && motion_enabled()) return failed("关节须全部失能；使能状态下测试使用 --enabled <kp> <kd>");
     if (enabled) {
         if (motion_hold(all)) goto enable_error;
         if (arms_enable(g_arms, all, 0) != ARMS_OK) {
@@ -576,7 +571,7 @@ static int cmd_commtest(int argc, char **argv)
         arms_joint_state s;
         loss_base[j] = arms_read_joint(g_arms, j, &s) == ARMS_OK ? s.drive_frame_loss : -1;
     }
-    delay_ms(300); /* 等 ESC 错误计数清零在各从站完成 */
+    delay_ms(300); /* 等待各从站完成 ESC 错误计数清零 */
     tlog("通信测试开始: %s%ld 秒，回车或 Ctrl+C 提前结束（ESC 错误计数已清零）", label, seconds);
     for (t = 1; t <= seconds; ++t) {
         if (motion_wait_or_enter(1000)) {
@@ -604,11 +599,10 @@ static int cmd_commtest(int argc, char **argv)
     {
         int found = print_diag(all, true, loss_base);
         if (found & (DIAG_LINE | DIAG_LOSS)) {
-            printf("以上关节在测试期间有线路类错误计数或驱动器自报丢帧（详见 diag 和通信事件日志）\n");
+            printf("以上关节在测试期间出现线路类 ESC 错误计数或驱动器丢帧，明细见 diag 和通信事件日志\n");
             pass = false;
         } else if (found & DIAG_PROC) {
-            printf("提示: 只有处理类计数（从站拒绝的帧，线路类为 0），不是网线问题，不影响结果；"
-                   "通常是主机发往 EtherCAT 网口的普通网络报文，可用 rt_setup.sh status 检查网口\n");
+            printf("提示: 存在处理类 ESC 错误计数，线路类计数为 0，不计入测试结果\n");
         }
     }
     for (i = 0; i < ARMS_ARM_COUNT; ++i)
@@ -716,7 +710,7 @@ static int cmd_info(int argc, char **argv)
             arms_get_joint_info(g_arms, j, &q);
             arms_get_limits(g_arms, j, &l);
             printf("    方向 %+d 偏置 %.6f rad\n", q.direction, q.offset_rad);
-            printf("    软位置限位 pos_limit [%.3f, %.3f] rad（越界后屏蔽朝外的速度和前馈，不截断指令）\n",
+            printf("    软位置限位 pos_limit [%.3f, %.3f] rad\n",
                    l.pos_limit_min, l.pos_limit_max);
             printf("    反馈保护: vel_limit %.3f rad/s  tor_limit %.3f N.m\n", l.vel_limit, l.tor_limit);
         }
@@ -786,21 +780,20 @@ static void startup_selftest(void)
     if (faulted) {
         tlog("自检: 发现驱动器故障，自动复位一次");
         if (arms_reset(g_arms, faulted, 0) != ARMS_OK)
-            tlog_err("自检: 复位未完成: %s；可手动执行 reset 或查看 status", arms_last_error());
+            tlog_err("自检: 复位未完成: %s", arms_last_error());
     }
     {
         arms_mask released = 0, held = 0, unknown = 0;
         char list[256];
         arms_brake_scan(g_arms, &released, &held, &unknown);
         if (released)
-            tlog_err("自检: 关节%s 为强制松闸（Pn075=1），失能时抱闸不提供保持力；"
-                     "enable / free 时会自动切回正常控制抱闸（Pn075=0）",
+            tlog_err("自检: 关节%s 为强制松闸（Pn075=1），enable / free 时改为 0",
                      mask_list(released, list, sizeof(list)));
         if (held)
-            tlog_err("自检: 关节%s 为强制抱闸（Pn075=2）；enable / free 时会自动切回正常控制抱闸（Pn075=0）",
+            tlog_err("自检: 关节%s 为强制抱闸（Pn075=2），enable / free 时改为 0",
                      mask_list(held, list, sizeof(list)));
         if (unknown)
-            tlog_err("自检: 关节%s 的 Pn075 读取失败，可用 brake <关节> 查看", mask_list(unknown, list, sizeof(list)));
+            tlog_err("自检: 关节%s 的 Pn075 读取失败", mask_list(unknown, list, sizeof(list)));
     }
 }
 static bool uint_arg(const char *s, unsigned max, unsigned *out)
@@ -861,9 +854,9 @@ static int cmd_brake(int argc, char **argv)
         }
     }
     if (mode == ARMS_BRAKE_RELEASE)
-        tlog("强制松闸的关节失能时没有保持力；用手拖动请用 free。enable / free 会自动切回 normal（Pn075=0）");
+        tlog("强制松闸: 失能时抱闸不提供保持力；enable / free 时改为 normal");
     else if (mode == ARMS_BRAKE_HOLD)
-        tlog("强制抱闸期间伺服不松闸；enable / free 会自动切回 normal（Pn075=0）");
+        tlog("强制抱闸: 使能时不松闸；enable / free 时改为 normal");
     return failures ? failed("%d 个关节未完成", failures) : ok();
 }
 
@@ -877,7 +870,7 @@ static int cmd_free(int argc, char **argv)
     if (argc > 2 && !number(argv[2], &kd)) return bad_args("kd 必须是非负数值");
     motion_cancel_refresh(m);
     if (arms_free(g_arms, m, kd) != ARMS_OK) return failed("%s", arms_last_error());
-    tlog("零力矩拖动:%s，kd=%.3f。关节没有保持力，请先托住再 disable；hold 不恢复刚度", mask_list(m, list, sizeof(list)),
+    tlog("零力矩拖动:%s，kd=%.3f", mask_list(m, list, sizeof(list)),
          kd);
     return ok();
 }
@@ -891,7 +884,7 @@ static int cmd_multi_service(int argc, char **argv)
     bool hw = zero && !soft;
     int j, failures = 0;
     if (need_session() || selection(argv[1], &m)) return -2;
-    if (argc > 2 && !soft && strcmp(argv[2], "--hw")) return bad_args("zero 只接受可选参数 --soft（软件校零）");
+    if (argc > 2 && !soft && strcmp(argv[2], "--hw")) return bad_args("可选参数: --soft");
     motion_cancel_refresh(m);
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_service_op op = !zero ? ARMS_SAVE : hw ? ARMS_ZERO_HW : ARMS_ZERO_SOFT;
@@ -913,12 +906,11 @@ static int cmd_multi_service(int argc, char **argv)
         }
     }
     if (hw && failures < __builtin_popcount(m))
-        tlog("硬件零点在驱动器重新上电后生效：执行 power off、power on（或断开再接通电机电源），再用 status 核对位置。"
-             "重新上电前这些关节拒绝 enable / free，且不要退出本程序");
+        tlog("硬件零点在驱动器重新上电后生效；生效前上述关节不能 enable、free");
     return failures ? failed("%d 个关节未完成", failures) : ok();
 }
 
-/* Pn 编号按十进制；对象索引可用 0x 前缀。别名也在同一目录中解析。 */
+/* Pn 编号为十进制，对象索引可带 0x 前缀；别名在参数目录中解析 */
 static int pn_number(const char *key)
 {
     const char *digits = !strncasecmp(key, "pn", 2) ? key + 2 : key;
@@ -935,7 +927,7 @@ static void pn_describe(const arms_pn_info *p)
 {
     printf("Pn%03u  0x%04x:00  %s", p->number, arms_pn_index(p->number), p->name);
     if (p->alias) printf(" [%s]", p->alias);
-    printf("  参考值 ");
+    printf("  范围 ");
     if (p->choices) {
         for (const int *c = p->choices; *c >= 0; c++) printf("%s%d", c == p->choices ? "" : "/", *c);
     } else if (p->min == p->max) printf("%d", p->min);
@@ -951,7 +943,7 @@ static int hex_digit(char c)
     return -1;
 }
 
-/* 不试写、不先读对象猜类型：默认保持原来的 INT16，其他宽度由调用者明确指定。 */
+/* 写入类型默认为 INT16，其他宽度由参数前缀指定 */
 static bool encode_value(const char *arg, bool typed, uint8_t *out, size_t cap, size_t *len)
 {
     if (typed && !strncmp(arg, "hex:", 4)) {
@@ -1041,7 +1033,7 @@ static int cmd_parameter(int argc, char **argv)
     }
     uint8_t payload[256]; size_t len;
     if (!encode_value(argv[base], sdo, payload, sizeof(payload), &len))
-        return failed(sdo ? "SDO 值编码无效；用整数、i/u 位宽前缀或 hex:字节串" : "需要 INT16 原始整数");
+        return failed(sdo ? "SDO 值格式无效，应为整数、i/u 位宽前缀或 hex:字节串" : "值应为 INT16 整数");
     unsigned word = len == 2 ? payload[0] | ((unsigned)payload[1] << 8) : UINT_MAX;
     if (number == 75 && word <= 2) {
         char *av[] = {"brake", argv[1], (char *)arms_brake_mode_name((arms_brake_mode)word)};
@@ -1124,118 +1116,100 @@ static int cmd_service(int argc, char **argv)
 static int cmd_help(int argc, char **argv);
 
 static const command commands[] = {
-    {"help", "通用", "[命令]", 0, 1, "列出所有命令，或显示某个命令的详细用法",
-     "  不带参数: 按分组列出命令\n  带命令名: 等同于 <命令> -h", "  help\n  help commtest", cmd_help},
-    {"status", "查看", "[关节] [--raw]", 0, 2, "显示关节状态表（位置/速度/力矩、状态、AL、状态字、错误码）",
-     "  关节写法: 21 | l_wrist_z | left | right | all | 15-18 | 21,28（默认全部已打开关节）\n"
-     "  状态: offline / preop / safeop / locked（OP，伺服失能）/ enabled / FAULT\n"
-     "        released / held（失能，且抱闸为强制松闸 / 强制抱闸）\n"
-     "  cmd、kp、kd 为实际下发的位置和增益；P=实际位置超出 pos_limit，朝外的速度和前馈已清零，\n"
-     "  T=超时，flt=累计故障次数。\n"
-     "  温度为执行器温度（Pn002=77 的监控量），约每 2 秒更新；- 表示尚未读到。",
+    {"help", "通用", "[命令]", 0, 1, "列出全部命令，或显示指定命令的详细用法",
+     "  不带参数时按分组列出命令；带命令名时等同于 <命令> -h。", "  help\n  help commtest", cmd_help},
+    {"status", "查看", "[关节] [--raw]", 0, 2, "显示关节状态表",
+     "  关节: 21 | l_wrist_z | left | right | all | 15-18 | 21,28，默认为全部已打开关节。\n"
+     "  状态: offline / preop / safeop / locked（OP，伺服失能）/ enabled / FAULT；\n"
+     "        released / held 表示伺服失能且抱闸模式为强制松闸 / 强制抱闸。\n"
+     "  cmd、kp、kd: 当前下发的位置指令和增益。\n"
+     "  flag: P 为软位置限位生效，T 为指令超时。flt: 累计故障次数。\n"
+     "  温度: 执行器温度（Pn002=77），周期约 2 秒；- 表示未读取。\n"
+     "  --raw: 附加显示原始 PDO 数据。",
      "  status\n  status left\n  status 21", cmd_status},
-    {"diag", "查看", "[关节] [reset]", 0, 2, "显示执行器温度、驱动器丢帧次数和各从站 ESC 错误计数",
-     "  驱动器丢帧: 驱动器自报的 EtherCAT 丢帧次数（Pn002=63），上电清零，不能由程序清零。\n"
-     "  ESC 错误计数: 从站通信芯片寄存器 0x0300..0x0313，自预热完成、diag reset 或通信恢复起累计，到 255 停止。\n"
-     "    线路类: 各端口无效帧、物理层错误、链路丢失，指向网线、接头或从站网口；\n"
-     "      哪个从站的端口 0 先出现计数，故障点通常在它与上一个从站之间（端口 0 接主站一侧，端口 1 接下一个从站）。\n"
-     "    处理类: 转发错误、处理单元错误、PDI 错误。只有处理类时帧在电气上完好，只是被从站拒绝，\n"
-     "      通常是主机发往 EtherCAT 网口的普通网络报文（rt_setup.sh 运行期间会阻止）。\n"
-     "  reset: 清零全部从站的 ESC 错误计数。线路类计数增加逐条写入通信事件日志；处理类按 safety.esc_summary_s\n"
-     "    （默认 60 秒）汇总一条；温度告警和过温保护也写入日志。\n"
-     "  过温保护: 温度达到 safety.temp_max_c 时全部关节失能并锁定，降温后 reset；safety.temp_warn_c 只告警。",
+    {"diag", "查看", "[关节] [reset]", 0, 2, "显示驱动器丢帧次数和从站 ESC 错误计数",
+     "  驱动器丢帧: 驱动器统计的 EtherCAT 丢帧次数（Pn002=63），断电清零。\n"
+     "  ESC 错误计数: 寄存器 0x0300..0x0313，饱和值 255。端口 0 为主站侧，端口 1 为下游侧。\n"
+     "    线路类: 无效帧、物理层错误、链路丢失。\n"
+     "    处理类: 转发错误、处理单元错误、PDI 错误。\n"
+     "  reset: 清零全部从站的 ESC 错误计数。",
      "  diag\n  diag left\n  diag reset", cmd_diag},
-    {"watch", "查看", "[关节] [刷新Hz]", 0, 2, "原地刷新显示关节状态、位置、速度、力矩，回车结束",
-     "  每个关节一行，在同一块区域内刷新。刷新频率 1..50 Hz，默认 5。\n"
-     "  使用 -T 启动时输出经过时间戳处理，改为每次刷新打印一组。",
+    {"watch", "查看", "[关节] [刷新Hz]", 0, 2, "持续刷新显示关节状态，回车结束",
+     "  刷新频率 1..50 Hz，默认 5 Hz。以 -T 启动时按时间戳逐次输出。",
      "  watch\n  watch left 10\n  watch 21", cmd_watch},
-    {"bus", "查看", "[reset]", 0, 1, "显示两条臂的通信统计；reset 清零",
-     "  周期: 平均/最短/最长间隔、抖动、唤醒延迟、超时周期、跳过周期\n"
-     "  每条臂: 链路、OP 从站数、WKC、异常次数、最长连续异常、发送错误、收发耗时",
+    {"bus", "查看", "[reset]", 0, 1, "显示两条臂的通信统计；reset 清零统计",
+     "  周期: 平均/最短/最长间隔、抖动、唤醒延迟、超时周期、跳过周期。\n"
+     "  每条臂: 链路、OP 从站数、WKC、异常次数、最长连续异常、发送错误、收发耗时。",
      "  bus\n  bus reset", cmd_bus},
-    {"info", "查看", "[关节]", 0, 1, "显示版本、配置文件、周期、实时 CPU、关节与总线位置的对应关系", "",
-     "  info", cmd_info},
-    {"enable", "控制", "<关节> [-t 毫秒]", 1, 3, "使能并显示模式和当前位置（使能后零力矩）",
-     "  与参考 hw_lib 一致，使能后指令为零：kp=0、kd=0、速度 0、前馈 0。正常控制抱闸下使能会松开抱闸，\n"
-     "  受重力的关节会下落，先托住，或使能后立即用 mit 下发带增益的指令。\n"
-     "  -t 指定等待超时；0 或省略时使用驱动默认值。\n"
-     "  抱闸为强制松闸（Pn075=1）或强制抱闸（Pn075=2）的关节，先自动切回正常控制抱闸（Pn075=0），不保存。",
-     "  enable left -t 2000", cmd_enable},
-    {"disable", "控制", "[关节]", 0, 1, "停止刷新并使关节失能", "  缺省作用于全部已打开关节。", "  disable",
-     cmd_disable},
-    {"reset", "控制", "<关节>", 1, 1, "故障复位并显示模式", "  复位后处于失能状态，运动前须重新使能。",
-     "  reset 17", cmd_reset},
+    {"info", "查看", "[关节]", 0, 1, "显示版本、配置、实时参数及关节映射和限位", "", "  info\n  info 21", cmd_info},
+    {"enable", "控制", "<关节> [-t 毫秒]", 1, 3, "使能关节",
+     "  使能后指令为零: kp=0、kd=0，速度和前馈为 0。\n"
+     "  抱闸模式（Pn075）为 1 或 2 的关节先改为 0，不保存。\n"
+     "  -t: 使能等待超时，0 或省略时使用驱动默认值。",
+     "  enable 21\n  enable left -t 2000", cmd_enable},
+    {"disable", "控制", "[关节]", 0, 1, "使关节失能", "  默认为全部已打开关节。", "  disable", cmd_disable},
+    {"reset", "控制", "<关节>", 1, 1, "故障复位", "  复位后关节处于失能状态。", "  reset 17", cmd_reset},
     {"mit", "控制", "<关节> <位置> <kp> <kd> [速度] [前馈]", 4, 6, "下发 MIT 指令",
-     "  位置单位 rad，速度 rad/s，前馈 N.m；kp、kd 必填，速度和前馈默认为 0。\n"
-     "  与参考 hw_lib 一致，指令原样下发，不插值、不限幅：目标离当前位置较远时关节会快速跳向目标，\n"
-     "  请小步给定或降低 kp。kp、kd 为负时按 0 下发。实际位置超出 pos_limit 时，朝外的速度和前馈被清零。\n"
-     "  非零速度或前馈持续刷新。所有关节均须已使能。",
+     "  单位: 位置 rad，速度 rad/s，前馈 N·m。速度和前馈默认为 0。\n"
+     "  指令直接下发，不插值、不限幅；kp、kd 为负时按 0 下发。\n"
+     "  实际位置超出 pos_limit 时，朝外的速度和前馈置 0。\n"
+     "  速度或前馈非零时以 100 Hz 持续刷新。所选关节须已使能。",
      "  mit 17 0.1 5 0.5\n  mit 18 0.1 2 0.1 0.05", cmd_mit},
-    {"hold", "控制", "[关节]", 0, 1, "停止刷新并保持当前指令位置",
-     "  清零速度与前馈，保留当前的 kp、kd 和位置；缺省作用于全部已打开关节。\n"
-     "  使能后尚未下发过指令时 kp=0，hold 不产生保持力。", "  hold", cmd_hold},
+    {"hold", "控制", "[关节]", 0, 1, "保持当前指令位置",
+     "  停止指令刷新，速度和前馈置 0，位置、kp、kd 不变。默认为全部已打开关节。", "  hold", cmd_hold},
     {"swing", "测试", "<关节> <幅值> <周期秒> <次数> <kp> <kd>", 6, 6, "以当前指令位置为中心正弦摆动",
-     "  幅值单位 rad。结束时回到中心；回车或 Ctrl+C 中止并保持当前指令位置。",
+     "  幅值单位 rad，以 200 Hz 下发位置和速度。结束时回到中心；回车或 Ctrl+C 中止并保持当前指令位置。",
      "  swing 17 0.05 4 3 5 0.5", cmd_swing},
-    {"selftest", "查看", "", 0, 0, "检查在线状态、故障与保护锁定", "不使能或移动关节。", "  selftest",
-     cmd_selftest},
-    {"identify", "查看", "<关节>", 1, 1, "读取从站身份、序列号与配置映射", "不移动关节。", "  identify 21",
-     cmd_service},
-    {"free", "控制", "<关节> [kd]", 1, 2, "零力矩拖动：使能后 kp=0，可用手转动关节",
-     "  关节写法同 status：21 | 15-18 | left | right | all。kd 为阻尼，默认 0（最轻）。\n"
-     "  关节没有保持力，肩、肘会因重力下落，执行前先托住。超过 vel_limit 会触发超速保护。\n"
-     "  先支撑关节再 disable；hold 保留 kp=0，不会恢复位置保持力。\n  抱闸为强制松闸或强制抱闸时，先自动切回正常控制抱闸（Pn075=0）。",
+    {"selftest", "查看", "", 0, 0, "检查在线状态、故障与保护锁定", "  不改变关节状态。", "  selftest", cmd_selftest},
+    {"identify", "查看", "<关节>", 1, 1, "读取从站身份、序列号与配置映射", "", "  identify 21", cmd_service},
+    {"free", "控制", "<关节> [kd]", 1, 2, "零力矩拖动",
+     "  使能关节并下发 kp=0、速度 0、前馈 0，kd 为阻尼，默认 0。\n"
+     "  抱闸模式（Pn075）为 1 或 2 的关节先改为 0，不保存。",
      "  free 21\n  free left 0.2", cmd_free},
-    {"brake", "维护", "<关节> [normal|release|hold]", 1, 2, "查看或临时设置抱闸模式（Pn075）",
-     "  不带模式: 读取并显示 Pn075。\n"
-     "  0 normal  正常控制抱闸：伺服使能时松闸，失能时抱闸。任何状态都可设置。\n"
-     "  1 release 强制松闸：与伺服状态无关；失能时抱闸不提供保持力，且电机阻尼很大，仍难以用手转动。\n"
-     "  2 hold    强制抱闸：与伺服状态无关，使能时也不松闸。\n"
-     "  release / hold 要求关节失能；之后对该关节执行 enable 或 free 会自动切回 normal（0）。\n"
-     "  brake 只临时修改，不触发参数保存。\n"
-     "  quit 时尝试恢复本次改动过的关节为 normal，但不改写已保存的参数。",
+    {"brake", "维护", "<关节> [normal|release|hold]", 1, 2, "查看或设置抱闸模式（Pn075）",
+     "  不带模式时读取 Pn075。\n"
+     "  0 normal  正常控制: 伺服使能时松闸，失能时抱闸。\n"
+     "  1 release 强制松闸。\n"
+     "  2 hold    强制抱闸。\n"
+     "  release、hold 要求关节失能。设置不保存；quit 时将本次修改过的关节恢复为 normal。",
      "  brake all\n  brake 16 normal\n  brake left hold", cmd_brake},
-    {"zero", "维护", "<关节> [--soft]", 1, 2, "以当前位置为零点（默认硬件校零）",
-     "  关节写法同 status，可一次校多个关节。使能关节先自动失能；已失能不重复操作，确认静止后校零，不重新使能。\n"
-     "  默认硬件校零：向驱动器发送 Pn101 清零脉冲，零点保存在驱动器中；要求抱闸为 normal（Pn075=0）。\n"
-     "    同时把配置中该关节的 offset_rad 写为 0，避免与软件偏置叠加。\n"
-     "    驱动器重新上电后生效：执行 power off、power on 后用 status 核对；上电前该关节拒绝 enable、free。\n"
-     "  --soft 软件校零：只把当前位置写入配置文件的 offset_rad 并立即生效，不改驱动器，不改变文件排版。\n"
-     "  流程: free <关节> → 托住并停在机械零位 → zero <关节> → power off → power on → status <关节>",
+    {"zero", "维护", "<关节> [--soft]", 1, 2, "以当前位置为零点",
+     "  已使能的关节先失能，确认静止后校零，完成后保持失能。\n"
+     "  默认硬件校零: 写 Pn101 清零脉冲，并将配置中的 offset_rad 置 0；要求 Pn075=0。\n"
+     "    驱动器重新上电后生效，生效前该关节不能 enable、free。\n"
+     "  --soft: 软件校零，将当前位置写入配置文件的 offset_rad，立即生效。",
      "  zero 21\n  zero left\n  zero 21 --soft", cmd_multi_service},
-    {"pn_save", "维护", "<关节>", 1, 1, "发送参数保存脉冲（Pn097），写入驱动器掉电保存区",
-     "  先支撑负载。对选中关节按需失能，确认静止后发送 Pn097，不重新使能。\n"
-     "  不检查或更改 Pn075；强制松闸时不能依靠抱闸承重。持久化结果须重新上电后验读。",
+    {"pn_save", "维护", "<关节>", 1, 1, "保存驱动器参数（Pn097）",
+     "  已使能的关节先失能，确认静止后写 Pn097 保存脉冲，完成后保持失能。重新上电后生效。",
      "  pn_save 21\n  pn_save all", cmd_multi_service},
-    {"pn", "维护", "<关节> <编号|别名> [值] | list | help <编号|别名>", 1, 3, "按编号读写；list 仅列手册参考项",
-     "普通写要求失能，不自动回读或保存。Pn075/097/101 走 brake/pn_save/zero 流程。",
+    {"pn", "维护", "<关节> <编号|别名> [值] | list | help <编号|别名>", 1, 3, "读写驱动器参数",
+     "  写参数要求关节失能，不回读、不保存。Pn075、Pn097、Pn101 分别由 brake、pn_save、zero 设置。\n"
+     "  list 列出手册中的常用参数。",
      "  pn list\n  pn help brake_voltage\n  pn 15 Pn026", cmd_parameter},
-    {"sdo", "维护", "<关节> <索引> <子索引> [值]", 3, 4, "按索引及子索引读写对象字典",
-     "写值默认 i16；可用 i8/u8/i16/u16/i32/u32/i64/u64:值 或 hex:小端字节串。", "  sdo 15 0x2026 0", cmd_parameter},
-    {"brake_voltage", "维护", "<关节> [伏]", 1, 2, "Pn026：制动器保持电压，不切换抱闸",
-     "等价于 pn <关节> Pn026 [值]。", "  brake_voltage 15", cmd_parameter},
-    {"torque_scale", "维护", "<关节> [原始值]", 1, 2, "Pn082：转矩系数，10 表示 1 A/N·m",
-     "等价于 pn <关节> Pn082 [值]；写标定原始值，不执行自动标定。", "  torque_scale 15", cmd_parameter},
-    {"reg", "维护", "<关节> <地址> [1|2|4]", 2, 3, "只读 ESC 寄存器", "不提供原始寄存器写入。",
+    {"sdo", "维护", "<关节> <索引> <子索引> [值]", 3, 4, "读写对象字典",
+     "  写入类型默认为 i16；可写 i8/u8/i16/u16/i32/u32/i64/u64:值 或 hex:小端字节串。", "  sdo 15 0x2026 0",
+     cmd_parameter},
+    {"brake_voltage", "维护", "<关节> [伏]", 1, 2, "读写制动器保持电压（Pn026）", "  等同于 pn <关节> Pn026 [值]。",
+     "  brake_voltage 15", cmd_parameter},
+    {"torque_scale", "维护", "<关节> [原始值]", 1, 2, "读写转矩系数（Pn082），10 表示 1 A/N·m",
+     "  等同于 pn <关节> Pn082 [值]。", "  torque_scale 15", cmd_parameter},
+    {"reg", "维护", "<关节> <地址> [1|2|4]", 2, 3, "读取 ESC 寄存器", "  长度为 1、2 或 4 字节，只读。",
      "  reg 21 0x130 2", cmd_service},
     {"check", "查看", "", 0, 0, "检查已打开关节是否全部在线，并显示屏蔽掩码与离线保护状态",
-     "  在线条件: 从站处于 OP、WKC 正确、该臂通信正常。被屏蔽的关节不参与检查。", "  check", cmd_check},
-    {"power", "控制", "on | off | status", 1, 1, "请求上电、断电或显示电源控制状态",
-     "  off: 先将全部已使能关节失能，再断电；断电期间通信中断属正常。\n"
-     "  on:  上电并等待通信恢复（最长 30 秒），恢复后全部关节处于失能，需重新 enable。\n"
-     "  外部断电或断线时同样会在恢复后自动重连，不需要重启程序。\n"
-     "  仅支持具备 PCI 电源接口的硬件会话。",
+     "  在线条件: 从站处于 OP、WKC 正确且该臂通信正常。被屏蔽的关节不参与检查。", "  check", cmd_check},
+    {"power", "控制", "on | off | status", 1, 1, "电机电源上电、断电或显示状态",
+     "  off: 先使全部已使能关节失能，再断电。\n"
+     "  on: 上电并等待通信恢复，最长 30 秒；恢复后全部关节处于失能状态。\n"
+     "  仅适用于具备 PCI 电源接口的硬件。",
      "  power off\n  power on\n  power status", cmd_power},
-    {"commtest", "测试", "<秒> [--enabled <kp> <kd>]", 1, 4, "测试通信质量；可选伺服使能测试",
-     "  默认要求全部关节失能；--enabled 使能全部已打开关节，并以给定 kp、kd 保持当前位置，\n"
-     "  结束或中止后全部失能。使能到下发保持指令之间是零力矩，先托住手臂。\n  清零统计后每 "
-     "10 秒打印一次进度。\n"
-     "  开始时清零 ESC 错误计数，结束时列出错误计数非零或驱动器丢帧增加的关节。\n"
-     "  通过条件: WKC 异常 0 次、发送错误 0 次、无超时周期、无跳过周期、无线路类 ESC 错误计数、驱动器丢帧不增加；\n"
-     "  只有处理类计数（从站拒绝的帧）时给出提示，不判为不通过",
+    {"commtest", "测试", "<秒> [--enabled <kp> <kd>]", 1, 4, "通信质量测试",
+     "  默认要求全部关节失能。--enabled: 使能全部已打开关节，以给定 kp、kd 保持使能时的位置，结束后失能。\n"
+     "  开始时清零通信统计和 ESC 错误计数，每 10 秒输出一次进度。\n"
+     "  通过条件: WKC 异常、发送错误、超时周期、跳过周期均为 0，无线路类 ESC 错误计数，驱动器丢帧不增加。\n"
+     "  仅有处理类 ESC 错误计数时给出提示，不判为不通过。",
      "  commtest 300\n  commtest 60 --enabled 5 0.5", cmd_commtest},
     {"version", "通用", "", 0, 0, "显示版本", "", "  version", cmd_version},
-    {"quit", "通用", "", 0, 0, "退出：停止通信并释放主站", "  也可以用 exit 或 q", "  quit", cmd_quit},
+    {"quit", "通用", "", 0, 0, "停止通信并退出", "  别名: exit、q。", "  quit", cmd_quit},
 };
 #define COMMAND_COUNT (sizeof(commands) / sizeof(commands[0]))
 
@@ -1335,7 +1309,7 @@ static int cmd_help(int argc, char **argv)
         }
     }
     printf("关节写法: 21 | l_wrist_z | left | right | all | 15-18 | 21,28\n");
-    printf("任一命令加 -h 查看详细用法，例如: commtest -h\n");
+    printf("<命令> -h 显示详细用法\n");
     return 0;
 }
 
@@ -1374,7 +1348,7 @@ static int split(char *line, char **argv, int max)
     return n;
 }
 
-/* 离线保护触发时由监视线程调用：驱动已将全部关节失能，这里切断电机电源 */
+/* 离线保护触发时由监视线程调用：驱动已使全部关节失能，此处切断电机电源 */
 static void on_trip(void)
 {
     if (mock_backend) {
@@ -1382,13 +1356,13 @@ static void on_trip(void)
         return;
     }
     if (!powered) {
-        tlog_err("离线保护: 电源不由本程序控制，请立即手动断电");
+        tlog_err("离线保护: 电源不由本程序控制，需手动断电");
         return;
     }
     if (request_power(false) == 0) {
-        tlog_err("离线保护: 已请求断电，请以现场回读为准。排除问题后执行 power on 重新上电并检查");
+        tlog_err("离线保护: 已请求断电；power on 重新上电并检查在线状态");
     } else {
-        tlog_err("离线保护: 下电失败，请立即手动断电");
+        tlog_err("离线保护: 下电失败，需手动断电");
     }
 }
 
@@ -1430,7 +1404,7 @@ static void usage(FILE *out)
         "  -j, --joints LIST    参与的关节: all | left | right | 15-21 | 21,28（默认 all）\n"
         "  -r, --rt-cpu N       实时线程 CPU，-1 表示不绑定（默认取配置 realtime.rt_cpu）\n"
         "  -c, --config FILE    配置文件（默认 $ARMS_CONFIG、/etc/bxi/arms.json、./config/arms.json）\n"
-        "  -e, --exec CMD       执行命令后退出，例如 -e \"commtest 300\"（可重复，按顺序执行）\n"
+        "  -e, --exec CMD       执行命令后退出，可重复，按顺序执行\n"
         "      --mock           使用模拟后端，不访问硬件，不需要 root\n"
         "      --no-power       不操作电机电源（电源已由其他程序打开时使用）\n"
         "      --keep-power     退出时不断电\n"
@@ -1438,15 +1412,11 @@ static void usage(FILE *out)
         "      --no-rt-setup    不配置实时运行环境（中断绑定、CPU 隔离，以及 EtherCAT 网口退出 NetworkManager、\n"
         "                       去掉 IP 地址、关闭 IPv6；退出时还原）\n"
         "  -m, --mask MASK      屏蔽掩码（31 位，第 n 位对应关节 n）。被屏蔽的关节不打开、不做在线检查，\n"
-        "                       掉线不触发下电保护；例如 0x10200000 屏蔽 21 和 28（默认取配置 "
-        "safety.ignore_mask）\n"
+        "                       掉线不触发下电保护（默认取配置 safety.ignore_mask）\n"
         "      --check / --no-check  本次要求 / 不要求未屏蔽关节全部在线（不改变运行时掉线策略）\n"
         "      --check-motor 0|1     显式选择启动检查；--motor-disable MASK 等价于 --mask\n"
         "      --event-log FILE  通信事件日志（默认 arms_driver/logs/comm_events.log，即配置目录旁的 logs/）。\n"
         "                       WKC 异常、通信失败与恢复、周期延迟、离线保护触发时，追加事件前 64 个周期的时序和从站状态\n"
-        "\n"
-        "维护命令在同一会话中直接执行；交互输入可按 Tab 补全，回车才执行。\n"
-        "用手拖动关节用 free（使能后 kp=0）；驱动器失能时电机阻尼很大，仅松开抱闸仍难以转动。\n"
         "  -T, --timestamps     每一行输出都加时间戳（默认只在事件行加）\n"
         "  -h, --help           显示本帮助\n"
         "  -V, --version        显示版本\n"
@@ -1460,10 +1430,8 @@ static void usage(FILE *out)
         "  arms_test -m 0x10200000             屏蔽关节 21、28 后启动\n"
         "\n"
         "启动在线检查（默认开启）: 上电扫描后，未屏蔽的关节必须全部在线，否则下电并退出。\n"
-        "运行中未屏蔽的关节掉线: 全部关节失能并下电（safety.offline_action = power_off），\n"
-        "排除问题后执行 power on 重新上电并检查。EtherCAT "
-        "为串联链路，链中一个电机断电会使其后的电机一并离线。\n"
-        "进入终端后输入 help 查看命令，任一命令加 -h 查看详细用法。\n");
+        "运行中未屏蔽的关节掉线: 全部关节失能并下电（safety.offline_action = power_off），power on 恢复。\n"
+        "交互终端中输入 help 列出命令，<命令> -h 显示详细用法。\n");
 }
 
 int main(int argc, char **argv)
@@ -1509,7 +1477,7 @@ int main(int argc, char **argv)
             char *end;
             long v = strtol(optarg, &end, 10);
             if (*end || v <= 0 || (unsigned long)v > UINT_MAX) {
-                fprintf(stderr, "错误: --freq 需要整数，例如 1000 或 2000\n");
+                fprintf(stderr, "错误: --freq 需要整数频率\n");
                 return 2;
             }
             opt.cycle_hz = (unsigned int)v;
@@ -1609,14 +1577,14 @@ int main(int argc, char **argv)
         rt_setup = false;
     } else {
         if (arms_acquire_lease() < 0) {
-            tlog_err("硬件会话锁不可用：请检查权限或停止另一个控制程序");
+            tlog_err("硬件会话锁不可用：权限不足或另一个控制程序正在运行");
             return 1;
         }
         if (arms_env_start_master() != 0) return 1;
         if (rt_setup && arms_env_rt_apply(opt.config_path, opt.rt_cpu >= 0 ? opt.rt_cpu : -2) < 0) return 1;
         if (power) {
             if (arms_power_on(0) != 0) {
-                arms_power_off(); /* 请求失败不等于已断电 */
+                arms_power_off(); /* 请求失败时不视为已断电 */
                 arms_env_rt_revert();
                 return 1;
             }
@@ -1633,7 +1601,7 @@ int main(int argc, char **argv)
         if (powered && (st == ARMS_E_TOPOLOGY || st == ARMS_E_LINK)) {
             if (arms_power_off() == 0)
                 tlog_err("启动在线检查未通过，已请求断电保护");
-            else tlog_err("启动在线检查未通过，下电失败，请立即手动断电");
+            else tlog_err("启动在线检查未通过，下电失败，需手动断电");
         } else if (powered && !keep_power) {
             arms_power_off();
         }
@@ -1670,7 +1638,7 @@ int main(int argc, char **argv)
             }
         }
     } else {
-        tlog("就绪。输入 help 查看命令，Tab 补全，quit 退出");
+        tlog("就绪。help 列出命令，Tab 补全，quit 退出");
         while (!g_quit && !g_terminate) {
             char prompt[128], line[512], *av[16];
             int ac;

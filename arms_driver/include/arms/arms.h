@@ -268,7 +268,7 @@ void arms_reset_stats(arms_t *arms);
 /**
  * @brief 把周期上下文记录的通信事件追加到日志文件
  *
- * 在非实时线程中周期调用（例如每 100 ms），退出前再调用一次。记录的事件：
+ * 在非实时线程中周期调用（周期 100 ms 量级），退出前再调用一次。记录的事件：
  * WKC 异常（每臂每秒最多一条，其余计入下一条的“限速期间另有”）、通信失败、通信恢复、
  * 周期延迟（两次周期开始间隔超过 1.5 个周期，每秒最多一条）、离线保护触发、
  * ESC 错误计数增加和驱动器自报丢帧增加（每臂每秒最多一条）、温度告警、过温保护，
@@ -322,9 +322,9 @@ int arms_joint_by_name(const arms_t *arms, const char *name);
 const char *arms_arm_name(int arm);
 
 /**
- * 关节限位（关节侧），与参考 hw_lib 的 motor_info_t 对应，均只看反馈、不截断指令：
- * 实际位置超出 pos_limit 后，朝越界方向的速度和前馈被清零（软位置限位）；
- * 实际速度、力矩持续超过 vel_limit、tor_limit 触发超速、超力矩保护。
+ * 关节限位（关节侧）。均依据反馈判断，不截断指令：
+ * 实际位置超出 pos_limit 时，朝越界方向的速度和前馈置 0（软位置限位）；
+ * 实际速度、力矩持续超过 vel_limit、tor_limit 时触发超速、超力矩保护。
  */
 typedef struct {
     double pos_limit_min, pos_limit_max; /**< [rad] */
@@ -340,11 +340,9 @@ arms_status arms_get_limits(const arms_t *arms, int joint, arms_joint_limits *li
  * @param joints 关节掩码，只作用于已打开的关节
  * @param timeout_ms 等待全部关节进入使能的超时，0 表示 1000 ms
  *
- * 与参考 hw_lib 一致，使能后指令为零：目标位置取当前实际位置，kp、kd、速度、前馈均为 0，
- * 即零力矩。正常控制抱闸下使能会松开抱闸，受重力的关节会下落，须先支撑或在使能后立即下发指令。
+ * 使能后指令为零：目标位置取当前实际位置，kp、kd、速度、前馈均为 0。
  * 已使能的关节不受影响。处于故障的关节需先 arms_reset()。
- * 所选关节的 Pn075 为 1（强制松闸）或 2（强制抱闸）时，先自动写回 0（正常控制抱闸）
- * 并回读确认，不保存到驱动器；写入或回读失败则拒绝使能。
+ * 所选关节的 Pn075 为 1 或 2 时，先写为 0 并回读确认，不保存；写入或回读失败时拒绝使能。
  * 超时或失败时，本次请求中未完成的关节回到失能。
  */
 arms_status arms_enable(arms_t *arms, arms_mask joints, unsigned int timeout_ms);
@@ -372,9 +370,9 @@ typedef struct {
 /**
  * @brief 写入单个关节的 MIT 指令，下一周期原样生效
  *
- * 驱动不做轨迹插值，也不限幅，与参考 hw_lib 一致：位置、速度、前馈原样下发，kp、kd 为负或
- * NaN 时按 0 下发（同参考 pack_cmd）。唯一的调整是软位置限位：实际位置越界后，朝越界方向的
- * 速度和前馈被清零。位置、速度、前馈必须是有限值，否则返回 ARMS_E_ARG。
+ * 不做轨迹插值和限幅，位置、速度、前馈原样下发；kp、kd 为负或 NaN 时按 0 下发。
+ * 实际位置超出软位置限位时，朝越界方向的速度和前馈置 0。
+ * 位置、速度、前馈必须为有限值，否则返回 ARMS_E_ARG。
  * 只对已使能的关节有效。调用方需在 safety.command_timeout_ms 内持续刷新，否则按
  * safety.timeout_action 处理。可在任意非实时线程调用。
  */
@@ -387,8 +385,7 @@ arms_status arms_hold(arms_t *arms, arms_mask joints);
  * @brief 零力矩拖动：使能关节（已使能的保持使能），下发 kp = 0、速度 0、前馈 0、阻尼 kd
  * @param kd 阻尼，0 表示完全自由，须为非负有限值
  *
- * 关节没有保持力，会受重力下落。先支撑关节再失能；arms_hold() 保留 kp=0，不会恢复位置保持力。
- * 抱闸模式处理同 arms_enable()：强制松闸或强制抱闸的关节先自动切回正常控制抱闸。
+ * 抱闸模式处理同 arms_enable()。
  */
 arms_status arms_free(arms_t *arms, arms_mask joints, double kd);
 

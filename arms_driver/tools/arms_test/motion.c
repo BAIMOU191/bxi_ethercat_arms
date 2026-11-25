@@ -48,7 +48,7 @@ void motion_set_trip_handler(void (*fn)(void)) { trip_handler = fn; }
 static bool protect_seen;
 static int take_snapshot(snapshot *s);
 
-/* 超速/超力矩保护：驱动已失能全部关节，这里停止指令刷新并打印诊断快照 */
+/* 超速/超力矩/过温保护：驱动已使全部关节失能，此处停止指令刷新并打印诊断快照 */
 static void check_protect(const arms_bus_stats *st)
 {
     size_t i;
@@ -77,7 +77,7 @@ static void check_protect(const arms_bus_stats *st)
     }
 }
 
-/* 离线保护：驱动在周期内已失能全部关节，这里打印触发关节并调用下电处理 */
+/* 离线保护：驱动已使全部关节失能，此处打印触发关节并调用下电处理 */
 static void check_trip(void)
 {
     arms_bus_stats st;
@@ -275,7 +275,7 @@ int motion_start(arms_t *arms, volatile sig_atomic_t *flag, bool batch)
     stopping = false;
     bus = arms;
     interrupted = flag;
-    /* 交互终端与 -e 会话接受回车。重定向的命令脚本不能被运动命令提前读取。 */
+    /* 交互终端与 -e 会话可用回车中止；标准输入为重定向脚本时不读取 */
     poll_input = batch || isatty(STDIN_FILENO);
     if (!take_snapshot(&previous)) {
         tlog_err("无法读取故障监视的初始总线快照");
@@ -321,7 +321,7 @@ int motion_hold(arms_mask mask)
             tlog_err("保持失败: %s", arms_last_error());
             return -1;
         }
-        /* 请求与最后一条刷新可能在同一总线周期被取走；确认新反馈后才允许下一条控制命令。 */
+        /* 请求与最后一次刷新可能在同一周期生效；确认新反馈后再执行下一条控制命令 */
         sleep_until(now_ns() + arms_period_ns(bus));
         if (arms_read(bus, states, ARMS_JOINT_COUNT, &n) != ARMS_OK) {
             tlog_err("无法读取保持反馈");

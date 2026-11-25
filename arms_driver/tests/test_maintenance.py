@@ -126,7 +126,7 @@ with tempfile.TemporaryDirectory() as tmp:
         try:
             seen = b''
             deadline = time.monotonic() + 8
-            while '输入 help 查看命令'.encode() not in seen:
+            while '就绪'.encode() not in seen:
                 assert select.select([proc.stdout], [], [], max(0, deadline - time.monotonic()))[0], seen
                 chunk = os.read(proc.stdout.fileno(), 8192)
                 assert chunk, seen

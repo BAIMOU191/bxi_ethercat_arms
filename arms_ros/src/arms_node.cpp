@@ -43,7 +43,7 @@ static std::string format(const char *fmt, ...)
     return line;
 }
 
-// Also runs when a partially constructed node fails its startup checks.
+// 节点在启动检查中失败、尚未完整构造时同样执行
 struct Device {
     arms_t *driver = nullptr;
     int lease = -1;
@@ -81,7 +81,7 @@ class ArmsNode final : public rclcpp::Node
     int64_t max_age_ms;
     unsigned rejected = 0;
     bool manage_power = false;
-    /* hold 的关节：忽略话题目标，直到对其执行 enable、free、disable 或 reset。仅在执行器线程访问。 */
+    /* 处于 hold 的关节：忽略话题目标，直到执行 enable、free、disable 或 reset；仅在执行器线程访问 */
     arms_mask held = 0;
     void reject(const char *why)
     {
@@ -334,7 +334,7 @@ class ArmsNode final : public rclcpp::Node
         held = 0;
         dev.cut = false;
         r.success = true;
-        r.message = "trip cleared; all opened joints online and disabled. Reset drive faults if any, then enable.";
+        r.message = "trip cleared; all opened joints online and disabled";
         RCLCPP_INFO(get_logger(), "protection trip cleared");
     }
     /* 只读：按 Pn 编号或对象字典地址读取单个关节的参数（SDO 上传），不修改驱动器 */

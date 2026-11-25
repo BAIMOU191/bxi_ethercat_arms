@@ -30,7 +30,7 @@ if [[ $EUID -ne 0 ]]; then
   exec sudo "$0" -c "$CONFIG" -j "$JOINTS" -t "$DURATION" -f "$FREQS" ${RT_CPU:+-r "$RT_CPU"}
 fi
 if pgrep -x motor_console >/dev/null || pgrep -f 'hw_lib_test_' >/dev/null || pgrep -x arms_test >/dev/null; then
-  echo "检测到其他 EtherCAT 控制程序正在运行，请先退出" >&2
+  echo "其他 EtherCAT 控制程序正在运行" >&2
   exit 1
 fi
 

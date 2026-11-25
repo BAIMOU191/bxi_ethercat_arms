@@ -47,10 +47,10 @@ int arms_power_off(void)
 {
     if (!g_pci_open) return 0;
     if (motor_pwr_set(0u) < 0) {
-        tlog_err("电源: motor_pwr_set(0) 失败，请人工确认断电");
+        tlog_err("电源: motor_pwr_set(0) 失败，电源状态未知");
         return -1; /* 保留已打开的 PCI 句柄，允许重试断电 */
     }
-    tlog("电源: 已请求断电（实际断电请以现场指示为准）");
+    tlog("电源: 已请求断电");
     bxi_pci_exit();
     g_pci_open = 0;
     return 0;

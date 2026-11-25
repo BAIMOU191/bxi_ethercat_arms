@@ -601,9 +601,8 @@ static const char *const esc_names[ESC_ERR_BYTES] = {
 };
 
 /*
- * 线路类计数：各端口无效帧、物理层错误、链路丢失，反映网线、接头或从站网口的问题。
- * 其余（转发错误、处理单元错误、PDI 错误）为处理类：帧在电气上完好，但被从站判为无效，
- * 只出现处理类计数时，通常是主机发往 EtherCAT 网口的非 EtherCAT 报文。
+ * 线路类计数：各端口无效帧、物理层错误、链路丢失。
+ * 处理类计数：转发错误、处理单元错误、PDI 错误。
  */
 static bool esc_line_counter(unsigned int b) { return b < 8 || (b >= 16 && b < 20); }
 #define ESC_PU_ERR 12u   /* 处理单元错误 */
@@ -675,7 +674,7 @@ static void temperature_sample(arms_t *a, int i, int k, double t, uint64_t now)
 {
     arm_rt *r = &a->arm[i];
     event_detail d;
-    if (t < -40.0 || t > 200.0) return; /* 不可信的读数不参与保护 */
+    if (t < -40.0 || t > 200.0) return; /* 超出有效范围的读数不参与保护 */
     r->temp[k] = t;
     memset(&d, 0, sizeof(d));
     d.joint = r->slot_joint[k];
@@ -720,7 +719,7 @@ static void loss_sample(arms_t *a, int i, int k, int32_t v, uint64_t now)
 
 /*
  * 监控量轮询：选择温度 → 等 0x3000 刷新 → 读取 → 选择丢帧次数 → 等待 → 读取 → 下一个从站。
- * 驱动器在选择后需要时间刷新 0x3000，等待避免把上一个监控量读成当前量。失败时跳到下一个从站。
+ * 选择监控量后等待 0x3000 刷新再读取。失败时转到下一个从站。
  */
 enum {
     MON_SEL_TEMP, MON_WAIT_SEL_TEMP, MON_SETTLE_TEMP, MON_READ_TEMP, MON_WAIT_TEMP,
@@ -1051,7 +1050,7 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
         } else {
             c->phase = CTL_ENABLING;
             c->phase_cycle = a->cycles;
-            /* 与参考 hw_lib 一致：使能后指令为零（零力矩），目标位置取当前位置 */
+            /* 使能后指令为零，目标位置取当前位置 */
             c->cur.position = s->position;
             c->cur.velocity = 0.0;
             c->cur.torque = 0.0;
@@ -1153,14 +1152,14 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
 
     active = c->phase == CTL_ENABLING || c->phase == CTL_ON;
     if (active) {
-        /* 指令原样下发；kp、kd 为负或 NaN 时按 0（同参考 pack_cmd） */
+        /* 指令原样下发；kp、kd 为负或 NaN 时按 0 */
         double pos = c->cur.position;
         double vel = c->cur.velocity;
         double tff = c->cur.torque;
         double kp = c->cur.kp > 0.0 ? c->cur.kp : 0.0;
         double kd = c->cur.kd > 0.0 ? c->cur.kd : 0.0;
         double d = (double)jc->direction;
-        /* 软位置限位（同参考 over_pos）：实际位置越界后清零朝越界方向的速度和前馈，不截断位置 */
+        /* 软位置限位：实际位置越界时，朝越界方向的速度和前馈置 0，位置不截断 */
         if (s->position > jc->pos_limit_max) {
             if (vel > 0.0 || tff > 0.0) blocked = true;
             if (vel > 0.0) vel = 0.0;
@@ -1306,7 +1305,7 @@ static arms_status start_rt(arms_t *a)
         else
             logf_(a, "实时线程: SCHED_FIFO %d, 未绑定 CPU, %u Hz", a->cfg.rt_priority, a->cycle_hz);
     } else {
-        logf_(a, "警告: 非 root 运行，模拟后端以普通线程运行，时序统计仅供参考");
+        logf_(a, "警告: 非 root 运行，模拟后端以普通线程运行，时序统计不具实时性");
     }
     return ARMS_OK;
 }
@@ -1323,7 +1322,7 @@ static void close_buses(arms_t *a)
 static void stop_and_free(arms_t *a)
 {
     if (a->thread_started) {
-        /* 先失能并保持若干周期，让驱动器在通信停止前进入失能 */
+        /* 先失能并保持若干周期，使驱动器在通信停止前进入失能状态 */
         post(a, a->joints, REQ_DISABLE);
         usleep(50000);
         atomic_store(&a->stop, true);
@@ -1619,7 +1618,7 @@ void arms_close(arms_t *a)
         for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; j++)
             if (a->brake_touched & abnormal & ARMS_MASK_JOINT(j)) {
                 if (arms_set_brake(a, j, ARMS_BRAKE_NORMAL, true) != ARMS_OK)
-                    logf_(a, "警告：关节 %d 未能恢复正常抱闸控制，请保持机械支撑", j);
+                    logf_(a, "警告: 关节 %d 未能恢复正常抱闸控制", j);
             }
         stop_and_free(a);
     }
@@ -1793,15 +1792,11 @@ static void write_detail(FILE *fp, const event_record *e)
         for (unsigned int b = 0; b < ESC_ERR_BYTES; ++b)
             if (esc_names[b] && d->after[b] != d->before[b])
                 fprintf(fp, " %s %u→%u", esc_names[b], d->before[b], d->after[b]);
-        fprintf(fp, "\n  线路类计数（无效帧、物理层错误、链路丢失）增加，指向网线、接头或从站网口。\n"
-                    "  端口 0 接主站一侧，端口 1 接下一个从站；计数最先增加的位置通常最靠近故障点\n");
+        fputc('\n', fp);
         break;
     case EVT_ESC_PROC:
         fprintf(fp,
-                "  过去 %.0f 秒内有 %.0f 个帧被从站处理单元拒绝，最先拒绝的是关节 %d（链上位置 %d）；线路类计数未变。\n"
-                "  帧在电气上完好，不是网线问题。通常是主机发往 EtherCAT 网口的 DHCP、mDNS、IPv6 等普通报文，\n"
-                "  rt_setup.sh 在程序运行期间会阻止这类报文；用 rt_setup.sh status 查看网口是否仍有 IP 或由 "
-                "NetworkManager 管理。\n",
+                "  %.0f 秒内被从站处理单元拒绝的帧 %.0f 个，首个拒绝位置为关节 %d（链上位置 %d）；线路类计数未变化\n",
                 d->limit, d->value, d->joint, d->slave);
         break;
     case EVT_DRIVE_LOSS:
@@ -2117,7 +2112,7 @@ static arms_status request_and_wait(arms_t *a, arms_mask mask, unsigned int req,
         atomic_store(&a->res[j], RES_PENDING);
         atomic_store(&a->req[j], req);
     }
-    /* 周期上下文自身也按 timeout_ms 结束请求，这里多留余量 */
+    /* 周期上下文按 timeout_ms 结束请求，此处等待时间留有余量 */
     deadline = mono_ns() + ((uint64_t)timeout_ms + 200u) * 1000000ull;
     while (pending && mono_ns() < deadline) {
         pending = false;
@@ -2135,7 +2130,7 @@ static arms_status request_and_wait(arms_t *a, arms_mask mask, unsigned int req,
         }
     }
     if (bad < 0) {
-        /* 等快照包含本次结果后再返回，保证随后的 arms_read()/arms_set_command() 看到新状态 */
+        /* 快照包含本次结果后返回，随后的 arms_read()/arms_set_command() 可见新状态 */
         unsigned int s0 = atomic_load(&a->seq);
         uint64_t until = mono_ns() + 100000000ull;
         while (atomic_load(&a->seq) - s0 < 4u && mono_ns() < until) usleep(500);
@@ -2167,12 +2162,11 @@ static void wait_snapshot(arms_t *a)
 }
 
 /*
- * 检查关节抱闸是否为正常控制模式（Pn075=0）。强制松闸（1）时失能后抱闸不闭合，
- * 关节失去保持；强制抱闸（2）时电机会顶着抱闸出力。用于必须在正常模式下执行的操作。
+ * 检查关节抱闸是否为正常控制模式（Pn075=0），用于要求正常模式的操作。
  */
 static bool brake_abnormal(arms_t *a, arms_mask mask, const char *what)
 {
-    /* 库调用方不必先运行 CLI 自检。只在非实时管理上下文补读未知模式。 */
+    /* 抱闸模式未知时在管理上下文中补读 */
     arms_mask unknown = mask & ~atomic_load(&a->brake_known);
     for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_brake_mode mode;
@@ -2322,7 +2316,7 @@ arms_status arms_set_command(arms_t *a, int joint, const arms_command *cmd)
         set_error("关节 %d 未打开", joint);
         return ARMS_E_ARG;
     }
-    /* kp、kd 不检查：为负或 NaN 时周期内按 0 下发（同参考 pack_cmd） */
+    /* kp、kd 不检查，为负或 NaN 时在周期处理中按 0 下发 */
     if (!isfinite(cmd->position) || !isfinite(cmd->velocity) || !isfinite(cmd->torque)) {
         set_error("关节 %d 的指令无效（位置、速度或前馈不是有限值）", joint);
         return ARMS_E_ARG;
@@ -2343,7 +2337,7 @@ arms_status arms_set_command(arms_t *a, int joint, const arms_command *cmd)
     return ARMS_OK;
 }
 
-/* Blocking mailbox operations belong to the non-real-time management thread. */
+/* 阻塞的邮箱访问只在非实时管理线程中执行 */
 arms_status arms_get_joint_info(const arms_t *a, int j, arms_joint_info *out)
 {
     if (!a || !out || j < 15 || j > 28 || !a->cfg.joint[j].present)
@@ -2441,8 +2435,7 @@ static arms_status maintenance_ready_ex(arms_t *a, int j, bool confirmed, arms_j
     return ARMS_OK;
 }
 
-/* 运行中的 MIT 主站拥有这些周期输出及其映射，不允许两个生产者同时写同一状态。
- * 与 Pn 手册目录无关；其余 SDO 由从站按自己的对象字典和访问属性应答。 */
+/* 由过程数据周期写入的对象，禁止通过 SDO 写入；其余对象由从站按对象字典的访问属性应答。 */
 static bool owned_by_cycle(uint16_t index, uint8_t sub)
 {
     if (index == 0x1601 || index == 0x1a01 || index == 0x1c12 || index == 0x1c13) return true;
@@ -2567,7 +2560,7 @@ arms_status arms_set_brake(arms_t *a, int j, arms_brake_mode mode, bool confirme
     if (st == ARMS_OK) {
         record_brake(a, j, mode);
     } else {
-        /* 写入结果不确定时重新读取，以驱动器实际值为准；读取失败则按未知模式联锁 */
+        /* 写入结果不确定时重新读取驱动器的值；读取失败时按未知模式处理 */
         arms_brake_mode now;
         char saved[sizeof(last_error)];
         snprintf(saved, sizeof(saved), "%s", last_error);
@@ -2663,7 +2656,7 @@ arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
         /* 硬件零点取代软件偏置：配置立即写 0，运行中的偏置在驱动器断电时切换 */
         atomic_fetch_or(&a->zero_pending, ARMS_MASK_JOINT(j));
         if (!arms_store_offset(a->cfg.path, j, 0.0)) {
-            set_error("关节 %d 已发出硬件清零脉冲，但无法把 %s 中的 offset_rad 写为 0，请手动修改", j, a->cfg.path);
+            set_error("关节 %d 已发出硬件清零脉冲，但 %s 中的 offset_rad 未能写为 0", j, a->cfg.path);
             return ARMS_E_SYSTEM;
         }
         return ARMS_OK;

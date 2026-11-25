@@ -26,7 +26,7 @@
 #include "arms/pn.h"
 
 struct bus {
-    /* 模拟设备自己的对象存储，不以主站 pn list 决定读写权限。 */
+    /* 模拟设备的对象存储，读写权限由模拟对象字典决定 */
     uint16_t params[BUS_MAX_SLAVES][200], extra_pn[BUS_MAX_SLAVES];
     uint8_t test_record[BUS_MAX_SLAVES][2][8];
     bool pn075_unreadable, stuck_enabled;
@@ -362,7 +362,7 @@ static int mock_sdo(bus_t *b, int slave, uint16_t index, uint8_t sub, uint8_t *d
     if (slave < 0 || slave >= BUS_MAX_SLAVES)
         return -1;
     if (index == 0x1018 && sub >= 1 && sub <= 4) {
-        if (write) { *abort = 0x06010002; return -1; } /* read only */
+        if (write) { *abort = 0x06010002; return -1; } /* 只读 */
         if (*n < 4) { *abort = 0x06070010; return -1; }
         uint32_t x = sub == 1 ? KGU_VENDOR_ID : sub == 2 ? KGU_PRODUCT_CODE :
                      sub == 3 ? b->revision : (uint32_t)(1 + slave + 16 * b->master);
@@ -370,7 +370,7 @@ static int mock_sdo(bus_t *b, int slave, uint16_t index, uint8_t sub, uint8_t *d
         *n = 4;
         return 0;
     }
-    /* 仅 mock 用：非 Pn 记录，:1=32 位读写，:2=8 位只写，:3=64 位读写。 */
+    /* 模拟专用的非 Pn 对象：子索引 1 为 32 位读写，2 为 8 位只写，3 为 64 位读写 */
     if (index == 0x5ffe) {
         if (sub < 1 || sub > 3) { *abort = 0x06090011; return -1; }
         if (sub == 2 && !write) { *abort = 0x06010001; return -1; }
@@ -399,7 +399,7 @@ static int mock_sdo(bus_t *b, int slave, uint16_t index, uint8_t sub, uint8_t *d
     uint16_t *v = number == 345 ? &b->extra_pn[slave] : &b->params[slave][number];
     if (write) {
         uint16_t val = kgu_get_u16(data, 0);
-        /* 示范设备端真实拒绝，而非 CLI 阻止下载。 */
+        /* 由模拟设备返回 SDO abort */
         if (number == 26 && val > 24) { *abort = 0x06090030; return -1; }
         *v = val;
     } else kgu_put_u16(data, 0, *v);

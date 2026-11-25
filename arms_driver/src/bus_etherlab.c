@@ -101,7 +101,7 @@ static int resolve_master(const bus_open_params *p, char *err, size_t err_size)
         return -1;
     }
     if (!read_line("/sys/module/ec_master/parameters/main_devices", devices, sizeof(devices))) {
-        snprintf(err, err_size, "EtherLab 主站模块未加载（/sys/module/ec_master 不存在）；请先启动 ethercat 服务");
+        snprintf(err, err_size, "EtherLab 主站模块未加载（/sys/module/ec_master 不存在）");
         return -1;
     }
     for (tok = strtok_r(devices, ", \t", &save); tok; tok = strtok_r(NULL, ", \t", &save), ++index)
@@ -259,7 +259,7 @@ static int el_configure(bus_t *b, const int *positions, int n, char *err, size_t
             snprintf(err, err_size, "slave %d DC Sync0 配置失败: %s", positions[i], strerror(-ret));
             return -1;
         }
-        /* 诊断用的异步请求和紧急报文缓冲；创建失败只影响诊断，不影响控制 */
+        /* 诊断用的异步请求和紧急报文缓冲；创建失败时仅停用诊断 */
         b->esc_req[i] = ecrt_slave_config_create_reg_request(b->sc[i], ESC_ERR_BYTES);
         b->mon_sel[i] = ecrt_slave_config_create_sdo_request(b->sc[i], KGU_OBJ_MONITOR_SELECT, 0, 2);
         b->mon_val[i] = ecrt_slave_config_create_sdo_request(b->sc[i], KGU_OBJ_MONITOR_VALUE, 0, 4);

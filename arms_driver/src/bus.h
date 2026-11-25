@@ -28,8 +28,8 @@ typedef struct {
 
 typedef struct {
     const char *interface;
-    const char *mac;        /* may be empty */
-    int master;             /* -1 = resolve from MAC */
+    const char *mac;        /* 可为空 */
+    int master;             /* -1 表示按 MAC 解析 */
     uint32_t cycle_ns;
     int32_t sync0_shift_ns;
     uint32_t vendor_id;
@@ -40,7 +40,7 @@ typedef struct {
 
 typedef struct bus bus_t;
 
-/* 扫描失败原因不依赖诊断文本；仅空链可由 --no-check 跳过。 */
+/* 扫描失败原因；仅空链可由 --no-check 跳过 */
 enum { BUS_SCAN_MASTER = -1, BUS_SCAN_LINK = -2, BUS_SCAN_EMPTY = -3, BUS_SCAN_UNSTABLE = -4 };
 
 typedef struct {

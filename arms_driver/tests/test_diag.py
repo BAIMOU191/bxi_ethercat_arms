@@ -26,11 +26,13 @@ with tempfile.TemporaryDirectory() as tmp:
     def row(out, joint):
         return next(l.split() for l in out.splitlines() if l.startswith(f'{joint} ') and ('L/' in l or 'R/' in l))
 
-    # 温度和驱动器丢帧：status 末列、diag 表都能读到
+    # 温度显示在 status 末列；diag 只列驱动器丢帧和 ESC 计数
     out, _ = run('normal', {}, 'commtest 4', 'status 15,28', 'diag 21')
     assert '结果: 通过' in out, out
     assert row(out, 15)[-1] == '35' and row(out, 28)[-1] == '41', out
-    assert '线路类 端口0 无效/物理/丢链' in out and row(out, 21)[3] == '41' and row(out, 21)[4] == '0', out
+    assert '线路类 端口0 无效/物理/丢链' in out, out
+    assert '温度' not in next(l for l in out.splitlines() if '驱动器丢帧' in l and '线路类' in l), out
+    assert row(out, 21)[3] == '0', out
 
     # ESC 错误计数增加：commtest 列出关节 18（左臂链上位置 3）并判为不通过，日志记录端口 1 的计数变化
     out, log = run('esc', {'ARMS_MOCK_ESC_ERR': '1500'}, 'commtest 4')
@@ -38,14 +40,14 @@ with tempfile.TemporaryDirectory() as tmp:
     assert '线路错误计数增加' in log and '关节 18（链上位置 3）计数变化: 端口1无效帧 0→' in log, log
     assert '端口1物理层错误' in log and '最近 16 个周期' in log, log
 
-    # 只有处理类计数（主机报文被拒）：不逐条记录，按窗口汇总一条；commtest 只提示，不判为不通过
+    # 仅有处理类计数：不逐条记录，按窗口汇总一条；commtest 给出提示，不判为不通过
     data['safety']['esc_summary_s'] = 2
     proc_cfg = tmp / 'proc.json'
     proc_cfg.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     out, log = run('proc', {'ARMS_MOCK_ESC_PROC': '1200'}, 'commtest 6', cfg=proc_cfg)
-    assert '结果: 通过' in out and '只有处理类计数' in out, out
+    assert '结果: 通过' in out and '存在处理类 ESC 错误计数' in out, out
     assert '线路错误计数增加' not in log and '从站拒绝的帧（汇总）' in log, log
-    assert '最先拒绝的是关节 15（链上位置 0）；线路类计数未变' in log, log
+    assert '首个拒绝位置为关节 15（链上位置 0）；线路类计数未变化' in log, log
     del data['safety']['esc_summary_s']
 
     # 驱动器自报丢帧增加
