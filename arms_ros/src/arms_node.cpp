@@ -284,6 +284,7 @@ class ArmsNode final : public rclcpp::Node
         bool rt_setup = declare_parameter("setup_rt", false);
         auto check = declare_parameter<int64_t>("check_motor", -1);
         opt.ignore_mask = declare_parameter<int64_t>("motor_disable", -1);
+        opt.log = [](void *, const char *line) { RCLCPP_INFO(rclcpp::get_logger("arms_node"), "%s", line); };
         max_age_ms = declare_parameter<int64_t>("command_max_age_ms", 100);
         if (check < -1 || check > 1 || opt.ignore_mask < -1 || opt.ignore_mask > 0x7fffffff ||
             max_age_ms < 1 || max_age_ms > 1000)
@@ -325,7 +326,8 @@ class ArmsNode final : public rclcpp::Node
             arms_brake_scan(dev.driver, &released, &held, &unknown);
             if (released | held)
                 RCLCPP_WARN(get_logger(),
-                            "brake not in normal mode (released 0x%08x, held 0x%08x); enable refused until brake_normal",
+                            "brake not in normal mode (Pn075=1 released 0x%08x, Pn075=2 held 0x%08x); "
+                            "enable/free switch the selected joints back to normal (Pn075=0)",
                             released, held);
             if (unknown)
                 RCLCPP_WARN(get_logger(), "brake mode (Pn075) unreadable on joint mask 0x%08x", unknown);

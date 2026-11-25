@@ -34,12 +34,19 @@ try:
         until(lambda:len(seen)==3);assert len(seen['joint_states'].name)==14
         assert seen['arms/diagnostics'].status[0].level in (0,b'\x00'),seen['arms/diagnostics']
         assert call('selftest').success and not call('enable').success
-        # 抱闸模式需要确认；非 normal 期间拒绝使能和零力矩拖动
+        # 抱闸模式需要确认；enable / free 会把强制松闸、强制抱闸自动切回正常控制
         assert not call('brake_release').success
         assert call('brake_release',True).success
-        assert not call('enable',True).success and not call('free',True).success
-        assert call('brake_hold',True).success
-        assert not call('enable',True).success
+        def after_disable(name):
+            # disable 立即返回；强制抱闸要求关节已失能，等反馈确认后再设置
+            end=time.monotonic()+3
+            while not call(name,True).success:
+                assert time.monotonic()<end,name
+                time.sleep(.05)
+        assert call('enable',True).success and call('disable').success
+        after_disable('brake_hold')
+        assert call('free',True).success and call('disable').success
+        after_disable('brake_hold')
         assert call('brake_normal',True).success
         # 零力矩拖动会使能关节
         assert call('free',True).success

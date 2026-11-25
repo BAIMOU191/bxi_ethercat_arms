@@ -102,10 +102,10 @@ typedef enum {
     ARMS_JS_PREOP,
     ARMS_JS_SAFEOP,
     ARMS_JS_LOCKED,     /**< OP，伺服失能 */
-    ARMS_JS_RELEASED,   /**< OP，伺服失能，抱闸强制松开 */
+    ARMS_JS_RELEASED,   /**< OP，伺服失能，强制松闸（Pn075=1） */
     ARMS_JS_ENABLED,    /**< OP，伺服使能 */
     ARMS_JS_FAULT,      /**< 驱动器故障或 AL 错误 */
-    ARMS_JS_HELD,       /**< OP，伺服失能，抱闸强制锁闸（Pn075=2） */
+    ARMS_JS_HELD,       /**< OP，伺服失能，强制抱闸（Pn075=2） */
 } arms_joint_mode;
 
 /** @brief 关节状态名称 */
@@ -310,6 +310,8 @@ arms_status arms_get_limits(const arms_t *arms, int joint, arms_joint_limits *li
  *
  * 使能时目标位置取当前实际位置，增益为 gain_default，因此关节保持原位。
  * 已使能的关节不受影响。处于故障的关节需先 arms_reset()。
+ * 所选关节的 Pn075 为 1（强制松闸）或 2（强制抱闸）时，先自动写回 0（正常控制抱闸）
+ * 并回读确认，不保存到驱动器；写入或回读失败则拒绝使能。
  * 超时或失败时，本次请求中未完成的关节回到失能。
  */
 arms_status arms_enable(arms_t *arms, arms_mask joints, unsigned int timeout_ms);
@@ -351,7 +353,7 @@ arms_status arms_hold(arms_t *arms, arms_mask joints);
  * @param kd 阻尼，0 表示完全自由，须不超过 gain_max.kd
  *
  * 关节没有保持力，会受重力下落。先支撑关节再失能；arms_hold() 保留 kp=0，不会恢复位置保持力。
- * 有关节的抱闸不是正常控制模式时拒绝执行。
+ * 抱闸模式处理同 arms_enable()：强制松闸或强制抱闸的关节先自动切回正常控制抱闸。
  */
 arms_status arms_free(arms_t *arms, arms_mask joints, double kd);
 
@@ -360,12 +362,12 @@ arms_status arms_free(arms_t *arms, arms_mask joints, double kd);
  * 写操作要求该关节所在臂通信正常、confirmed 为 true，其余条件见各接口。
  */
 
-/** 抱闸模式（Pn075） */
+/** 抱闸模式（Pn075），取值与 KGU 模组说明一致 */
 typedef enum {
-    ARMS_BRAKE_UNKNOWN = -1, /**< 未读取或读取失败 */
-    ARMS_BRAKE_NORMAL = 0,   /**< 正常控制：使能时松闸，失能时抱闸 */
-    ARMS_BRAKE_RELEASE = 1,  /**< 强制松闸 */
-    ARMS_BRAKE_HOLD = 2,     /**< 强制抱闸 */
+    ARMS_BRAKE_UNKNOWN = -1, /**< 未读取或读取失败（非 Pn075 取值） */
+    ARMS_BRAKE_NORMAL = 0,   /**< 0：正常控制抱闸，伺服使能时松闸，失能时抱闸 */
+    ARMS_BRAKE_RELEASE = 1,  /**< 1：强制松闸，与伺服状态无关 */
+    ARMS_BRAKE_HOLD = 2,     /**< 2：强制抱闸，与伺服状态无关 */
 } arms_brake_mode;
 
 /** @brief 抱闸模式名称 normal / release / hold / unknown */
@@ -375,7 +377,7 @@ const char *arms_brake_mode_name(arms_brake_mode mode);
  * @brief 临时设置抱闸模式（写 Pn075 并回读，不保存到驱动器）
  *
  * RELEASE / HOLD 要求该关节失能；NORMAL 不要求失能，但仍要求有效通信和明确确认。
- * 任一已打开关节不是 NORMAL 或无法确认模式时，arms_enable() 和 arms_free() 被拒绝。
+ * 之后对该关节调用 arms_enable() 或 arms_free() 会自动将其切回 NORMAL。
  * arms_close() 尝试将本次会话改动过的关节恢复为 NORMAL，不保证机械抱闸已闭合。
  */
 arms_status arms_set_brake(arms_t *arms, int joint, arms_brake_mode mode, bool confirmed);

@@ -37,9 +37,14 @@ with tempfile.TemporaryDirectory() as tmp:
     out = run('brake 21 release', 'brake left 1', 'status 15', 'brake all normal',
               'brake right hold', 'status 22', 'brake all 0', 'enable 15')
     assert 'released' in out and 'held' in out, out
-    # 非 normal 期间拒绝使能和零力矩拖动
-    run('brake 21 release', 'enable 22', ok=False)
-    run('brake 21 hold', 'free 22', ok=False)
+    # 强制松闸 / 强制抱闸时，enable 和 free 先自动切回正常控制抱闸（Pn075=0）
+    out = run('brake 21 release', 'enable 21', 'brake 21')
+    assert '自动切为正常控制' in out and 'normal  (Pn075=0' in out, out
+    out = run('brake 21 hold', 'free 21', 'brake 21')
+    assert '自动切为正常控制' in out and 'normal  (Pn075=0' in out, out
+    # 未选中的关节保持原模式
+    out = run('brake 21 release', 'enable 22', 'brake 21')
+    assert out.count('release (Pn075=1') >= 2 and '自动切为正常控制' not in out, out
     # 使能中的关节拒绝强制松闸
     run('enable 21', 'brake 21 release', ok=False)
     # 零力矩拖动：kp = 0；kd 不超过上限

@@ -1469,8 +1469,8 @@ static void wait_snapshot(arms_t *a)
 }
 
 /*
- * 抱闸不是正常控制模式时拒绝使能：强制松闸下失能后抱闸不闭合，关节失去保持；
- * 强制抱闸下电机会顶着抱闸出力。
+ * 检查关节抱闸是否为正常控制模式（Pn075=0）。强制松闸（1）时失能后抱闸不闭合，
+ * 关节失去保持；强制抱闸（2）时电机会顶着抱闸出力。用于必须在正常模式下执行的操作。
  */
 static bool brake_abnormal(arms_t *a, arms_mask mask, const char *what)
 {
@@ -1492,10 +1492,47 @@ static bool brake_abnormal(arms_t *a, arms_mask mask, const char *what)
     return true;
 }
 
+/*
+ * 使能前将所选关节的抱闸切回正常控制（Pn075=0）：强制松闸（1）或强制抱闸（2）
+ * 写 0 并回读确认，不保存；模式未知时同样写 0。任一关节失败则拒绝本次操作。
+ */
+static arms_status brake_to_normal(arms_t *a, arms_mask mask, const char *what)
+{
+    mask &= a->joints;
+    for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        arms_mask bit = ARMS_MASK_JOINT(j);
+        arms_brake_mode mode = ARMS_BRAKE_UNKNOWN;
+        arms_status st;
+        if (!(mask & bit)) continue;
+        if (atomic_load(&a->brake_known) & bit) {
+            if (atomic_load(&a->brake_released) & bit) mode = ARMS_BRAKE_RELEASE;
+            else if (atomic_load(&a->brake_held) & bit) mode = ARMS_BRAKE_HOLD;
+            else mode = ARMS_BRAKE_NORMAL;
+        } else if (arms_get_brake(a, j, &mode) != ARMS_OK) {
+            mode = ARMS_BRAKE_UNKNOWN;
+        }
+        if (mode == ARMS_BRAKE_NORMAL) continue;
+        st = arms_set_brake(a, j, ARMS_BRAKE_NORMAL, true);
+        if (st != ARMS_OK) {
+            char reason[sizeof(last_error)];
+            snprintf(reason, sizeof(reason), "%s", last_error);
+            set_error("%s被拒绝: 关节 %d 的抱闸无法切回正常控制（Pn075=0）: %s", what, j, reason);
+            return st;
+        }
+        if (mode == ARMS_BRAKE_UNKNOWN)
+            logf_(a, "关节 %d 抱闸模式未知，已写入正常控制抱闸（Pn075=0）并回读确认，未保存", j);
+        else
+            logf_(a, "关节 %d 抱闸由%s（Pn075=%d）自动切为正常控制（Pn075=0），未保存", j,
+                  mode == ARMS_BRAKE_RELEASE ? "强制松闸" : "强制抱闸", (int)mode);
+    }
+    return ARMS_OK;
+}
+
 arms_status arms_enable(arms_t *a, arms_mask joints, unsigned int timeout_ms)
 {
+    arms_status st;
     if (!a) return ARMS_E_ARG;
-    if (brake_abnormal(a, a->joints, "使能")) return ARMS_E_STATE;
+    if ((st = brake_to_normal(a, joints, "使能")) != ARMS_OK) return st;
     return request_and_wait(a, joints, REQ_ENABLE, timeout_ms, "使能");
 }
 
@@ -1519,7 +1556,7 @@ arms_status arms_free(arms_t *a, arms_mask joints, double kd)
             set_error("零力矩拖动: kd %.3f 超过关节 %d 的 gain_max.kd %.3f", kd, j, a->cfg.joint[j].kd_max);
             return ARMS_E_ARG;
         }
-    if (brake_abnormal(a, a->joints, "零力矩拖动")) return ARMS_E_STATE;
+    if ((st = brake_to_normal(a, joints, "零力矩拖动")) != ARMS_OK) return st;
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_joint_state s;
         if (!(joints & ARMS_MASK_JOINT(j))) continue;

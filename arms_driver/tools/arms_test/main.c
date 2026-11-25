@@ -705,11 +705,11 @@ static void startup_selftest(void)
         char list[256];
         arms_brake_scan(g_arms, &released, &held, &unknown);
         if (released)
-            tlog_err("自检: 关节%s 的抱闸为强制松闸（Pn075=1），失能时没有保持力，且拒绝使能；"
-                     "执行 brake <关节> normal 恢复",
+            tlog_err("自检: 关节%s 为强制松闸（Pn075=1），失能时抱闸不提供保持力；"
+                     "enable / free 时会自动切回正常控制抱闸（Pn075=0）",
                      mask_list(released, list, sizeof(list)));
         if (held)
-            tlog_err("自检: 关节%s 的抱闸为强制抱闸（Pn075=2），拒绝使能；执行 brake <关节> normal 恢复",
+            tlog_err("自检: 关节%s 为强制抱闸（Pn075=2）；enable / free 时会自动切回正常控制抱闸（Pn075=0）",
                      mask_list(held, list, sizeof(list)));
         if (unknown)
             tlog_err("自检: 关节%s 的 Pn075 读取失败，可用 brake <关节> 查看", mask_list(unknown, list, sizeof(list)));
@@ -728,7 +728,7 @@ static bool uint_arg(const char *s, unsigned max, unsigned *out)
 static const char *brake_text(arms_brake_mode m)
 {
     switch (m) {
-    case ARMS_BRAKE_NORMAL: return "normal  (Pn075=0，正常控制)";
+    case ARMS_BRAKE_NORMAL: return "normal  (Pn075=0，正常控制抱闸)";
     case ARMS_BRAKE_RELEASE: return "release (Pn075=1，强制松闸)";
     case ARMS_BRAKE_HOLD: return "hold    (Pn075=2，强制抱闸)";
     default: return "unknown";
@@ -773,9 +773,9 @@ static int cmd_brake(int argc, char **argv)
         }
     }
     if (mode == ARMS_BRAKE_RELEASE)
-        tlog("强制松闸的关节失能时没有保持力；用手拖动请用 free。恢复执行 brake <关节> normal");
+        tlog("强制松闸的关节失能时没有保持力；用手拖动请用 free。enable / free 会自动切回 normal（Pn075=0）");
     else if (mode == ARMS_BRAKE_HOLD)
-        tlog("强制抱闸期间拒绝使能；恢复执行 brake <关节> normal");
+        tlog("强制抱闸期间伺服不松闸；enable / free 会自动切回 normal（Pn075=0）");
     return failures ? failed("%d 个关节未完成", failures) : ok();
 }
 
@@ -1052,7 +1052,9 @@ static const command commands[] = {
     {"info", "查看", "[关节]", 0, 1, "显示版本、配置文件、周期、实时 CPU、关节与总线位置的对应关系", "",
      "  info", cmd_info},
     {"enable", "控制", "<关节> [-t 毫秒]", 1, 3, "使能并显示模式和当前位置",
-     "  -t 指定等待超时；0 或省略时使用驱动默认值。", "  enable left -t 2000", cmd_enable},
+     "  -t 指定等待超时；0 或省略时使用驱动默认值。\n"
+     "  抱闸为强制松闸（Pn075=1）或强制抱闸（Pn075=2）的关节，先自动切回正常控制抱闸（Pn075=0），不保存。",
+     "  enable left -t 2000", cmd_enable},
     {"disable", "控制", "[关节]", 0, 1, "停止刷新并使关节失能", "  缺省作用于全部已打开关节。", "  disable",
      cmd_disable},
     {"reset", "控制", "<关节>", 1, 1, "故障复位并显示模式", "  复位后处于失能状态，运动前须重新使能。",
@@ -1077,14 +1079,15 @@ static const command commands[] = {
     {"free", "控制", "<关节> [kd]", 1, 2, "零力矩拖动：使能后 kp=0，可用手转动关节",
      "  关节写法同 status：21 | 15-18 | left | right | all。kd 为阻尼，默认 0（最轻），不超过 gain_max.kd。\n"
      "  关节没有保持力，肩、肘会因重力下落，执行前先托住。超过 vel_fault 会触发超速保护。\n"
-     "  先支撑关节再 disable；hold 保留 kp=0，不会恢复位置保持力。抱闸不是 normal 模式时拒绝执行。",
+     "  先支撑关节再 disable；hold 保留 kp=0，不会恢复位置保持力。\n  抱闸为强制松闸或强制抱闸时，先自动切回正常控制抱闸（Pn075=0）。",
      "  free 21\n  free left 0.2", cmd_free},
     {"brake", "维护", "<关节> [normal|release|hold]", 1, 2, "查看或临时设置抱闸模式（Pn075）",
      "  不带模式: 读取并显示 Pn075。\n"
-     "  normal  (0) 正常控制：使能时松闸，失能时抱闸。任何状态都可设置。\n"
-     "  release (1) 强制松闸：失能时抱闸不再提供保持；驱动器失能时电机阻尼很大，仍难以用手转动。\n"
-     "  hold    (2) 强制抱闸：使能时也不松闸。\n"
-     "  release / hold 要求关节失能，期间拒绝 enable 和 free。brake 本身不触发参数保存。\n"
+     "  0 normal  正常控制抱闸：伺服使能时松闸，失能时抱闸。任何状态都可设置。\n"
+     "  1 release 强制松闸：与伺服状态无关；失能时抱闸不提供保持力，且电机阻尼很大，仍难以用手转动。\n"
+     "  2 hold    强制抱闸：与伺服状态无关，使能时也不松闸。\n"
+     "  release / hold 要求关节失能；之后对该关节执行 enable 或 free 会自动切回 normal（0）。\n"
+     "  brake 只临时修改，不触发参数保存。\n"
      "  quit 时尝试恢复本次改动过的关节为 normal，但不改写已保存的参数。",
      "  brake all\n  brake 16 normal\n  brake left hold", cmd_brake},
     {"zero", "维护", "<关节> [--hw]", 1, 2, "以当前位置为零点",
