@@ -18,9 +18,13 @@ ros2 run arms_ros arms_node --ros-args -p mock:=true -p config:=$(realpath arms_
 | hardware/joint_states | sensor_msgs/msg/JointState，100 Hz，仅发布本会话已打开关节 |
 | hardware/actuator_states | communication/msg/ActuatorStates，100 Hz；PDO 不含温度，温度用 NaN 表示未知，不用零伪装有效值 |
 | hardware/arms/diagnostics | diagnostic_msgs/msg/DiagnosticArray，2 Hz，按臂报告链路、WKC、故障关节掩码（fault_joints）、保护关节、屏蔽、启动缺失和被拒绝的命令计数 |
-| arms/enable、disable、reset、selftest、free、brake_normal、brake_release、brake_hold、zero | arms_ros/srv/JointOperation：joints 是关节位掩码，confirm 是操作确认（disable 和 selftest 除外）；hardware_zero 仅对 zero 有效。free 为零力矩拖动（kp=0、kd=0）。brake_* 临时设置 Pn075 = 0/1/2，不保存；brake_release / brake_hold 要求关节失能，任一已打开关节不是 normal 或无法读回模式时 enable 和 free 被拒绝。zero 按关节判断：已使能先失能，已失能不重复操作，反馈确认静止后再写入；完成后不重新使能。软件零位立即生效。 |
+| arms/enable、disable、reset、selftest、free、brake_normal、brake_release、brake_hold、zero | arms_ros/srv/JointOperation：请求只含 `joints`（关节位掩码，selftest 忽略）和 `hardware_zero`（仅对 zero 有效，默认 false 为软件校零）。free 为零力矩拖动（kp=0、kd=0）。brake_* 临时设置 Pn075 = 0/1/2，不保存；三种模式均可在使能或失能时切换，不改变伺服状态或撤销已有目标。任一已打开关节不是 normal 或无法读回模式时，新的 enable 和 free 请求仍被拒绝。zero 按关节判断：已使能先失能，已失能不重复操作，反馈确认静止后再写入；完成后不重新使能。软件零位立即生效。 |
 
-状态和目标使用 SensorDataQoS / depth 1，诊断使用可靠 QoS。发生 power_off 保护时，独立监视线程请求失能；如节点拥有电源则请求断电，并保持会话锁定。恢复接线并确认安全后重新启动节点，不自动恢复使能。运行中丢失上位机目标时沿用驱动配置的超时保持或失能策略。
+实机调用抱闸服务前，请先停止运动指令，确认关节静止并支撑负载。服务成功仅表示 Pn075 写入并回读一致，不是机械到位反馈。
+
+例如在上述 mock 节点查询健康状态：`ros2 service call /arms/selftest arms_ros/srv/JointOperation "{}"`。升级到 0.3.0 时，请用新服务定义重新构建节点和依赖它的客户端，重新加载安装环境并重启进程；不要混用新旧接口。
+
+状态和目标使用 SensorDataQoS / depth 1，诊断使用可靠 QoS。发生 power_off 保护时，独立监视线程请求失能并锁定会话；如节点接管电源则请求断电。断电请求失败会报错并在节点退出时重试，必须现场核实实际供电状态。恢复接线并确认安全后重新启动节点，不自动恢复使能。运行中丢失上位机目标时沿用驱动配置的超时保持或失能策略。
 
 离线端到端回归（已 source install/local_setup.bash）：
 
@@ -28,4 +32,4 @@ ros2 run arms_ros arms_node --ros-args -p mock:=true -p config:=$(realpath arms_
 python3 arms_ros/test/smoke.py arms_driver/config/arms.json
 ```
 
-测试自建 localhost ROS 域和独立命名空间；两次启动均强制 mock，不连接 EtherCAT 或 PCI。
+测试自建 localhost ROS 域和独立命名空间；节点强制使用 mock，不连接 EtherCAT 或 PCI。

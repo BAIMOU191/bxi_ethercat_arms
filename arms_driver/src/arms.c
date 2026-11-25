@@ -264,18 +264,7 @@ static uint64_t mono_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-static void logf_(arms_t *a, const char *fmt, ...)
-{
-    char line[512];
-    va_list ap;
-    if (!a->opt.log) return;
-    va_start(ap, fmt);
-    vsnprintf(line, sizeof(line), fmt, ap);
-    va_end(ap);
-    a->opt.log(a->opt.log_user, line);
-}
-
-static void bus_log_adapter(void *user, const char *fmt, ...)
+static void logf_(void *user, const char *fmt, ...)
 {
     arms_t *a = user;
     char line[512];
@@ -526,7 +515,7 @@ static void cycle_rx(arms_t *a, uint64_t now)
         }
         if (ready && a->power_off_action && !a->tripped && (offline || failed)) {
             a->tripped = true;
-            a->trip_joints = offline ? offline : failed;
+            a->trip_joints = offline | failed;
         }
     }
 
@@ -842,26 +831,25 @@ static arms_status start_rt(arms_t *a)
     int ret;
     bool realtime = true;
 
-    pthread_attr_init(&attr);
-    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
-    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    ret = pthread_attr_init(&attr);
+    if (ret) { set_error("实时线程属性初始化失败: %s", strerror(ret)); return ARMS_E_SYSTEM; }
+    ret = pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+    if (!ret) ret = pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
     memset(&sp, 0, sizeof(sp));
     sp.sched_priority = a->cfg.rt_priority;
-    pthread_attr_setschedparam(&attr, &sp);
-    if (a->rt_cpu >= 0) {
+    if (!ret) ret = pthread_attr_setschedparam(&attr, &sp);
+    if (!ret && a->rt_cpu >= 0) {
         cpu_set_t set;
         CPU_ZERO(&set);
         CPU_SET(a->rt_cpu, &set);
-        pthread_attr_setaffinity_np(&attr, sizeof(set), &set);
+        ret = pthread_attr_setaffinity_np(&attr, sizeof(set), &set);
     }
-    ret = pthread_create(&a->thread, &attr, rt_main, a);
-    if (ret == EPERM && a->opt.backend == ARMS_BACKEND_MOCK) {
-        pthread_attr_destroy(&attr);
-        realtime = false;
-        pthread_attr_init(&attr);
-        ret = pthread_create(&a->thread, &attr, rt_main, a);
-    }
+    if (!ret) ret = pthread_create(&a->thread, &attr, rt_main, a);
     pthread_attr_destroy(&attr);
+    if (ret == EPERM && a->opt.backend == ARMS_BACKEND_MOCK) {
+        realtime = false;
+        ret = pthread_create(&a->thread, NULL, rt_main, a);
+    }
     if (ret == EPERM) {
         set_error("无法创建 SCHED_FIFO 实时线程：权限不足，需要 root");
         return ARMS_E_SYSTEM;
@@ -878,7 +866,7 @@ static arms_status start_rt(arms_t *a)
         else
             logf_(a, "实时线程: SCHED_FIFO %d, 未绑定 CPU, %u Hz", a->cfg.rt_priority, a->cycle_hz);
     } else {
-        logf_(a, "警告: 非 root 运行，模拟后端以普通线程运行，时序统计仅供参考");
+        logf_(a, "警告: 无实时调度权限，模拟后端使用默认线程属性，时序统计仅供参考");
     }
     return ARMS_OK;
 }
@@ -933,7 +921,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     if (options->config_path) {
         snprintf(path, sizeof(path), "%s", options->config_path);
     } else if (!arms_config_default_path(path, sizeof(path))) {
-        set_error("找不到配置文件（依次查找 $ARMS_CONFIG、/etc/bxi/arms.json、./config/arms.json）");
+        set_error("找不到配置文件：请用 -c 或 ARMS_CONFIG 指定可读的 arms.json");
         free(a);
         return ARMS_E_CONFIG;
     }
@@ -962,8 +950,8 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     atomic_store(&a->enable_timeout_cycles, DEFAULT_WAIT_MS * a->cycle_hz / 1000u);
     a->mode = options->mode != ARMS_MODE_CONFIG ? options->mode : a->cfg.mode;
     a->rt_cpu = options->rt_cpu >= -1 ? options->rt_cpu : a->cfg.rt_cpu;
-    if (a->rt_cpu >= sysconf(_SC_NPROCESSORS_CONF)) {
-        set_error("CPU %d 不存在", a->rt_cpu);
+    if (a->rt_cpu >= CPU_SETSIZE || a->rt_cpu >= sysconf(_SC_NPROCESSORS_CONF)) {
+        set_error("CPU %d 不存在或超出亲和性掩码容量", a->rt_cpu);
         free(a);
         return ARMS_E_ARG;
     }
@@ -1050,7 +1038,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         p.sync0_shift_ns = 0;
         p.vendor_id = a->cfg.vendor_id;
         p.product_code = a->cfg.product_code;
-        p.log = bus_log_adapter;
+        p.log = logf_;
         p.log_user = a;
         if (r->ops->open(&r->bus, &p, err, sizeof(err)) != 0) {
             set_error("%s 臂: %s", arms_arm_name(i), err);
@@ -1181,7 +1169,7 @@ void arms_close(arms_t *a)
         arms_mask abnormal = atomic_load(&a->brake_released) | atomic_load(&a->brake_held) | ~atomic_load(&a->brake_known);
         for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; j++)
             if (a->brake_touched & abnormal & ARMS_MASK_JOINT(j)) {
-                if (arms_set_brake(a, j, ARMS_BRAKE_NORMAL, true) != ARMS_OK)
+                if (arms_set_brake(a, j, ARMS_BRAKE_NORMAL) != ARMS_OK)
                     logf_(a, "警告：关节 %d 未能恢复正常抱闸控制，请保持机械支撑", j);
             }
         stop_and_free(a);
@@ -1332,7 +1320,7 @@ arms_status arms_check_online(arms_t *a, arms_mask *offline_out)
         const arms_arm_stats *as;
         if (!(a->joints & ARMS_MASK_JOINT(j))) continue;
         as = &s.stats.arm[a->cfg.joint[j].arm];
-        if ((s.s[j].al_state & 0x0F) != 0x08 || as->comm_failed || as->wkc_last != as->wkc_expected)
+        if (s.s[j].al_state != 0x08 || !as->link_up || as->comm_failed || as->wkc_last != as->wkc_expected)
             off |= ARMS_MASK_JOINT(j);
     }
     if (offline_out) *offline_out = off;
@@ -1428,6 +1416,14 @@ static const char *result_text(unsigned int r)
 }
 
 /* 向 mask 中已打开的关节发出请求并等待结果；失败时返回首个失败关节的说明 */
+/* 等待周期上下文发布两次快照，使随后的读取接口看到刚生效的指令或偏置（最长 100 ms） */
+static void wait_snapshot(arms_t *a)
+{
+    unsigned int s0 = atomic_load(&a->seq);
+    uint64_t until = mono_ns() + 100000000ull;
+    while (atomic_load(&a->seq) - s0 < 4u && mono_ns() < until) usleep(500);
+}
+
 static arms_status request_and_wait(arms_t *a, arms_mask mask, unsigned int req, unsigned int timeout_ms,
                                     const char *what)
 {
@@ -1471,9 +1467,7 @@ static arms_status request_and_wait(arms_t *a, arms_mask mask, unsigned int req,
     }
     if (bad < 0) {
         /* 等快照包含本次结果后再返回，保证随后的 arms_read()/arms_set_command() 看到新状态 */
-        unsigned int s0 = atomic_load(&a->seq);
-        uint64_t until = mono_ns() + 100000000ull;
-        while (atomic_load(&a->seq) - s0 < 4u && mono_ns() < until) usleep(500);
+        wait_snapshot(a);
         return ARMS_OK;
     }
     if (req == REQ_ENABLE) {
@@ -1491,14 +1485,6 @@ static arms_status request_and_wait(arms_t *a, arms_mask mask, unsigned int req,
     if (bad_res == RES_TIMEOUT || bad_res == RES_PENDING) return ARMS_E_TIMEOUT;
     if (bad_res == RES_COMM) return ARMS_E_COMM;
     return ARMS_E_STATE;
-}
-
-/* 等待周期上下文发布两次快照，使随后的读取接口看到刚生效的指令或偏置（最长 100 ms） */
-static void wait_snapshot(arms_t *a)
-{
-    unsigned int s0 = atomic_load(&a->seq);
-    uint64_t until = mono_ns() + 100000000ull;
-    while (atomic_load(&a->seq) - s0 < 4u && mono_ns() < until) usleep(500);
 }
 
 /*
@@ -1580,8 +1566,11 @@ arms_status arms_reset(arms_t *a, arms_mask joints, unsigned int timeout_ms)
 {
     int j;
     if (!a) return ARMS_E_ARG;
+    joints &= a->joints;
+    if (!joints) { set_error("复位: 没有选中已打开的关节"); return ARMS_E_ARG; }
+    if (!arms_ready(a)) { set_error("复位: 预热未完成"); return ARMS_E_STATE; }
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j)
-        if ((joints & a->joints & ARMS_MASK_JOINT(j))) atomic_store(&a->clear_comm[a->cfg.joint[j].arm], true);
+        if ((joints & ARMS_MASK_JOINT(j))) atomic_store(&a->clear_comm[a->cfg.joint[j].arm], true);
     atomic_store(&a->clear_protect, true);
     return request_and_wait(a, joints, REQ_RESET, timeout_ms, "复位");
 }
@@ -1686,11 +1675,11 @@ static arms_status verified(arms_t *a, int j, unsigned n, uint16_t value)
     return ARMS_OK;
 }
 /* 从同一周期的快照取得状态与通信统计，不把失能请求当作驱动器反馈。 */
-static arms_status maintenance_read(arms_t *a, int j, bool confirmed, arms_joint_state *s, arms_bus_stats *stats)
+static arms_status maintenance_read(arms_t *a, int j, arms_joint_state *s, arms_bus_stats *stats)
 {
-    if (!a || !confirmed) {
-        set_error("维护接口需要调用方明确授权");
-        return ARMS_E_STATE;
+    if (!a) {
+        set_error("驱动句柄为空");
+        return ARMS_E_ARG;
     }
     if (j < ARMS_JOINT_FIRST || j > ARMS_JOINT_LAST || !(a->joints & ARMS_MASK_JOINT(j))) {
         set_error("关节 %d 未打开", j);
@@ -1716,18 +1705,6 @@ static bool drive_disabled(const arms_joint_state *s)
            (s->status_word & 0x006f) == 0x0040;
 }
 
-static arms_status maintenance_ready_ex(arms_t *a, int j, bool confirmed, arms_joint_state *s, bool need_disabled)
-{
-    arms_bus_stats stats;
-    arms_status st = maintenance_read(a, j, confirmed, s, &stats);
-    if (st != ARMS_OK) return st;
-    if (need_disabled && !drive_disabled(s)) {
-        set_error("关节 %d 未失能（当前 %s），先执行 disable", j, arms_joint_mode_name(s->mode));
-        return ARMS_E_STATE;
-    }
-    return ARMS_OK;
-}
-
 /* 运行中的 MIT 主站拥有这些周期输出及其映射，不允许两个生产者同时写同一状态。
  * 与 Pn 手册目录无关；其余 SDO 由从站按自己的对象字典和访问属性应答。 */
 static bool owned_by_cycle(uint16_t index, uint8_t sub)
@@ -1737,19 +1714,19 @@ static bool owned_by_cycle(uint16_t index, uint8_t sub)
 }
 
 arms_status arms_sdo_write(arms_t *a, int j, uint16_t idx, uint8_t sub, const uint8_t *data,
-                           size_t len, bool confirmed)
+                           size_t len)
 {
     if (!data || !len) { set_error("SDO 写入需要非空数据"); return ARMS_E_ARG; }
     if (!sub && (idx == 0x2075 || idx == 0x2097 || idx == 0x2101)) {
         if (len != 2) { set_error("抱闸/保存/清零动作需要 2 字节"); return ARMS_E_ARG; }
         unsigned v = kgu_get_u16(data, 0);
-        if (idx == 0x2075) return arms_set_brake(a, j, (arms_brake_mode)v, confirmed);
+        if (idx == 0x2075) return arms_set_brake(a, j, (arms_brake_mode)v);
         if (v != 1) { set_error("保存/清零只接受写 1 触发，复位由程序完成"); return ARMS_E_ARG; }
-        return arms_service(a, j, idx == 0x2097 ? ARMS_SAVE : ARMS_ZERO_HW, confirmed);
+        return arms_service(a, j, idx == 0x2097 ? ARMS_SAVE : ARMS_ZERO_HW);
     }
     arms_joint_state s;
     arms_bus_stats stats;
-    arms_status st = maintenance_read(a, j, confirmed, &s, &stats);
+    arms_status st = maintenance_read(a, j, &s, &stats);
     if (st != ARMS_OK) return st;
     if (stats.tripped || stats.protect.reason != ARMS_PROTECT_NONE || s.error_code || !drive_disabled(&s)) {
         set_error("关节 %d 未确认失能或有故障/保护，未写 %04x:%02x", j, idx, sub);
@@ -1763,7 +1740,7 @@ arms_status arms_sdo_write(arms_t *a, int j, uint16_t idx, uint8_t sub, const ui
     return mailbox(a, j, idx, sub, (uint8_t *)data, &len, true);
 }
 
-arms_status arms_pn_write(arms_t *a, int j, unsigned n, int v, bool confirmed)
+arms_status arms_pn_write(arms_t *a, int j, unsigned n, int v)
 {
     int index = arms_pn_index(n);
     if (index < 0 || v < INT16_MIN || v > INT16_MAX) {
@@ -1771,7 +1748,7 @@ arms_status arms_pn_write(arms_t *a, int j, unsigned n, int v, bool confirmed)
     }
     uint8_t data[2];
     kgu_put_u16(data, 0, (uint16_t)v);
-    return arms_sdo_write(a, j, (uint16_t)index, 0, data, sizeof(data), confirmed);
+    return arms_sdo_write(a, j, (uint16_t)index, 0, data, sizeof(data));
 }
 
 const char *arms_brake_mode_name(arms_brake_mode m)
@@ -1837,18 +1814,29 @@ arms_status arms_brake_scan(arms_t *a, arms_mask *released, arms_mask *held, arm
     return ARMS_OK;
 }
 
-arms_status arms_set_brake(arms_t *a, int j, arms_brake_mode mode, bool confirmed)
+arms_status arms_set_brake(arms_t *a, int j, arms_brake_mode mode)
 {
     arms_joint_state s;
+    arms_bus_stats stats;
     arms_status st;
     if (!a) return ARMS_E_ARG;
     if (mode != ARMS_BRAKE_NORMAL && mode != ARMS_BRAKE_RELEASE && mode != ARMS_BRAKE_HOLD) {
         set_error("无效的抱闸模式");
         return ARMS_E_ARG;
     }
-    /* 恢复正常控制不要求失能；强制松闸/抱闸要求失能 */
-    st = maintenance_ready_ex(a, j, confirmed, &s, mode != ARMS_BRAKE_NORMAL);
+    /* Pn075 是在线参数，不发送使能/失能请求，也不改写当前运动目标。 */
+    st = maintenance_read(a, j, &s, &stats);
     if (st != ARMS_OK) return st;
+    if (mode != ARMS_BRAKE_NORMAL) {
+        if (stats.tripped || stats.protect.reason != ARMS_PROTECT_NONE || s.error_code || s.mode == ARMS_JS_FAULT) {
+            set_error("关节 %d 故障或保护已触发，未写强制抱闸模式", j);
+            return ARMS_E_STATE;
+        }
+        if (s.mode != ARMS_JS_ENABLED && !drive_disabled(&s)) {
+            set_error("关节 %d 状态字 0x%04x 不在稳定的使能或失能态，未写 Pn075", j, s.status_word);
+            return ARMS_E_STATE;
+        }
+    }
     a->brake_touched |= ARMS_MASK_JOINT(j);
     st = verified(a, j, 75, (uint16_t)mode);
     if (st == ARMS_OK) {
@@ -1870,14 +1858,14 @@ static double zero_value(const arms_t *a, int j, const arms_joint_state *s)
 }
 
 /* 校零与保存共用：仅在需要时请求目标关节失能，以新 PDO 反馈验证静止，不重新使能。 */
-static arms_status prepare_stationary(arms_t *a, int j, bool confirmed, arms_joint_state *s, const char *operation)
+static arms_status prepare_stationary(arms_t *a, int j, arms_joint_state *s, const char *operation)
 {
     const uint64_t deadline = mono_ns() + 1000000000ull;
     uint64_t quiet_since = 0;
     bool requested = false;
     do {
         arms_bus_stats stats;
-        arms_status st = maintenance_read(a, j, confirmed, s, &stats);
+        arms_status st = maintenance_read(a, j, s, &stats);
         if (st != ARMS_OK) return st;
         if (stats.tripped || stats.protect.reason != ARMS_PROTECT_NONE || s->error_code ||
             s->mode == ARMS_JS_FAULT || !isfinite(s->position) || !isfinite(s->velocity)) {
@@ -1908,11 +1896,11 @@ static arms_status prepare_stationary(arms_t *a, int j, bool confirmed, arms_joi
     return ARMS_E_TIMEOUT;
 }
 
-arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
+arms_status arms_service(arms_t *a, int j, arms_service_op op)
 {
     arms_joint_state s;
     if (op != ARMS_ZERO_SOFT && op != ARMS_ZERO_HW && op != ARMS_SAVE) return ARMS_E_ARG;
-    arms_status st = prepare_stationary(a, j, confirmed, &s, op == ARMS_SAVE ? "保存参数" : "校零");
+    arms_status st = prepare_stationary(a, j, &s, op == ARMS_SAVE ? "保存参数" : "校零");
     if (st != ARMS_OK)
         return st;
     uint8_t data[2];

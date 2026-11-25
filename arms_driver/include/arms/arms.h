@@ -159,7 +159,7 @@ typedef struct {
     uint64_t wkc_bad;                /**< WKC 不符的周期数 */
     uint32_t wkc_bad_consecutive_max;
     uint64_t send_errors;
-    bool comm_failed;                /**< 连续异常超过 safety.wkc_tolerance，恢复稳定后自动清除 */
+    bool comm_failed;                /**< 连续异常达到 safety.wkc_tolerance，恢复稳定后自动清除 */
     uint32_t comm_drops;             /**< 通信失败次数 */
     uint32_t comm_recoveries;        /**< 自动恢复次数 */
     double recv_us_max;
@@ -360,7 +360,7 @@ arms_status arms_free(arms_t *arms, arms_mask joints, double kd);
 
 /*
  * 维护接口：只能在同一个非实时管理线程中调用（内部使用阻塞的 SDO 访问）。
- * 写操作要求该关节所在臂通信正常、confirmed 为 true，其余条件见各接口。
+ * 写操作要求该关节所在臂通信正常，其余条件见各接口。
  */
 
 /** 抱闸模式（Pn075） */
@@ -377,11 +377,12 @@ const char *arms_brake_mode_name(arms_brake_mode mode);
 /**
  * @brief 临时设置抱闸模式（写 Pn075 并回读，不保存到驱动器）
  *
- * RELEASE / HOLD 要求该关节失能；NORMAL 不要求失能，但仍要求有效通信和明确确认。
+ * 三种模式均可在使能或失能时切换，不切换伺服状态，也不撤销运动目标。需在线且反馈新鲜；
+ * 故障、保护或伺服过渡态不能写强制模式。切换前停止运动并支撑负载。
  * 任一已打开关节不是 NORMAL 或无法确认模式时，arms_enable() 和 arms_free() 被拒绝。
  * arms_close() 尝试将本次会话改动过的关节恢复为 NORMAL，不保证机械抱闸已闭合。
  */
-arms_status arms_set_brake(arms_t *arms, int joint, arms_brake_mode mode, bool confirmed);
+arms_status arms_set_brake(arms_t *arms, int joint, arms_brake_mode mode);
 
 /** @brief 读取单个关节的 Pn075 并更新内部记录 */
 arms_status arms_get_brake(arms_t *arms, int joint, arms_brake_mode *mode);
@@ -404,7 +405,7 @@ typedef enum {
 } arms_service_op;
 
 /** @brief 执行维护操作（单个关节；多个关节由调用方逐个调用）。校零和参数保存均按需失能并等待静止，操作后不重新使能。 */
-arms_status arms_service(arms_t *arms, int joint, arms_service_op op, bool confirmed);
+arms_status arms_service(arms_t *arms, int joint, arms_service_op op);
 
 /** @brief 读取对象字典 */
 arms_status arms_sdo_read(arms_t *arms, int joint, uint16_t index, uint8_t sub, uint8_t *out, size_t cap,
@@ -414,9 +415,9 @@ arms_status arms_sdo_read(arms_t *arms, int joint, uint16_t index, uint8_t sub, 
  * 普通写需在线且失能，不抢写运行中的 PDO；成功指从站接受下载，不代表已回读或掉电保存。
  * Pn075/097/101（子索引 0）沿用专用动作及反馈检查。 */
 arms_status arms_sdo_write(arms_t *arms, int joint, uint16_t index, uint8_t sub, const uint8_t *data,
-                           size_t size, bool confirmed);
+                           size_t size);
 /** @brief Pn000..999 的 INT16 简写，与 arms_sdo_write 的语义相同。 */
-arms_status arms_pn_write(arms_t *arms, int joint, unsigned number, int value, bool confirmed);
+arms_status arms_pn_write(arms_t *arms, int joint, unsigned number, int value);
 
 /** @brief Pn 参数号对应的对象字典索引（Pn075 → 0x2075），无效返回 -1 */
 int arms_pn_index(unsigned number);
@@ -431,6 +432,12 @@ typedef struct {
 arms_status arms_get_joint_info(const arms_t *arms, int joint, arms_joint_info *info);
 /** @brief 版本字符串 */
 const char *arms_version(void);
+
+/** @brief 该驱动支持的周期频率。 */
+bool arms_cycle_hz_supported(unsigned int hz);
+
+/** @brief 查找可读配置：环境变量、/etc/bxi、工作目录、可执行文件附近及安装的 share 目录。 */
+bool arms_config_default_path(char *out, size_t size);
 
 #ifdef __cplusplus
 }

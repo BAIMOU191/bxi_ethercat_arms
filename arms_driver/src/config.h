@@ -58,13 +58,7 @@ extern const char *const arms_standard_joint_names[31];
 
 bool arms_store_offset(const char *path, int joint, double value);
 
-bool arms_cycle_hz_supported(unsigned int hz);
-
 /* Load and validate. On failure returns false and writes a message to error. */
 bool arms_config_load(const char *path, arms_config *config, char *error, size_t error_size);
-
-/* Default search: $ARMS_CONFIG, /etc/bxi/arms.json, ./config/arms.json,
- * <exe dir>/../config/arms.json. Returns false if none is readable. */
-bool arms_config_default_path(char *out, size_t size);
 
 #endif

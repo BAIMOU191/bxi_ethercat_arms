@@ -43,7 +43,7 @@ eth0、eth1 由 EtherLab 主站独占，只承载 EtherCAT 帧。
 | 资源 | 用途 |
 |---|---|
 | `/dev/EtherCAT0`、`/dev/EtherCAT1` | EtherLab 主站 0/1，按网口 MAC 解析主站号 |
-| BXI PCI SDK（`motor_pwr_set`） | 仅 `arms_test` 用于电机总电源；库本身不操作电源 |
+| BXI PCI SDK（`motor_pwr_set`） | `arms_test` 默认管理电源；`arms_ros` 仅在 `manage_power=true` 的实机会话接管。核心 C 库本身不操作电源 |
 | `/run/arms_rt_setup.state` | `rt_setup.sh` 的还原记录 |
 
 同一主站同时只能被一个程序占用；`motor_console`、`hw_lib_test_*` 等程序运行时无法打开。

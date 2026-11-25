@@ -86,8 +86,16 @@ class ArmsNode final : public rclcpp::Node
             reject("timestamp");
             return;
         }
-        std::array<arms_command, 29> cmds{};
-        arms_mask mask = 0;
+        arms_joint_state states[ARMS_JOINT_COUNT];
+        size_t count = 0;
+        if (arms_read(dev.driver, states, ARMS_JOINT_COUNT, &count) != ARMS_OK) {
+            reject("joint feedback unavailable");
+            return;
+        }
+        arms_mask enabled = 0, seen = 0;
+        for (size_t i = 0; i < count; ++i)
+            if (states[i].mode == ARMS_JS_ENABLED) enabled |= ARMS_MASK_JOINT(states[i].joint);
+        std::array<arms_command, ARMS_JOINT_LAST + 1> cmds{};
         for (size_t i = 0; i < n; i++) {
             int j = arms_joint_by_name(dev.driver, m.actuators_name[i].c_str());
             if (j < 15 || j > 28)
@@ -95,18 +103,16 @@ class ArmsNode final : public rclcpp::Node
             arms_mask bit = ARMS_MASK_JOINT(j);
             if (!(arms_opened_joints(dev.driver) & bit))
                 continue;
-            arms_joint_state s{};
-            arms_read_joint(dev.driver, j, &s);
             arms_command c{m.pos[i], m.vel[i], m.torque[i], m.kp[i], m.kd[i]};
-            if (mask & bit || !std::isfinite(c.position) || !std::isfinite(c.velocity) ||
+            if (seen & bit || !std::isfinite(c.position) || !std::isfinite(c.velocity) ||
                 !std::isfinite(c.torque) || !std::isfinite(c.kp) || !std::isfinite(c.kd) || c.kp < 0 ||
                 c.kd < 0) {
                 reject("duplicate or invalid value");
                 return;
             }
-            mask |= bit;
+            seen |= bit;
             cmds[j] = c;
-            if (s.mode != ARMS_JS_ENABLED)
+            if (!(enabled & bit))
                 continue;
             arms_joint_limits l{};
             arms_get_limits(dev.driver, j, &l);
@@ -116,11 +122,11 @@ class ArmsNode final : public rclcpp::Node
                 return;
             }
         }
-        for (int j = 15; j <= 28; j++)
+        // Only submit targets validated against the enabled set from this frame.
+        const arms_mask mask = seen & enabled;
+        for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; j++)
             if (mask & ARMS_MASK_JOINT(j)) {
-                arms_joint_state s{};
-                arms_read_joint(dev.driver, j, &s);
-                if (s.mode == ARMS_JS_ENABLED && arms_set_command(dev.driver, j, &cmds[j], 0) != ARMS_OK) {
+                if (arms_set_command(dev.driver, j, &cmds[j], 0) != ARMS_OK) {
                     arms_disable(dev.driver, mask);
                     reject("driver rejected command");
                     return;
@@ -156,8 +162,8 @@ class ArmsNode final : public rclcpp::Node
             r.message = "select opened joint bits 15..28";
             return;
         }
-        if (name != "disable" && (!q.confirm || dev.cut)) {
-            r.message = "confirmation required or protection latched";
+        if (name != "disable" && dev.cut) {
+            r.message = "protection latched";
             return;
         }
         arms_status st = ARMS_E_ARG;
@@ -177,13 +183,17 @@ class ArmsNode final : public rclcpp::Node
                     continue;
                 arms_status one;
                 if (name == "brake_normal")
-                    one = arms_set_brake(dev.driver, j, ARMS_BRAKE_NORMAL, q.confirm);
+                    one = arms_set_brake(dev.driver, j, ARMS_BRAKE_NORMAL);
                 else if (name == "brake_release")
-                    one = arms_set_brake(dev.driver, j, ARMS_BRAKE_RELEASE, q.confirm);
+                    one = arms_set_brake(dev.driver, j, ARMS_BRAKE_RELEASE);
                 else if (name == "brake_hold")
-                    one = arms_set_brake(dev.driver, j, ARMS_BRAKE_HOLD, q.confirm);
-                else
-                    one = arms_service(dev.driver, j, q.hardware_zero ? ARMS_ZERO_HW : ARMS_ZERO_SOFT, q.confirm);
+                    one = arms_set_brake(dev.driver, j, ARMS_BRAKE_HOLD);
+                else if (name == "zero")
+                    one = arms_service(dev.driver, j, q.hardware_zero ? ARMS_ZERO_HW : ARMS_ZERO_SOFT);
+                else {
+                    r.message = "unknown joint operation";
+                    return;
+                }
                 if (one != ARMS_OK)
                     failed += std::to_string(j) + ": " + arms_last_error() + "; ";
             }
@@ -295,7 +305,7 @@ class ArmsNode final : public rclcpp::Node
             dev.lease = arms_acquire_lease();
             if (dev.lease < 0)
                 throw std::runtime_error("hardware session busy or permission denied");
-            if (rt_setup && (arms_env_start_master() != 0 || arms_env_rt_apply(opt.config_path, -1) != 0))
+            if (rt_setup && (arms_env_start_master() != 0 || arms_env_rt_apply(opt.config_path, opt.rt_cpu) != 0))
                 throw std::runtime_error("real-time environment setup failed");
             if (power) {
                 dev.owns_power = true;
@@ -325,10 +335,10 @@ class ArmsNode final : public rclcpp::Node
             arms_brake_scan(dev.driver, &released, &held, &unknown);
             if (released | held)
                 RCLCPP_WARN(get_logger(),
-                            "brake not in normal mode (released 0x%08x, held 0x%08x); enable refused until brake_normal",
+                            "brake not in normal mode (released 0x%08x, held 0x%08x); new enable/free requests refused until brake_normal",
                             released, held);
             if (unknown)
-                RCLCPP_WARN(get_logger(), "brake mode (Pn075) unreadable on joint mask 0x%08x", unknown);
+                RCLCPP_WARN(get_logger(), "brake mode (Pn075) unreadable on joint mask 0x%08x; new enable/free requests require known normal modes", unknown);
         }
         auto qos = rclcpp::SensorDataQoS().keep_last(1);
         joint_pub = create_publisher<Joint>("hardware/joint_states", qos);
@@ -350,9 +360,9 @@ class ArmsNode final : public rclcpp::Node
                 arms_get_stats(dev.driver, &s);
                 if (s.tripped && !dev.cut.exchange(true)) {
                     arms_disable(dev.driver, arms_opened_joints(dev.driver));
-                    if (dev.owns_power.exchange(false)) {
-                        if (arms_power_off())
-                            RCLCPP_ERROR(get_logger(), "power-off request FAILED");
+                    if (dev.owns_power) {
+                        if (arms_power_off() == 0) dev.owns_power = false;
+                        else RCLCPP_ERROR(get_logger(), "power-off request FAILED; verify power on site; shutdown will retry");
                     } else
                         RCLCPP_ERROR(get_logger(),
                                      "trip latched; external power owner must verify power off");

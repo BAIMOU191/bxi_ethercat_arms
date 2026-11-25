@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory() as tmp:
     os.close(slave)
     try:
         expect(master, b'> \x1b[0K')
-        for typed, shown in [(b'ze\t', b'> zero '), (b'help brake_v\t', b'> help brake_voltage '),
+        for typed, shown in [(b'exi\t', b'> exit '), (b'ze\t', b'> zero '), (b'help brake_v\t', b'> help brake_voltage '),
                              (b'pn help torque_s\t', b'> pn help torque_scale '),
                              (b'pn 15 Pn14\t', b'> pn 15 Pn148 '),
                              (b'brake 15 rel\t', b'> brake 15 release '),
@@ -44,7 +44,13 @@ with tempfile.TemporaryDirectory() as tmp:
         os.write(master, b's\t')
         listing = expect(master, b'  \r')
         assert b'status  ' in listing and b'swing  ' in listing, listing
-        os.write(master, b'\x15qui\t\r')
+        # A long pasted line must not execute a valid-looking prefix.
+        os.write(master, b'\x15quit' + b' ' * 507 + b'X\r')
+        marker = '输入行过长，命令未执行。'.encode()
+        tail = expect(master, marker).split(marker, 1)[1]
+        if b'> \x1b[0K' not in tail:
+            expect(master, b'> \x1b[0K')
+        os.write(master, b'qui\t\r')
         assert p.wait(timeout=5) == 0
         assert config.read_bytes() == original
     finally:

@@ -306,8 +306,8 @@ static void el_update_states(bus_t *b, uint8_t *al, bool *link_up)
     for (i = 0; i < b->count; ++i) {
         ec_slave_config_state_t st;
         memset(&st, 0, sizeof(st));
-        if (ecrt_slave_config_state(b->sc[i], &st) == 0)
-            al[i] = st.online ? (uint8_t)st.al_state : 0;
+        /* 查询失败时不能把上次的 OP 当成本次在线反馈。 */
+        al[i] = ecrt_slave_config_state(b->sc[i], &st) == 0 && st.online ? (uint8_t)st.al_state : 0;
     }
     memset(&ms, 0, sizeof(ms));
     ecrt_master_state(b->master, &ms);

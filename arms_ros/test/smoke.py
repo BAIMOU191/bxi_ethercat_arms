@@ -19,10 +19,10 @@ def until(predicate):
     while not predicate():
         assert time.monotonic()<end,'ROS condition timed out'
         rclpy.spin_once(test,timeout_sec=.04)
-def call(name,confirm=False,joint=21):
+def call(name, *, joint=21):
     cli=test.create_client(JointOperation,ns+'/arms/'+name)
     assert cli.wait_for_service(timeout_sec=12),name
-    q=JointOperation.Request();q.joints=1<<joint;q.confirm=confirm
+    q=JointOperation.Request(joints=1<<joint)
     f=cli.call_async(q);until(f.done);r=f.result();test.destroy_client(cli);return r
 try:
     config_dir = tempfile.TemporaryDirectory()
@@ -33,32 +33,45 @@ try:
     try:
         until(lambda:len(seen)==3);assert len(seen['joint_states'].name)==14
         assert seen['arms/diagnostics'].status[0].level in (0,b'\x00'),seen['arms/diagnostics']
-        assert call('selftest').success and not call('enable').success
-        # 抱闸模式需要确认；非 normal 期间拒绝使能和零力矩拖动
-        assert not call('brake_release').success
-        assert call('brake_release',True).success
-        assert not call('enable',True).success and not call('free',True).success
-        assert call('brake_hold',True).success
-        assert not call('enable',True).success
-        assert call('brake_normal',True).success
+        assert set(JointOperation.Request.get_fields_and_field_types()) == {'joints', 'hardware_zero'}
+        assert call('selftest').success and call('reset').success
+        assert not call('enable', joint=0).success  # 未打开的关节仍被拒绝
+        # 非 normal 期间仍拒绝使能和零力矩拖动
+        assert call('brake_release').success
+        assert not call('enable').success and not call('free').success
+        assert call('brake_hold').success
+        assert not call('enable').success
+        assert call('brake_normal').success
         # 零力矩拖动会使能关节
-        assert call('free',True).success
-        # free 后校零与已失能后校零共用驱动路径；ROS 的授权字段保持兼容。
-        assert not call('zero').success
-        assert call('zero',True).success and call('zero',True).success
-        assert call('free',True).success
-        # 使能中拒绝强制松闸
-        assert not call('brake_release',True).success
+        assert call('free').success
+        # free 后校零与已失能后校零共用驱动路径。
+        assert call('zero').success and call('zero').success
+        assert call('enable').success
+        # 已使能时切换 Pn075 不失能；恢复 normal 后无需再次 enable 就能接受后续目标。
+        for service in ('brake_release', 'brake_hold', 'brake_release', 'brake_normal'):
+            assert call(service).success, service
         m=ActuatorCmds();m.actuators_name=['l_wrist_z_joint'];m.pos=[.1];m.vel=[0.];m.kp=[5.];m.kd=[0.];m.torque=[0.]
         def moved():
             m.header.stamp=test.get_clock().now().to_msg();pub.publish(m)
             s=seen['joint_states'];return abs(s.position[s.name.index('l_wrist_z_joint')]-.1)<.02
         until(moved)
-        m.pos=[];pub.publish(m)
-        until(lambda:any(k.key=='rejected_commands' and int(k.value)>0 for k in seen['arms/diagnostics'].status[0].values))
+        def rejected_count():
+            return int(next(k.value for k in seen['arms/diagnostics'].status[0].values if k.key == 'rejected_commands'))
+        old = rejected_count()
+        m.pos=[]; m.header.stamp=test.get_clock().now().to_msg(); pub.publish(m)
+        until(lambda: rejected_count() > old)
+        # 两个已使能关节：第一项合法、第二项超限时，第一项也不能被下发。
+        assert call('enable', joint=22).success
+        m.actuators_name=['l_wrist_z_joint','r_shoulder_y_joint']; m.pos=[-.1,1e6]
+        m.vel=[0.,0.]; m.kp=[5.,5.]; m.kd=[0.,0.]; m.torque=[0.,0.]
+        old = rejected_count(); m.header.stamp=test.get_clock().now().to_msg(); pub.publish(m)
+        until(lambda: rejected_count() > old)
+        state=seen['joint_states']
+        assert abs(state.position[state.name.index('l_wrist_z_joint')]-.1)<.02
+        assert call('disable', joint=22).success
         assert call('disable').success
         # 注入 15 号驱动器故障：WKC 正常也不能把这条臂报告为 online。
-        call('enable', True, joint=15)
+        call('enable', joint=15)
         until(lambda: any(d.message == 'drive fault' and any(
             kv.key == 'fault_joints' and int(kv.value) & (1 << 15) for kv in d.values
         ) for d in seen['arms/diagnostics'].status))

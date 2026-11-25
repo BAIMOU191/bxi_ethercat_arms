@@ -58,6 +58,16 @@ int main(int argc, char **argv)
     CHECK(fabs(rd(a, 17).cmd_position - s.position) < 1e-3, "hold position on enable");
     CHECK(rd(a, 22).mode == ARMS_JS_LOCKED, "22 untouched");
 
+    /* 原始 C 接口也走抱闸流程；不能靠 CLI 的参数别名掩盖底层的不同实现。 */
+    arms_brake_mode brake = ARMS_BRAKE_UNKNOWN;
+    const uint8_t hold_pn075[2] = {2, 0};
+    CHECK(arms_pn_write(a, 17, 75, 1) == ARMS_OK, arms_last_error());
+    CHECK(arms_get_brake(a, 17, &brake) == ARMS_OK && brake == ARMS_BRAKE_RELEASE, "Pn075 release");
+    CHECK(arms_sdo_write(a, 17, 0x2075, 0, hold_pn075, sizeof(hold_pn075)) == ARMS_OK, arms_last_error());
+    CHECK(arms_get_brake(a, 17, &brake) == ARMS_OK && brake == ARMS_BRAKE_HOLD, "SDO brake hold");
+    CHECK(arms_set_brake(a, 17, ARMS_BRAKE_NORMAL) == ARMS_OK, arms_last_error());
+    CHECK(rd(a, 17).mode == ARMS_JS_ENABLED, "changing Pn075 did not disable servo");
+
     /* 关节 21 的模拟初始位置 0.7 在限位 0.5 之外：使能后保持原位，不被拉回 */
     s = rd(a, 21);
     CHECK(arms_enable(a, ARMS_MASK_JOINT(21), 0) == ARMS_OK, arms_last_error());
@@ -123,6 +133,8 @@ int main(int argc, char **argv)
     CHECK(s.mode == ARMS_JS_FAULT, "fault detected");
     CHECK(s.fault_count == 1, "fault counted");
     CHECK(s.error_code != 0, "error code");
+    CHECK(arms_set_brake(a, 15, ARMS_BRAKE_RELEASE) == ARMS_E_STATE, "forced release refused while faulted");
+    CHECK(arms_set_brake(a, 15, ARMS_BRAKE_HOLD) == ARMS_E_STATE, "forced hold refused while faulted");
     CHECK(arms_enable(a, ARMS_MASK_JOINT(15), 0) == ARMS_E_STATE, "enable refused while faulted");
     CHECK(arms_reset(a, ARMS_MASK_JOINT(15), 0) == ARMS_OK, arms_last_error());
     CHECK(rd(a, 15).mode == ARMS_JS_LOCKED, "locked after reset");
