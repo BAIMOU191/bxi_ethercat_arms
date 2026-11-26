@@ -7,6 +7,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "bxi_pci_drv.h"
 
@@ -30,6 +31,12 @@ int main(int argc, char **argv)
     if (strcmp(op, "on") && strcmp(op, "off") && strcmp(op, "status")) {
         fprintf(stderr, "用法: sudo %s on | off | status\n", argv[0]);
         return 2;
+    }
+    /* 非 root 运行时 SDK 会以当前用户创建 /tmp/bxi_pci.lock，之后 root 因 fs.protected_regular 无法打开该文件 */
+    if (geteuid() != 0) {
+        fprintf(stderr, "需要 root: sudo %s %s
+", argv[0], op);
+        return 1;
     }
     if (bxi_pci_init(ignore_can, NULL, -1) == -1) {
         fprintf(stderr, "bxi_pci_init 失败：需要 root，或 PCI 正被其他程序占用（arms_test、arms_node、motor_console 等）\n");
