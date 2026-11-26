@@ -41,7 +41,7 @@ ros2 service call /arms/clear_trip std_srvs/srv/Trigger
 离线端到端回归（已 source install/local_setup.bash）：
 
 ```bash
-python3 arms_ros/test/smoke.py arms_driver/config/arms.json
+python3 arms_ros/test/smoke.py arms_driver/tests/mock_arms.json
 ```
 
 测试自建 localhost ROS 域和独立命名空间；两次启动均强制 mock，不连接 EtherCAT 或 PCI。

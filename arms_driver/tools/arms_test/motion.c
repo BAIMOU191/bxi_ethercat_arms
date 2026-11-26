@@ -200,38 +200,38 @@ static void monitor_faults(void)
     for (size_t i = 0; i < s.count; ++i) {
         const arms_joint_state *j = &s.joints[i], *old = &previous.joints[i];
         /* 通信失败期间上电产生的同步丢失故障在恢复时自动复位，不单独报告 */
-        if (j->fault_count > old->fault_count && !s.stats.arm[j->arm].comm_failed) {
+        if (j->fault_count > old->fault_count && !s.stats.arm[j->link].comm_failed) {
             tlog_err("关节 %d 故障计数 %u -> %u", j->joint, old->fault_count, j->fault_count);
-            report[j->arm] = true;
+            report[j->link] = true;
         }
         /* 主动失能后为 locked，不属于异常 */
         if (old->mode == ARMS_JS_ENABLED && j->mode != ARMS_JS_ENABLED && j->mode != ARMS_JS_LOCKED) {
             tlog_err("关节 %d 退出使能: %s", j->joint, arms_joint_mode_name(j->mode));
-            report[j->arm] = true;
+            report[j->link] = true;
         }
     }
     for (int arm = 0; arm < ARMS_ARM_COUNT; ++arm) {
         const arms_arm_stats *a = &s.stats.arm[arm];
         if (!previous.stats.arm[arm].comm_failed && a->comm_failed) {
             if (power_off) {
-                tlog("%s 臂通信中断（电机已断电）", arms_arm_name(arm));
+                tlog("%s 臂通信中断（电机已断电）", arms_link_name(bus, arm));
                 continue;
             }
-            tlog_err("%s 臂通信失败，该臂关节已失能%s", arms_arm_name(arm),
+            tlog_err("%s 臂通信失败，该臂关节已失能%s", arms_link_name(bus, arm),
                      arms_offline_power_off(bus) ? "" : "；电源或网线恢复后自动重连");
             report[arm] = true;
         }
         if (previous.stats.arm[arm].comm_failed && !a->comm_failed)
-            tlog("%s 臂通信已恢复（累计中断 %u 次），关节保持失能，需重新 enable", arms_arm_name(arm),
+            tlog("%s 臂通信已恢复（累计中断 %u 次），关节保持失能，需重新 enable", arms_link_name(bus, arm),
                  a->comm_drops);
         if (!report[arm]) continue;
         for (size_t i = 0; i < s.count; ++i) {
             const arms_joint_state *j = &s.joints[i];
-            if (j->arm == arm)
+            if (j->link == arm)
                 tlog_err("  %d %-8s SW=0x%04x ERR=0x%04x pos=%.4f cmd=%.4f rad", j->joint,
                          arms_joint_mode_name(j->mode), j->status_word, j->error_code, j->position, j->cmd_position);
         }
-        tlog_err("  %s WKC=%u/%u 异常=%llu 最长连续=%u comm_failed=%d", arms_arm_name(arm), a->wkc_last,
+        tlog_err("  %s WKC=%u/%u 异常=%llu 最长连续=%u comm_failed=%d", arms_link_name(bus, arm), a->wkc_last,
                  a->wkc_expected, (unsigned long long)a->wkc_bad, a->wkc_bad_consecutive_max, a->comm_failed);
     }
     previous = s;

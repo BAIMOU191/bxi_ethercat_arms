@@ -44,7 +44,7 @@ import json, sys
 c = json.load(open(sys.argv[1]))
 rt = c.get("realtime", {})
 arms = c.get("arms", {})
-ifs = ",".join(a["interface"] for a in (arms.get("left"), arms.get("right")) if a and a.get("interface"))
+ifs = ",".join(dict.fromkeys(a["interface"] for a in (arms.get("left"), arms.get("right")) if a and a.get("interface")))
 print(rt.get("rt_cpu", -1), rt.get("irq_cpu", -1), rt.get("softirq_priority", 70), ifs or "-")
 PY
 )

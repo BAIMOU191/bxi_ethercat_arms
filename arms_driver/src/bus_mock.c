@@ -16,6 +16,8 @@
  *   ARMS_MOCK_TEMP=<C>         全部从站执行器温度（默认 35 + 链上位置）
  *   ARMS_MOCK_DRIVE_LOSS=<n>   第 n 周期起，主站 0 各从站自报的 EtherCAT 丢帧次数每 500 周期加 1
  *   ARMS_MOCK_EMCY=<n>         第 n 周期，主站 0 链上位置 0 的从站发出一条紧急报文（错误码 0x7500）
+ *   ARMS_MOCK_HUB=<p>=<s>,...  链上位置 0 为集线器：ESC 端口 p 连接链上位置 s 起的支路（如 3=1,1=8）；
+ *                              未设置时为单条直线链路（每个从站端口 1 连接下一个位置）
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +57,8 @@ struct bus {
     uint64_t loss_cycle, emcy_cycle;
     uint32_t drive_loss[BUS_MAX_SLAVES];
     int emcy_pending;
+    int hub_next[4]; /* 集线器各 ESC 端口连接的支路首个位置，-1 表示未连接；hub 为 false 时不使用 */
+    bool hub;
 };
 
 #define MOCK_REQ_CYCLES 3u /* 模拟异步请求的处理时间 */
@@ -105,6 +109,18 @@ static int mock_open(bus_t **out, const bus_open_params *p, char *err, size_t er
     b->loss_cycle = s ? strtoull(s, NULL, 10) : 0;
     s = getenv("ARMS_MOCK_EMCY");
     b->emcy_cycle = s ? strtoull(s, NULL, 10) : 0;
+    for (int k = 0; k < 4; ++k) b->hub_next[k] = -1;
+    s = getenv("ARMS_MOCK_HUB");
+    if (s && *s) {
+        int port, first, used;
+        b->hub = true;
+        while (sscanf(s, "%d=%d%n", &port, &first, &used) == 2) {
+            if (port >= 0 && port < 4) b->hub_next[port] = first;
+            s += used;
+            if (*s != ',') break;
+            ++s;
+        }
+    }
     b->rng = 0x12345678u;
     b->master = p->master;
     if (b->master < 0) {
@@ -407,10 +423,22 @@ static int mock_sdo(bus_t *b, int slave, uint16_t index, uint8_t sub, uint8_t *d
     return 0;
 }
 
+static int mock_port_next(bus_t *b, int position, int port)
+{
+    if (position < 0 || position >= b->slaves || port < 0 || port > 3) return -2;
+    if (b->hub && position == 0) return port == 0 ? -1 : b->hub_next[port];
+    if (port != 1 || position + 1 >= b->slaves) return -1;
+    /* 支路末端：下一个位置是集线器另一个端口的支路起点 */
+    if (b->hub)
+        for (int k = 1; k < 4; ++k)
+            if (b->hub_next[k] == position + 1) return -1;
+    return position + 1;
+}
+
 const bus_ops bus_mock_ops = {
     "mock",          mock_open,          mock_scan,          mock_configure,      mock_activate,
     mock_receive,    mock_send,          mock_inputs,        mock_outputs,        mock_update_states,
     mock_expected_wkc, mock_master_index, mock_close,        mock_sdo,            mock_esc_read,
     mock_esc_clear,  mock_esc_state,     mock_monitor_select, mock_monitor_read,  mock_monitor_state,
-    mock_emerg_pop,
+    mock_emerg_pop,  mock_port_next,
 };

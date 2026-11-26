@@ -248,7 +248,7 @@ class ArmsNode final : public rclcpp::Node
             const auto &a = b.arm[i];
             if (!a.present)
                 continue;
-            t += format("%-5s %s link %s  OP %d/%d  WKC %u/%u  comm %s  drops %u\n", arms_arm_name(i), a.interface,
+            t += format("%-5s %s link %s  OP %d/%d  WKC %u/%u  comm %s  drops %u\n", arms_link_name(dev.driver, i), a.interface,
                         a.link_up ? "up" : "DOWN", a.slaves_op, a.slaves_expected, a.wkc_last, a.wkc_expected,
                         a.comm_failed ? "FAILED" : "ok", a.comm_drops);
         }
@@ -308,12 +308,14 @@ class ArmsNode final : public rclcpp::Node
         }
         bool powered_here = false;
         if (manage_power && !dev.owns_power) {
-            if (arms_power_on(0)) {
+            const int rc = arms_power_on(0);
+            if (rc < 0) {
                 r.message = "power-on request failed";
                 return;
             }
-            dev.owns_power = true;
-            powered_here = true;
+            /* 电源已由其他程序接通或 PCI 被占用时不接管，失败时也不断电 */
+            powered_here = rc == ARMS_POWER_OWNED;
+            dev.owns_power = powered_here;
         }
         std::string why;
         if (!wait_online(15000)) {
@@ -324,10 +326,12 @@ class ArmsNode final : public rclcpp::Node
             why = arms_last_error();
         }
         if (!why.empty()) {
-            if (powered_here && dev.owns_power.exchange(false) && arms_power_off())
-                why += "; power-off request FAILED, switch motor power off manually";
-            else if (powered_here)
-                why += "; motor power switched off again";
+            if (powered_here && dev.owns_power.exchange(false)) {
+                const int rc = arms_power_off();
+                why += rc < 0    ? "; power-off request FAILED, switch motor power off manually"
+                       : rc == 1 ? "; another program is using the PCI board, motor power left on"
+                                 : "; motor power switched off again";
+            }
             r.message = "trip not cleared: " + why;
             return;
         }
@@ -426,19 +430,19 @@ class ArmsNode final : public rclcpp::Node
         arms_read(dev.driver, states, ARMS_JOINT_COUNT, &n);
         for (size_t k = 0; k < n; ++k) {
             const auto &s = states[k];
-            if (s.mode == ARMS_JS_FAULT || s.error_code) faults[s.arm] |= ARMS_MASK_JOINT(s.joint);
-            if (!std::isnan(s.temperature) && (std::isnan(max_temp[s.arm]) || s.temperature > max_temp[s.arm]))
-                max_temp[s.arm] = s.temperature;
+            if (s.mode == ARMS_JS_FAULT || s.error_code) faults[s.link] |= ARMS_MASK_JOINT(s.joint);
+            if (!std::isnan(s.temperature) && (std::isnan(max_temp[s.link]) || s.temperature > max_temp[s.link]))
+                max_temp[s.link] = s.temperature;
             if (s.drive_frame_loss > 0)
-                drive_loss[s.arm] += s.drive_frame_loss;
+                drive_loss[s.link] += s.drive_frame_loss;
             /* 线路类：无效帧、物理层错误、链路丢失；处理类：转发、处理单元、PDI 错误 */
             for (int e = 0; e < 20; ++e) {
                 if (e == 14 || e == 15)
                     continue;
                 if (e < 8 || e >= 16)
-                    esc_line[s.arm] += s.esc_errors[e];
+                    esc_line[s.link] += s.esc_errors[e];
                 else
-                    esc_proc[s.arm] += s.esc_errors[e];
+                    esc_proc[s.link] += s.esc_errors[e];
             }
         }
         for (int i = 0; i < ARMS_ARM_COUNT; i++) {
@@ -446,7 +450,7 @@ class ArmsNode final : public rclcpp::Node
             if (!a.present)
                 continue;
             diagnostic_msgs::msg::DiagnosticStatus d;
-            d.name = std::string("arms/") + arms_arm_name(i);
+            d.name = std::string("arms/") + arms_link_name(dev.driver, i);
             d.hardware_id = a.interface;
             const bool prot = b.protect.reason != ARMS_PROTECT_NONE;
             d.level = (dev.cut || b.tripped || prot || faults[i] || a.slaves_op != a.slaves_expected || a.comm_failed || !a.link_up ||
@@ -516,10 +520,13 @@ class ArmsNode final : public rclcpp::Node
             if (rt_setup && (arms_env_start_master() != 0 || arms_env_rt_apply(opt.config_path, -1) != 0))
                 throw std::runtime_error("real-time environment setup failed");
             if (power) {
-                dev.owns_power = true;
                 opt.scan_timeout_ms = 15000; /* 扫描等待总线稳定，不固定延时 */
-                if (arms_power_on(0))
+                const int rc = arms_power_on(0);
+                if (rc < 0)
                     throw std::runtime_error("power-on request failed");
+                dev.owns_power = rc == ARMS_POWER_OWNED;
+                if (rc == ARMS_POWER_EXTERNAL)
+                    RCLCPP_INFO(get_logger(), "motor power is managed by another program; this node will not switch it off");
             }
         }
         if (arms_open(&opt, &dev.driver) != ARMS_OK)
@@ -594,8 +601,12 @@ class ArmsNode final : public rclcpp::Node
                 if (s.tripped && !dev.cut.exchange(true)) {
                     arms_disable(dev.driver, arms_opened_joints(dev.driver));
                     if (dev.owns_power.exchange(false)) {
-                        if (arms_power_off())
+                        const int rc = arms_power_off();
+                        if (rc < 0)
                             RCLCPP_ERROR(get_logger(), "power-off request FAILED");
+                        else if (rc == 1)
+                            RCLCPP_ERROR(get_logger(),
+                                         "trip latched; another program is using the PCI board, motor power left on");
                     } else
                         RCLCPP_ERROR(get_logger(),
                                      "trip latched; external power owner must verify power off");

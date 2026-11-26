@@ -37,7 +37,8 @@
 static volatile sig_atomic_t g_interrupted, g_terminate;
 static int stop_pipe[2];
 static arms_t *g_arms;
-static atomic_bool powered, power_known;
+/* powered: 电源由本程序接通、由本程序断开；external_power: 电源由其他程序管理 */
+static atomic_bool powered, power_known, external_power;
 static bool mock_backend;
 static pthread_mutex_t power_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_stamp_all; /* -T：每行加时间戳，输出经过管道 */
@@ -188,12 +189,12 @@ static void print_stats(const arms_bus_stats *st)
     for (i = 0; i < ARMS_ARM_COUNT; ++i) {
         const arms_arm_stats *a = &st->arm[i];
         if (!a->present) {
-            printf("%-5s 未打开\n", arms_arm_name(i));
+            if (!(arms_shared_link(g_arms) && i == ARMS_ARM_RIGHT)) printf("%-5s 未打开\n", arms_link_name(g_arms, i));
             continue;
         }
         printf("%-5s %s 主站%d 链路%s  从站 OP %d/%d(总线上 %d)  WKC %u/%u  异常 %llu (最长连续 %u)  发送错误 %llu"
                "  收 %.4f us 发 %.4f us%s\n",
-               arms_arm_name(i), a->interface, a->master_index, a->link_up ? "UP" : "DOWN", a->slaves_op,
+               arms_link_name(g_arms, i), a->interface, a->master_index, a->link_up ? "UP" : "DOWN", a->slaves_op,
                a->slaves_expected, a->slaves_found, a->wkc_last, a->wkc_expected, (unsigned long long)a->wkc_bad,
                a->wkc_bad_consecutive_max, (unsigned long long)a->send_errors, a->recv_us_max, a->send_us_max,
                a->comm_failed ? "  [通信失败]" : "");
@@ -409,18 +410,31 @@ static int wait_bus_online(unsigned int timeout_ms)
     return -1;
 }
 
-/* 命令线程与掉线监视线程共用 PCI 句柄；锁只保护 SDK 调用，不包含总线恢复等待 */
+/*
+ * 命令线程与掉线监视线程共用 PCI 句柄；锁只保护 SDK 调用，不包含总线恢复等待。
+ * 接通: 返回 ARMS_POWER_OWNED / ARMS_POWER_EXTERNAL / -1。
+ * 断开: 返回 0 已断开，1 电源不由本程序负责或其他程序正在使用 PCI（未断电），-1 失败。
+ */
 static int request_power(bool on)
 {
     int rc;
     pthread_mutex_lock(&power_lock);
-    if (on && powered && power_known) rc = 0;
-    else rc = on ? arms_power_on(0) : arms_power_off();
-    if (rc == 0) {
-        powered = on;
-        motion_set_power_off(!on);
+    if (on) {
+        rc = arms_power_on(0);
+        if (rc >= 0) {
+            powered = rc == ARMS_POWER_OWNED;
+            external_power = rc == ARMS_POWER_EXTERNAL;
+            power_known = true;
+            motion_set_power_off(false);
+        }
+    } else if (!powered) {
+        rc = 1;
+    } else {
+        rc = arms_power_off();
+        if (rc >= 0) powered = false;
+        if (rc == 0) motion_set_power_off(true);
+        if (rc == 1) external_power = true;
     }
-    power_known = rc == 0;
     pthread_mutex_unlock(&power_lock);
     return rc;
 }
@@ -433,30 +447,34 @@ static int cmd_power(int argc, char **argv)
     if (!arms_power_available()) return failed("本程序不支持 PCI 电源控制");
     if (mock_backend) return failed("模拟后端不访问 PCI 电源");
     if (!strcmp(op, "status")) {
-        printf("电源: %s（本程序的请求状态，非硬件回读）\n", !power_known ? "状态未知" : powered ? "已请求上电" : "已请求断电");
+        printf("电源: %s\n", powered          ? "已由本程序接通，退出或离线保护时由本程序断开"
+                            : external_power ? "由其他程序管理，本程序不断开"
+                            : power_known    ? "已由本程序断开"
+                                             : "本程序未操作电源");
     } else if (!strcmp(op, "on")) {
-        if (request_power(true) != 0) {
-            return failed("上电失败");
-        }
+        int rc = request_power(true);
+        if (rc < 0) return failed("上电失败");
         if (wait_bus_online(30000) != 0 || arms_check_online(g_arms, NULL) != ARMS_OK) {
-            /* 在线检查未通过：重新下电保护 */
+            /* 在线检查未通过：本程序接通的电源重新断开 */
             char why[512];
             arms_mask off = 0;
             arms_check_online(g_arms, &off);
             snprintf(why, sizeof(why), "%s", off ? arms_last_error() : "通信在 30 秒内未恢复");
-            if (request_power(false) == 0) {
-                return failed("上电后在线检查未通过，已重新下电。%s", why);
-            }
-            return failed("上电后在线检查未通过，下电失败，需手动断电。%s", why);
+            if (rc == ARMS_POWER_EXTERNAL) return failed("在线检查未通过（电源由其他程序管理，未断电）。%s", why);
+            rc = request_power(false);
+            if (rc == 0) return failed("上电后在线检查未通过，已重新断电。%s", why);
+            if (rc == 1) return failed("上电后在线检查未通过，其他程序正在使用 PCI，未断电。%s", why);
+            return failed("上电后在线检查未通过，断电失败，需手动断电。%s", why);
         }
         if (arms_clear_trip(g_arms) != ARMS_OK) return failed("离线保护未能清除: %s", arms_last_error());
         tlog("在线检查通过，关节保持失能");
     } else {
-        if (!powered && !power_known) return failed("未接管电源，无法确认或切断外部供电");
+        int rc;
+        if (!powered) return failed("电源不是本程序接通的，本程序不断开");
         if (motion_enabled() && disable_joints(arms_opened_joints(g_arms), 50)) return -1;
-        if (request_power(false) != 0) {
-            return failed("断电失败，电源状态未知");
-        }
+        rc = request_power(false);
+        if (rc < 0) return failed("断电失败，电源状态未知");
+        if (rc == 1) tlog("其他程序正在使用 PCI，电源保持接通");
     }
     return ok();
 }
@@ -1093,7 +1111,7 @@ static int cmd_service(int argc, char **argv)
             printf("0x%04x\n", s.al_state);
         } else {
             char master[16], slave[16], address[16];
-            snprintf(master, 16, "%d", st.arm[s.arm].master_index);
+            snprintf(master, 16, "%d", st.arm[s.link].master_index);
             snprintf(slave, 16, "%d", s.slave);
             snprintf(address, 16, "%u", a);
             char *args[] = {"ethercat", "reg_read", "-m", master,
@@ -1198,8 +1216,11 @@ static const command commands[] = {
     {"check", "查看", "", 0, 0, "检查已打开关节是否全部在线，并显示屏蔽掩码与离线保护状态",
      "  在线条件: 从站处于 OP、WKC 正确且该臂通信正常。被屏蔽的关节不参与检查。", "  check", cmd_check},
     {"power", "控制", "on | off | status", 1, 1, "电机电源上电、断电或显示状态",
-     "  off: 先使全部已使能关节失能，再断电。\n"
-     "  on: 上电并等待通信恢复，最长 30 秒；恢复后全部关节处于失能状态。\n"
+     "  电源与其他程序共用，谁接通谁断开。\n"
+     "  on: 接通电源并等待通信恢复，最长 30 秒；恢复后全部关节处于失能状态。\n"
+     "      电源已由其他程序接通、或 PCI 正被其他程序使用时，不接管电源。\n"
+     "  off: 只断开本程序接通的电源，先使全部已使能关节失能；其他程序正在使用 PCI 时电源保持接通。\n"
+     "  status: 显示电源由本程序还是其他程序管理。\n"
      "  仅适用于具备 PCI 电源接口的硬件。",
      "  power off\n  power on\n  power status", cmd_power},
     {"commtest", "测试", "<秒> [--enabled <kp> <kd>]", 1, 4, "通信质量测试",
@@ -1356,13 +1377,16 @@ static void on_trip(void)
         return;
     }
     if (!powered) {
-        tlog_err("离线保护: 电源不由本程序控制，需手动断电");
+        if (external_power)
+            tlog_err("离线保护: 电源由其他程序管理，本程序未断电；全部关节已失能");
+        else
+            tlog_err("离线保护: 电源不由本程序控制，需手动断电");
         return;
     }
-    if (request_power(false) == 0) {
-        tlog_err("离线保护: 已请求断电；power on 重新上电并检查在线状态");
-    } else {
-        tlog_err("离线保护: 下电失败，需手动断电");
+    switch (request_power(false)) {
+    case 0: tlog_err("离线保护: 已请求断电；power on 重新上电并检查在线状态"); break;
+    case 1: tlog_err("离线保护: 其他程序正在使用 PCI，电源保持接通；全部关节已失能"); break;
+    default: tlog_err("离线保护: 下电失败，需手动断电"); break;
     }
 }
 
@@ -1384,9 +1408,13 @@ static void build_prompt(char *buf, size_t size)
         char state[32] = "";
         if (fault >= 0) snprintf(state, sizeof(state), " FAULT:%d", fault);
         else if (st.protect.reason != ARMS_PROTECT_NONE) snprintf(state, sizeof(state), " PROT:%d", st.protect.joint);
-        snprintf(buf, size, "arms %s L%d/%d R%d/%d E%d%s%s%s> ", hz, st.arm[0].slaves_op, st.arm[0].slaves_expected,
-                 st.arm[1].slaves_op, st.arm[1].slaves_expected, enabled, state,
-                 (st.arm[0].comm_failed || st.arm[1].comm_failed) ? " COMM!" : "", st.tripped ? " TRIP" : "");
+        if (arms_shared_link(g_arms))
+            snprintf(buf, size, "arms %s LR%d/%d E%d%s%s%s> ", hz, st.arm[0].slaves_op, st.arm[0].slaves_expected,
+                     enabled, state, st.arm[0].comm_failed ? " COMM!" : "", st.tripped ? " TRIP" : "");
+        else
+            snprintf(buf, size, "arms %s L%d/%d R%d/%d E%d%s%s%s> ", hz, st.arm[0].slaves_op, st.arm[0].slaves_expected,
+                     st.arm[1].slaves_op, st.arm[1].slaves_expected, enabled, state,
+                     (st.arm[0].comm_failed || st.arm[1].comm_failed) ? " COMM!" : "", st.tripped ? " TRIP" : "");
     }
 }
 
@@ -1406,8 +1434,9 @@ static void usage(FILE *out)
         "  -c, --config FILE    配置文件（默认 $ARMS_CONFIG、/etc/bxi/arms.json、./config/arms.json）\n"
         "  -e, --exec CMD       执行命令后退出，可重复，按顺序执行\n"
         "      --mock           使用模拟后端，不访问硬件，不需要 root\n"
-        "      --no-power       不操作电机电源（电源已由其他程序打开时使用）\n"
-        "      --keep-power     退出时不断电\n"
+        "      --no-power       不操作电机电源\n"
+        "      --keep-power     退出时不断开本程序接通的电源\n"
+        "                       电源已由其他程序接通或 PCI 正被其他程序使用时，本程序不接管电源，退出时不断电\n"
         "      --power-wait MS  上电后等待总线稳定的最长时间（默认 15000）；从站数达到配置并稳定后立即继续\n"
         "      --no-rt-setup    不配置实时运行环境（中断绑定、CPU 隔离，以及 EtherCAT 网口退出 NetworkManager、\n"
         "                       去掉 IP 地址、关闭 IPv6；退出时还原）\n"
@@ -1583,12 +1612,14 @@ int main(int argc, char **argv)
         if (arms_env_start_master() != 0) return 1;
         if (rt_setup && arms_env_rt_apply(opt.config_path, opt.rt_cpu >= 0 ? opt.rt_cpu : -2) < 0) return 1;
         if (power) {
-            if (arms_power_on(0) != 0) {
-                arms_power_off(); /* 请求失败时不视为已断电 */
+            int prc = arms_power_on(0);
+            if (prc < 0) {
                 arms_env_rt_revert();
                 return 1;
             }
-            powered = power_known = true;
+            powered = prc == ARMS_POWER_OWNED;
+            external_power = prc == ARMS_POWER_EXTERNAL;
+            power_known = true;
             /* 不固定等待：扫描时等到各臂从站数达到配置并保持稳定，最长 power_wait */
             opt.scan_timeout_ms = power_wait;
         }
@@ -1670,7 +1701,7 @@ close_session:
     if (powered) {
         if (keep_power && !g_terminate && rc == 0)
             tlog("电源: 保持上电（--keep-power）");
-        else if (arms_power_off() != 0) rc = 1;
+        else if (arms_power_off() < 0) rc = 1;
     }
     arms_env_rt_revert();
     tlog("已退出");

@@ -130,6 +130,7 @@ static void set_defaults(arms_config *c)
     c->mode = ARMS_MODE_STANDALONE;
     c->rt_cpu = -1;
     c->irq_cpu = -1;
+    c->hub_slave = -1;
     c->rt_priority = 80;
     c->softirq_priority = 70;
     c->wkc_tolerance = 3;
@@ -505,8 +506,12 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
         goto out;
     }
     if (c->arm[0].present && c->arm[1].present && strcmp(c->arm[0].interface, c->arm[1].interface) == 0) {
-        fail(error, size, "左右臂不能使用同一个网口 %s", c->arm[0].interface);
-        goto out;
+        /* 同一网口：两臂经分支器接在同一条链上，链路参数以左臂为准 */
+        if (strcmp(c->arm[0].mac, c->arm[1].mac) != 0 || c->arm[0].master != c->arm[1].master) {
+            fail(error, size, "左右臂共用网口 %s 时 mac、master 必须一致", c->arm[0].interface);
+            goto out;
+        }
+        c->shared_link = true;
     }
     joints = cJSON_GetObjectItemCaseSensitive(root, "joints");
     if (!cJSON_IsArray(joints) || cJSON_GetArraySize(joints) == 0) {
@@ -523,20 +528,66 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
         for (i = 0; i < n; ++i)
             if (!parse_joint(cJSON_GetArrayItem(joints, i), c, i, &base, error, size)) goto out;
     }
+    for (i = ARMS_JOINT_FIRST; i <= ARMS_JOINT_LAST; ++i) {
+        arms_joint_config *j = &c->joint[i];
+        if (!j->present) continue;
+        if (!c->arm[j->arm].present) {
+            fail(error, size, "关节 %d 属于 %s 臂，但 arms 段没有配置该臂", i, j->arm == 0 ? "left" : "right");
+            goto out;
+        }
+        j->link = c->shared_link ? ARMS_ARM_LEFT : j->arm;
+    }
     for (a = 0; a < ARMS_ARM_COUNT; ++a) {
         bool used[ARMS_MAX_SLAVES_PER_ARM] = {false};
         for (i = ARMS_JOINT_FIRST; i <= ARMS_JOINT_LAST; ++i) {
             const arms_joint_config *j = &c->joint[i];
-            if (!j->present || j->arm != a) continue;
-            if (!c->arm[a].present) {
-                fail(error, size, "关节 %d 属于 %s 臂，但 arms 段没有配置该臂", i, a == 0 ? "left" : "right");
-                goto out;
-            }
+            if (!j->present || j->link != a) continue;
             if (used[j->slave]) {
-                fail(error, size, "%s 臂的 slave %d 被多个关节使用", a == 0 ? "left" : "right", j->slave);
+                if (c->shared_link)
+                    fail(error, size, "共用链路上的 slave %d 被多个关节使用", j->slave);
+                else
+                    fail(error, size, "%s 臂的 slave %d 被多个关节使用", a == 0 ? "left" : "right", j->slave);
                 goto out;
             }
             used[j->slave] = true;
+        }
+    }
+    {
+        /* arms.hub：两臂经集线器共用链路时，各臂所接的集线器输出口，启动时按实际拓扑核对 */
+        const cJSON *hub = obj(arms, "hub");
+        long v;
+        if (hub) {
+            if (!cJSON_IsObject(hub)) {
+                fail(error, size, "arms.hub 必须是对象");
+                goto out;
+            }
+            if (!c->shared_link) {
+                fail(error, size, "arms.hub 只用于左右臂共用网口的配置");
+                goto out;
+            }
+            if (!get_int(hub, "slave", 0, ARMS_MAX_SLAVES_PER_ARM - 1, &v)) {
+                fail(error, size, "arms.hub.slave 必须是 0..%d", ARMS_MAX_SLAVES_PER_ARM - 1);
+                goto out;
+            }
+            c->hub_slave = (int)v;
+            for (i = ARMS_JOINT_FIRST; i <= ARMS_JOINT_LAST; ++i)
+                if (c->joint[i].present && c->joint[i].slave == c->hub_slave) {
+                    fail(error, size, "arms.hub.slave %d 与关节 %d 的 slave 相同", c->hub_slave, i);
+                    goto out;
+                }
+            for (a = 0; a < ARMS_ARM_COUNT; ++a) {
+                const char *key = a == ARMS_ARM_LEFT ? "left" : "right";
+                if (!cJSON_GetObjectItemCaseSensitive(hub, key)) continue;
+                if (!get_int(hub, key, 1, 3, &v)) {
+                    fail(error, size, "arms.hub.%s 必须是集线器输出口 1..3", key);
+                    goto out;
+                }
+                c->hub_out[a] = (int)v;
+            }
+            if (c->hub_out[0] && c->hub_out[0] == c->hub_out[1]) {
+                fail(error, size, "arms.hub 中左右臂不能接同一个输出口 OUT%d", c->hub_out[0]);
+                goto out;
+            }
         }
     }
     if (c->softirq_priority >= c->rt_priority) {

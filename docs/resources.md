@@ -13,15 +13,22 @@
 实时 CPU 上不应运行普通任务。`rt_setup.sh apply` 在运行期把其他线程和非绑定工作队列限制到其余 CPU；
 长期部署建议改用内核启动参数 `isolcpus=<rt_cpu> nohz_full=<rt_cpu> irqaffinity=<其余 CPU>`。
 
-## 中断
+## 网口与中断
 
-| 网口 | 中断（本机） | 绑定 |
-|---|---|---|
-| eth0 | 83、84 | `irq_cpu` |
-| eth1 | 105、106 | `irq_cpu` |
+双臂经 EtherCAT 集线器 ZLG ZSW-8004（1 进 3 出）接在 `eth0` 上，由 EtherLab 主站 0 统一收发，一个周期一帧；`eth1` 不使用。
 
-中断号随内核和设备树变化，`rt_setup.sh` 按 `/proc/interrupts` 中的网口名查找，不写死。
-eth0、eth1 由 EtherLab 主站独占，只承载 EtherCAT 帧。
+| 链上位置 | 设备 |
+|---|---|
+| 0 | 集线器（不配置过程数据） |
+| 1–7 | 左臂关节 15–21（OUT1，ESC 端口 3） |
+| 8–14 | 右臂关节 22–28（OUT2，ESC 端口 1） |
+
+集线器外壳输出口与 ESC 端口的对应为 OUT1 = 3、OUT2 = 1、OUT3 = 2，与帧的处理顺序一致，OUT3 日后接入的设备排在右臂之后。
+`arms.hub = { "slave": 0, "left": 1, "right": 2 }` 在启动时核对各输出口连接的首个驱动器及各臂驱动器的连接顺序。
+该核对只能发现输出口未连接或支路断开；14 个驱动器型号相同，左右臂互换插口无法从拓扑上区分。
+WKC 期望值为 42（14 个驱动器 × 3）。通信失败、离线保护按整条链路处理，两臂同时失能。
+
+`eth0` 的中断由 `rt_setup.sh` 按 `/proc/interrupts` 中的网口名查找并绑定到 `irq_cpu`，不写死中断号；运行期间 `eth0` 只承载 EtherCAT 帧。
 
 ## 周期耗时（实测）
 
@@ -42,8 +49,8 @@ eth0、eth1 由 EtherLab 主站独占，只承载 EtherCAT 帧。
 
 | 资源 | 用途 |
 |---|---|
-| `/dev/EtherCAT0`、`/dev/EtherCAT1` | EtherLab 主站 0/1，按网口 MAC 解析主站号 |
-| BXI PCI SDK（`motor_pwr_set`） | 仅 `arms_test` 用于电机总电源；库本身不操作电源 |
+| `/dev/EtherCAT0` | EtherLab 主站 0（`eth0`），按网口 MAC 解析主站号 |
+| BXI PCI SDK（`motor_pwr_set`） | `arms_test`、`arms_node` 控制电机总电源，与其他程序共用，谁接通谁断开。SDK 以 `/tmp/bxi_pci.lock` 独占 PCI；`bxi_pci_exit` 会把 GPIO 输出全部写 0（即断电），本程序只对自己接通的电源断电，释放 PCI 时只调用 `canfd_exit` 和 `bxi_pci_unlock`；`arms_power on|off|status` 单独开关电源 |
 | `/run/arms_rt_setup.state` | `rt_setup.sh` 的还原记录 |
 
 同一主站同时只能被一个程序占用；`motor_console`、`hw_lib_test_*` 等程序运行时无法打开。
