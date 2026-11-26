@@ -24,8 +24,8 @@ def request(cls,name,q):
     cli=test.create_client(cls,ns+'/arms/'+name)
     assert cli.wait_for_service(timeout_sec=12),name
     f=cli.call_async(q);until(f.done,30);r=f.result();test.destroy_client(cli);return r
-def call(name,confirm=False,joint=21,joints=None,soft=False):
-    q=JointOperation.Request();q.joints=joints if joints is not None else 1<<joint;q.confirm=confirm;q.soft_zero=soft
+def call(name,joint=21,joints=None,soft=False):
+    q=JointOperation.Request();q.joints=joints if joints is not None else 1<<joint;q.soft_zero=soft
     return request(JointOperation,name,q)
 def trigger(name):
     return request(Trigger,name,Trigger.Request())
@@ -40,6 +40,8 @@ def stop(proc):
     proc.wait(timeout=15)
 def diag_value(key):
     return max(int(kv.value) for d in seen['arms/diagnostics'].status for kv in d.values if kv.key==key)
+def rejected_count():
+    return int(next(k.value for k in seen['arms/diagnostics'].status[0].values if k.key=='rejected_commands'))
 try:
     config_dir = tempfile.TemporaryDirectory()
     config = Path(config_dir.name) / 'arms.json'
@@ -48,35 +50,35 @@ try:
     try:
         until(lambda:len(seen)==3);assert len(seen['joint_states'].name)==14
         assert seen['arms/diagnostics'].status[0].level in (0,b'\x00'),seen['arms/diagnostics']
-        assert call('selftest').success and not call('enable').success
-        # 抱闸模式需要确认；enable / free 会把强制松闸、强制抱闸自动切回正常控制
-        assert not call('brake_release').success
-        assert call('brake_release',True).success
-        def after_disable(name):
-            # disable 立即返回；强制抱闸要求关节已失能，等反馈确认后再设置
+        assert set(JointOperation.Request.get_fields_and_field_types())=={'joints','soft_zero'}
+        assert call('selftest').success and call('reset').success
+        assert not call('enable',joint=0).success  # 未打开的关节被拒绝
+        def settled(name):
+            # disable 立即返回；伺服过渡态不写强制抱闸模式，等反馈稳定后再设置
             end=time.monotonic()+3
-            while not call(name,True).success:
+            while not call(name).success:
                 assert time.monotonic()<end,name
                 time.sleep(.05)
-        assert call('enable',True).success and call('disable').success
-        after_disable('brake_hold')
-        assert call('free',True).success and call('disable').success
-        after_disable('brake_hold')
-        assert call('brake_normal',True).success
-        # 零力矩拖动会使能关节
-        assert call('free',True).success
-        # free 后校零与已失能后校零共用驱动路径；ROS 的授权字段保持兼容。
-        assert not call('zero').success
-        assert call('zero',True,soft=True).success and call('zero',True,soft=True).success
-        assert call('free',True).success
-        # 使能中拒绝强制松闸
-        assert not call('brake_release',True).success
+        # enable / free 会把强制松闸、强制抱闸自动切回正常控制
+        assert call('brake_release').success
+        assert call('enable').success and call('disable').success
+        settled('brake_hold')
+        assert call('free').success and call('disable').success
+        settled('brake_hold')
+        assert call('brake_normal').success
+        # 零力矩拖动会使能关节；free 后校零与已失能后校零共用驱动路径
+        assert call('free').success
+        assert call('zero',soft=True).success and call('zero',soft=True).success
+        assert call('enable').success
+        # 已使能时切换 Pn075 不失能；恢复 normal 后无需再次 enable 就能接受后续目标
+        for service in ('brake_release','brake_hold','brake_release','brake_normal'):
+            assert call(service).success,service
         m=ActuatorCmds();m.actuators_name=['l_wrist_z_joint'];m.pos=[.1];m.vel=[0.];m.kp=[5.];m.kd=[0.];m.torque=[0.]
         def moved():
             m.header.stamp=test.get_clock().now().to_msg();pub.publish(m)
             s=seen['joint_states'];return abs(s.position[s.name.index('l_wrist_z_joint')]-.1)<.02
         until(moved)
-        # hold 不需要确认；保持期间话题目标被忽略，enable 后恢复跟随
+        # 保持期间话题目标被忽略，enable 后恢复跟随
         assert not call('hold',joint=22).success
         assert call('hold').success
         until(lambda:diag_value('held_joints')==1<<21)
@@ -85,12 +87,20 @@ try:
             m.header.stamp=test.get_clock().now().to_msg();pub.publish(m);rclpy.spin_once(test,timeout_sec=.02)
         s=seen['joint_states'];assert abs(s.position[s.name.index('l_wrist_z_joint')]-.1)<.03,s
         assert 'H' in trigger('status').message.split('l_wrist_z_joint')[1].splitlines()[0]
-        assert call('enable',True).success
+        assert call('enable').success
         def reached(target):
             m.pos=[target];m.header.stamp=test.get_clock().now().to_msg();pub.publish(m)
             s=seen['joint_states'];return abs(s.position[s.name.index('l_wrist_z_joint')]-target)<.02
         until(lambda:reached(-.1))
         until(lambda:reached(.1))
+        # 整帧检查：第二项为非有限值时整帧拒绝，第一项也不下发
+        assert call('enable',joint=22).success
+        m.actuators_name=['l_wrist_z_joint','r_shoulder_y_joint'];m.pos=[-.1,float('nan')]
+        m.vel=[0.,0.];m.kp=[5.,5.];m.kd=[0.,0.];m.torque=[0.,0.]
+        old=rejected_count();m.header.stamp=test.get_clock().now().to_msg();pub.publish(m)
+        until(lambda:rejected_count()>old)
+        s=seen['joint_states'];assert abs(s.position[s.name.index('l_wrist_z_joint')]-.1)<.02,s
+        assert call('disable',joint=22).success
         # 状态文本、只读参数和无锁定时的 clear_trip
         st=trigger('status');assert st.success and 'l_wrist_z_joint' in st.message and 'WKC' in st.message,st.message
         r=read_param(21,pn=75);assert r.success and r.value==0 and list(r.raw)==[0,0],r
@@ -98,13 +108,14 @@ try:
         assert not read_param(21,pn=1000).success and not read_param(14,pn=75).success
         r=trigger('clear_trip');assert r.success and 'no protection trip' in r.message,r
         # 默认硬件校零：重新上电前拒绝使能
-        assert call('zero',True,joint=22).success
-        assert not call('enable',True,joint=22).success and 'zero_pending 0x00400000' in trigger('status').message
-        m.pos=[];pub.publish(m)
-        until(lambda:any(k.key=='rejected_commands' and int(k.value)>0 for k in seen['arms/diagnostics'].status[0].values))
+        assert call('zero',joint=22).success
+        assert not call('enable',joint=22).success and 'zero_pending 0x00400000' in trigger('status').message
+        # 数组长度不一致的帧被拒绝并计数
+        old=rejected_count();m.pos=[];m.header.stamp=test.get_clock().now().to_msg();pub.publish(m)
+        until(lambda:rejected_count()>old)
         assert call('disable').success
         # 注入 15 号驱动器故障：WKC 正常也不能把这条臂报告为 online。
-        call('enable', True, joint=15)
+        call('enable', joint=15)
         until(lambda: any(d.message == 'drive fault' and any(
             kv.key == 'fault_joints' and int(kv.value) & (1 << 15) for kv in d.values
         ) for d in seen['arms/diagnostics'].status))
@@ -116,7 +127,7 @@ try:
     try:
         until(lambda:len(seen)==3)
         until(lambda:diag_value('trip_joints')!=0,25)
-        assert not trigger('status').success and not call('enable',True).success
+        assert not trigger('status').success and not call('enable').success
         end=time.monotonic()+20
         while True:
             r=trigger('clear_trip')
@@ -125,9 +136,9 @@ try:
             time.sleep(.3)
         assert 'trip cleared' in r.message,r.message
         left=sum(1<<j for j in range(15,22))
-        r=call('reset',True,joints=left);assert r.success,r.message
+        r=call('reset',joints=left);assert r.success,r.message
         until(lambda:call('selftest').success)
-        assert call('enable',True).success
+        assert call('enable').success
     finally:
         stop(proc)
         config_dir.cleanup()

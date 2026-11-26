@@ -63,13 +63,8 @@ extern const char *const arms_standard_joint_names[31];
 
 bool arms_store_offset(const char *path, int joint, double value);
 
-bool arms_cycle_hz_supported(unsigned int hz);
-
-/* 读取并校验配置；失败时返回 false，原因写入 error */
+/* 读取并校验配置；失败时返回 false，原因写入 error。
+ * arms_cycle_hz_supported()、arms_config_default_path() 在 arms/arms.h 中公开声明。 */
 bool arms_config_load(const char *path, arms_config *config, char *error, size_t error_size);
-
-/* 默认查找顺序: $ARMS_CONFIG、/etc/bxi/arms.json、./config/arms.json、
- * <程序目录>/../config/arms.json；均不可读时返回 false */
-bool arms_config_default_path(char *out, size_t size);
 
 #endif

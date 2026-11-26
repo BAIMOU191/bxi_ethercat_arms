@@ -87,6 +87,10 @@ int main(int argc, char **argv)
     CHECK(arms_parse_joints("4294967311", 0, &m, err, sizeof(err)) != 0, "wrapped joint accepted");
     CHECK(arms_parse_joints("15,,28", 0, &m, err, sizeof(err)) != 0, "empty joint accepted");
 
+    CHECK(arms_parse_joints("15,22", ARMS_MASK_LEFT, &m, err, sizeof(err)) != 0, "partial list accepted");
+    CHECK(arms_parse_joints("20-22", ARMS_MASK_LEFT, &m, err, sizeof(err)) != 0, "partial range accepted");
+    CHECK(arms_parse_joints("all", ARMS_MASK_LEFT, &m, err, sizeof(err)) == 0 && m == ARMS_MASK_LEFT, "all intersects session");
+
     /* KGU 编解码 */
     {
         uint8_t out[KGU_OUT_BYTES], in[KGU_IN_BYTES];

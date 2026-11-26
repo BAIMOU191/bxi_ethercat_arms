@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(arms_driver VERSION 0.1.0 LANGUAGES C)
+project(arms_driver VERSION 0.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -105,6 +105,9 @@ if(BUILD_TESTING)
   add_test(NAME help_lists_check COMMAND arms_test --mock -c ${CMAKE_CURRENT_SOURCE_DIR}/tests/mock_arms.json -e "help")
   set_tests_properties(help_lists_check PROPERTIES PASS_REGULAR_EXPRESSION "  check +检查已打开关节")
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME script_cli COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_script_cli.py)
+  add_test(NAME cli_contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli_contract.py
+    $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/tests/mock_arms.json)
   add_test(NAME parameter_cli COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_parameters.py
     $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/tests/mock_arms.json)
   add_test(NAME tab_completion COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_completion.py
