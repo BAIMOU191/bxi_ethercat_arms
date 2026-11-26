@@ -607,17 +607,15 @@ bool arms_config_default_path(char *out, size_t size)
     const char *env = getenv("ARMS_CONFIG");
     char exe[PATH_MAX];
     ssize_t len;
-    if (env && env[0] && access(env, R_OK) == 0) {
-        snprintf(out, size, "%s", env);
-        return true;
-    }
-    if (access("/etc/bxi/arms.json", R_OK) == 0) {
-        snprintf(out, size, "/etc/bxi/arms.json");
-        return true;
-    }
-    if (access("config/arms.json", R_OK) == 0) {
-        snprintf(out, size, "config/arms.json");
-        return true;
+    if (!out || !size) return false;
+    const char *candidates[] = {env, "/etc/bxi/arms.json", "config/arms.json"};
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        const char *p = candidates[i];
+        if (p && *p && access(p, R_OK) == 0) {
+            if (strlen(p) >= size) return false;
+            strcpy(out, p);
+            return true;
+        }
     }
     len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
     if (len > 0) {
@@ -626,10 +624,12 @@ bool arms_config_default_path(char *out, size_t size)
         slash = strrchr(exe, '/');
         if (slash) {
             *slash = '\0';
-            snprintf(out, size, "%s/../config/arms.json", exe);
-            if (access(out, R_OK) == 0) return true;
-            snprintf(out, size, "%s/config/arms.json", exe);
-            if (access(out, R_OK) == 0) return true;
+            const char *paths[] = {"../config/arms.json", "config/arms.json", "../share/arms_driver/config/arms.json",
+                                   "../../share/arms_ros/config/arms.json"};
+            for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+                int n = snprintf(out, size, "%s/%s", exe, paths[i]);
+                if (n >= 0 && (size_t)n < size && access(out, R_OK) == 0) return true;
+            }
         }
     }
     return false;

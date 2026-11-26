@@ -14,8 +14,8 @@ int arms_env_start_master(void);
 
 /**
  * @brief 调用 rt_setup.sh apply 配置实时运行环境
- * @param config 配置文件路径，NULL 时由脚本按默认路径查找
- * @param rt_cpu 实时 CPU，-2 表示使用配置值
+ * @param config 配置文件路径，NULL 时与驱动共用默认路径查找
+ * @param rt_cpu -2 使用配置值；-1 不做 CPU/IRQ 调优；非负值同时覆盖实时和中断 CPU
  * @return 0 成功；-1 失败；1 未找到 rt_setup.sh（跳过）
  */
 int arms_env_rt_apply(const char *config, int rt_cpu);

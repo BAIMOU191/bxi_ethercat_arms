@@ -45,8 +45,16 @@ with tempfile.TemporaryDirectory() as tmp:
     # 未选中的关节保持原模式
     out = run('brake 21 release', 'enable 22', 'brake 21')
     assert out.count('release (Pn075=1') >= 2 and '自动切为正常控制' not in out, out
-    # 使能中的关节拒绝强制松闸
-    run('enable 21', 'brake 21 release', ok=False)
+    # 同批切换不同伺服状态的关节：只改 Pn075，既不使能 20，也不失能 21
+    modes = [('release', 'released', 1), ('hold', 'held', 2), ('release', 'released', 1), ('normal', 'locked', 0)]
+    cmds = ['enable 21']
+    for mode, _, _ in modes:
+        cmds += [f'brake 20,21 {mode}', 'status 20,21', 'sdo 21 0x2075 0']
+    lines = run(*cmds).splitlines()
+    states = [(p[0], p[3]) for p in (line.split() for line in lines) if len(p) >= 4 and p[2] in ('L/5', 'L/6')]
+    assert states == [row for _, state, _ in modes for row in [('20', state), ('21', 'enabled')]], states
+    assert [l for l in lines if l.startswith('0x2075:00 =')] == [
+        f'0x2075:00 = {v:02x} 00 ({v})' for _, _, v in modes], lines
     # 零力矩拖动：kp = 0；kd 不设上限，只要求非负有限值
     out = run('free 21 0.2', 'status 21')
     row = next(l.split() for l in out.splitlines() if l.startswith('21 ') and 'L/6' in l)

@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "tlog.h"
+#include "arms/arms.h"
 
 #define MASTER_PARAM "/sys/module/ec_master/parameters/main_devices"
 #define MASTER_INIT "/etc/init.d/ethercat"
@@ -136,16 +137,21 @@ int arms_env_rt_apply(const char *config, int rt_cpu)
         if (run_rt((char *[]){g_rt_script, "revert", NULL}))
             return -1;
     }
-    if (config) {
-        args[n++] = "-c";
-        args[n++] = (char *)config;
+    char resolved[PATH_MAX];
+    if (!config && !arms_config_default_path(resolved, sizeof(resolved))) {
+        tlog_err("找不到实时配置，请指定 arms.json");
+        return -1;
     }
-    if (rt_cpu >= 0) {
+    args[n++] = "-c";
+    args[n++] = config ? (char *)config : resolved;
+    if (rt_cpu >= -1) {
         snprintf(cpu, sizeof(cpu), "%d", rt_cpu);
         args[n++] = "--rt-cpu";
         args[n++] = cpu;
-        args[n++] = "--irq-cpu";
-        args[n++] = cpu;
+        if (rt_cpu >= 0) {
+            args[n++] = "--irq-cpu";
+            args[n++] = cpu;
+        }
     }
     args[n] = NULL;
     if (run_rt(args) != 0) {
