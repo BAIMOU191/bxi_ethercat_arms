@@ -18,11 +18,34 @@ static int ignore_can(void *arg, canfd_packet *msg)
     return 0;
 }
 
+#define FEEDBACK_TIMEOUT_MS 5000
+#define FEEDBACK_POLL_MS 100
+
+/* motor_pwr_get 读取电源反馈（PCI GPIO 0），motor_pwr_set 驱动控制输出（GPIO 2）；反馈滞后于控制 */
 static void print_state(void)
 {
     int s = motor_pwr_get();
-    if (s < 0) printf("电机电源: 状态读取失败\n");
-    else printf("电机电源: %s\n", s ? "接通" : "断开");
+    if (s < 0) printf("电机电源反馈: 读取失败\n");
+    else printf("电机电源反馈: %s\n", s ? "接通" : "断开");
+}
+
+/* 等待反馈与请求一致；返回 0 一致，-1 超时或读取失败 */
+static int wait_feedback(int want)
+{
+    for (int ms = 0; ms <= FEEDBACK_TIMEOUT_MS; ms += FEEDBACK_POLL_MS) {
+        int s = motor_pwr_get();
+        if (s < 0) {
+            printf("电机电源反馈: 读取失败\n");
+            return -1;
+        }
+        if ((s != 0) == (want != 0)) {
+            printf("电机电源反馈: %s（%d ms 后确认）\n", want ? "接通" : "断开", ms);
+            return 0;
+        }
+        usleep(FEEDBACK_POLL_MS * 1000);
+    }
+    printf("电机电源反馈: %d ms 内未变为%s\n", FEEDBACK_TIMEOUT_MS, want ? "接通" : "断开");
+    return -1;
 }
 
 int main(int argc, char **argv)
@@ -47,17 +70,16 @@ int main(int argc, char **argv)
             fprintf(stderr, "motor_pwr_set(1) 失败\n");
             return 1;
         }
-        print_state();
-        return 0; /* 不调用 bxi_pci_exit，电源保持接通 */
+        return wait_feedback(1) ? 1 : 0; /* 不调用 bxi_pci_exit，电源保持接通 */
     }
     if (!strcmp(op, "off")) {
         if (motor_pwr_set(0u) < 0) {
             fprintf(stderr, "motor_pwr_set(0) 失败，电源状态未知\n");
             return 1;
         }
-        print_state();
+        int rc = wait_feedback(0) ? 1 : 0;
         bxi_pci_exit();
-        return 0;
+        return rc;
     }
     print_state();
     return 0;
