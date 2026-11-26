@@ -72,7 +72,7 @@ WKC 期望值为 42（14 个驱动器 × 3）。通信失败、离线保护按�
 | 资源 | 用途 |
 |---|---|
 | `/dev/EtherCAT0` | EtherLab 主站 0，按网口 MAC 解析主站号 |
-| BXI PCI SDK x86-64（`third_party/bxi_pci_drv/x86_64`，`motor_pwr_set`） | `arms_test`、`arms_node` 控制电机总电源 |
+| BXI PCI SDK x86-64（`third_party/bxi_pci_drv/x86_64`，`motor_pwr_set`） | `arms_test`、`arms_node` 控制电机总电源。SDK 以 `/tmp/bxi_pci.lock` 独占 PCI；`bxi_pci_exit` 会把 GPIO 输出全部写 0（即断电），本程序只对自己接通的电源断电，释放 PCI 时只调用 `canfd_exit` 和 `bxi_pci_unlock` |
 | `/run/arms_rt_setup.state` | `rt_setup.sh` 的还原记录 |
 
 同一主站同时只能被一个程序占用。
