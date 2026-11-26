@@ -8,11 +8,7 @@ extern "C"
 {
 #endif
 
-#if defined(__aarch64__)
-#define CANFD_DEVICE_NUM 7
-#else
 #define CANFD_DEVICE_NUM 5
-#endif
 
 typedef struct
 {
