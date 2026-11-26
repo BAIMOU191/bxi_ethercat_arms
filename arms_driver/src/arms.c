@@ -1342,6 +1342,72 @@ static void confine_master_threads(arms_t *a)
     else if (moved) logf_(a, "EtherLab 内核线程 %d 个，已限制在保留 CPU 以外", moved);
 }
 
+/*
+ * 集线器端口核对（arms.hub）。集线器输出口与 ESC 端口的对应为 OUT1 = 3、OUT2 = 1、OUT3 = 2，
+ * 与帧的处理顺序 0 → 3 → 1 → 2 一致。要求各臂所接输出口的下一个从站是该臂配置中链上位置最小的
+ * 驱动器，且该臂驱动器按配置位置依次经端口 1 相连。不符时返回 -1 并写入错误说明。
+ */
+static int check_hub(arms_t *a, const arm_rt *r)
+{
+    static const int out_port[4] = {-1, 3, 1, 2};
+    const arms_config *c = &a->cfg;
+    char done[160] = "";
+    size_t len = 0;
+    if (!c->shared_link || c->hub_slave < 0 || !r->ops->port_next) return 0;
+    for (int arm = 0; arm < ARMS_ARM_COUNT; ++arm) {
+        const char *name = arm == ARMS_ARM_LEFT ? "左臂" : "右臂";
+        int pos[ARMS_MAX_SLAVES_PER_ARM], n = 0, opened = 0, out = c->hub_out[arm], got;
+        if (!out) continue;
+        for (int k = 0; k < r->count; ++k)
+            if (c->joint[r->slot_joint[k]].arm == arm) opened = 1;
+        if (!opened) continue;
+        if (a->missing & (arm == ARMS_ARM_LEFT ? ARMS_MASK_LEFT : ARMS_MASK_RIGHT)) {
+            logf_(a, "警告: %s有关节不在线，跳过集线器端口核对", name);
+            continue;
+        }
+        for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+            int p, m;
+            if (!c->joint[j].present || c->joint[j].arm != arm) continue;
+            p = c->joint[j].slave;
+            for (m = n; m > 0 && pos[m - 1] > p; --m) pos[m] = pos[m - 1];
+            pos[m] = p;
+            n++;
+        }
+        got = r->ops->port_next(r->bus, c->hub_slave, out_port[out]);
+        if (got == -2) {
+            set_error("读取集线器（链上位置 %d）的端口连接失败", c->hub_slave);
+            return -1;
+        }
+        if (got != pos[0]) {
+            int actual = 0;
+            for (int o = 1; o <= 3; ++o)
+                if (r->ops->port_next(r->bus, c->hub_slave, out_port[o]) == pos[0]) actual = o;
+            if (actual)
+                set_error("集线器端口核对失败: %s应接 OUT%d，实际接在 OUT%d（%s首个驱动器在链上位置 %d）", name, out,
+                          actual, name, pos[0]);
+            else if (got >= 0)
+                set_error("集线器端口核对失败: OUT%d 的下一个从站是链上位置 %d，%s首个驱动器配置为 %d", out, got,
+                          name, pos[0]);
+            else
+                set_error("集线器端口核对失败: %s应接 OUT%d，该口未连接", name, out);
+            return -1;
+        }
+        for (int k = 0; k + 1 < n; ++k) {
+            int nx = r->ops->port_next(r->bus, pos[k], 1);
+            if (nx != pos[k + 1]) {
+                set_error("集线器端口核对失败: %s支路中链上位置 %d 的下一个从站是 %d，配置为 %d", name, pos[k], nx,
+                          pos[k + 1]);
+                return -1;
+            }
+        }
+        if (len < sizeof(done))
+            len += (size_t)snprintf(done + len, sizeof(done) - len, "%sOUT%d → %s（链上位置 %d～%d）", len ? "，" : "",
+                                    out, name, pos[0], pos[n - 1]);
+    }
+    if (len) logf_(a, "集线器（链上位置 %d）端口核对通过: %s", c->hub_slave, done);
+    return 0;
+}
+
 static arms_status start_rt(arms_t *a)
 {
     pthread_attr_t attr;
@@ -1644,6 +1710,10 @@ arms_status arms_open(const arms_options *options, arms_t **out)
             r->bus = NULL;
             r->used = false;
             continue;
+        }
+        if (check_hub(a, r) != 0) {
+            st = ARMS_E_TOPOLOGY;
+            goto fail;
         }
         r->slaves_found = found;
         as->present = true;

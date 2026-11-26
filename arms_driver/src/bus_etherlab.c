@@ -418,9 +418,18 @@ static int el_emerg_pop(bus_t *b, int i, uint8_t *msg)
     return ret == -ENOENT ? 0 : ret;
 }
 
+static int el_port_next(bus_t *b, int position, int port)
+{
+    ec_slave_info_t si;
+    if (port < 0 || port >= EC_MAX_PORTS || position < 0 || position > 0xffff) return -2;
+    if (ecrt_master_get_slave(b->master, (uint16_t)position, &si) != 0) return -2;
+    if (!si.ports[port].link.link_up || si.ports[port].next_slave == 0xffff) return -1;
+    return si.ports[port].next_slave;
+}
+
 const bus_ops bus_etherlab_ops = {
     "etherlab",       el_open,         el_scan,          el_configure,     el_activate,        el_receive,
     el_send,          el_inputs,       el_outputs,       el_update_states, el_expected_wkc,    el_master_index,
     el_close,         el_sdo,          el_esc_read,      el_esc_clear,     el_esc_state,       el_monitor_select,
-    el_monitor_read,  el_monitor_state, el_emerg_pop,
+    el_monitor_read,  el_monitor_state, el_emerg_pop,    el_port_next,
 };

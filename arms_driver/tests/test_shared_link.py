@@ -21,12 +21,15 @@ with tempfile.TemporaryDirectory() as tmp:
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
         return path
 
-    def run(config, *commands, ok=True):
+    def run(config, *commands, ok=True, hub=None):
         args = [exe, '--mock', '-c', str(config)]
         for cmd in commands:
             args += ['-e', cmd]
+        env = dict(os.environ, ARMS_MOCK_SLAVES='15')
+        if hub is not None:
+            env['ARMS_MOCK_HUB'] = hub
         p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30,
-                           env=dict(os.environ, ARMS_MOCK_SLAVES='15'), stdin=subprocess.DEVNULL)
+                           env=env, stdin=subprocess.DEVNULL)
         assert (p.returncode == 0) == ok, (args, p.stdout)
         return p.stdout
 
@@ -49,4 +52,26 @@ with tempfile.TemporaryDirectory() as tmp:
     assert 'mac、master 必须一致' in run(bad_mac, 'check', ok=False)
     dup = make('dup.json', lambda d: d['joints'][7].update(slave=1))
     assert '共用链路上的 slave 1 被多个关节使用' in run(dup, 'check', ok=False)
+
+    # 集线器端口绑定：OUT1 = ESC 端口 3 接左臂，OUT2 = ESC 端口 1 接右臂，OUT3 空
+    hub = make('hub.json', lambda d: d['arms'].update(hub={'slave': 0, 'left': 1, 'right': 2}))
+    out = run(hub, 'check', hub='3=1,1=8')
+    assert '集线器（链上位置 0）端口核对通过: OUT1 → 左臂（链上位置 1～7），OUT2 → 右臂（链上位置 8～14）' in out, out
+    # 左右臂插反
+    out = run(hub, 'check', hub='3=8,1=1', ok=False)
+    assert '左臂应接 OUT1，实际接在 OUT2' in out, out
+    # 右臂所在输出口未连接
+    out = run(hub, 'check', hub='3=1', ok=False)
+    assert 'OUT2 的下一个从站' in out or '右臂应接 OUT2' in out, out
+    # 屏蔽右臂时只核对左臂
+    hub_masked = make('hub_masked.json', lambda d: (d['arms'].update(hub={'slave': 0, 'left': 1, 'right': 2}),
+                                                    d['safety'].update(ignore_mask='0x1fc00000')))
+    out = run(hub_masked, 'check', hub='3=1,1=8')
+    assert 'OUT1 → 左臂' in out and 'OUT2' not in out.split('端口核对通过')[1].splitlines()[0], out
+    # 配置校验
+    for bad, msg in [({'slave': 1, 'left': 1}, '与关节 15 的 slave 相同'),
+                     ({'slave': 0, 'left': 4}, 'arms.hub.left 必须是集线器输出口 1..3'),
+                     ({'slave': 0, 'left': 2, 'right': 2}, '左右臂不能接同一个输出口 OUT2')]:
+        cfg = make('bad_hub.json', lambda d, h=bad: d['arms'].update(hub=h))
+        assert msg in run(cfg, 'check', ok=False)
 print('OK')

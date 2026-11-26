@@ -130,6 +130,7 @@ static void set_defaults(arms_config *c)
     c->mode = ARMS_MODE_STANDALONE;
     c->rt_cpu = -1;
     c->irq_cpu = -1;
+    c->hub_slave = -1;
     c->rt_priority = 80;
     c->softirq_priority = 70;
     c->wkc_tolerance = 3;
@@ -549,6 +550,44 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
                 goto out;
             }
             used[j->slave] = true;
+        }
+    }
+    {
+        /* arms.hub：两臂经集线器共用链路时，各臂所接的集线器输出口，启动时按实际拓扑核对 */
+        const cJSON *hub = obj(arms, "hub");
+        long v;
+        if (hub) {
+            if (!cJSON_IsObject(hub)) {
+                fail(error, size, "arms.hub 必须是对象");
+                goto out;
+            }
+            if (!c->shared_link) {
+                fail(error, size, "arms.hub 只用于左右臂共用网口的配置");
+                goto out;
+            }
+            if (!get_int(hub, "slave", 0, ARMS_MAX_SLAVES_PER_ARM - 1, &v)) {
+                fail(error, size, "arms.hub.slave 必须是 0..%d", ARMS_MAX_SLAVES_PER_ARM - 1);
+                goto out;
+            }
+            c->hub_slave = (int)v;
+            for (i = ARMS_JOINT_FIRST; i <= ARMS_JOINT_LAST; ++i)
+                if (c->joint[i].present && c->joint[i].slave == c->hub_slave) {
+                    fail(error, size, "arms.hub.slave %d 与关节 %d 的 slave 相同", c->hub_slave, i);
+                    goto out;
+                }
+            for (a = 0; a < ARMS_ARM_COUNT; ++a) {
+                const char *key = a == ARMS_ARM_LEFT ? "left" : "right";
+                if (!cJSON_GetObjectItemCaseSensitive(hub, key)) continue;
+                if (!get_int(hub, key, 1, 3, &v)) {
+                    fail(error, size, "arms.hub.%s 必须是集线器输出口 1..3", key);
+                    goto out;
+                }
+                c->hub_out[a] = (int)v;
+            }
+            if (c->hub_out[0] && c->hub_out[0] == c->hub_out[1]) {
+                fail(error, size, "arms.hub 中左右臂不能接同一个输出口 OUT%d", c->hub_out[0]);
+                goto out;
+            }
         }
     }
     if (c->softirq_priority >= c->rt_priority) {

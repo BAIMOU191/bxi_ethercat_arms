@@ -16,7 +16,8 @@
   "drive": { "vendor_id": "0x00010203", "product_code": "0x00000402" },
   "arms": {
     "left": { "interface": "enp86s0", "mac": "", "master": null },
-    "right": { "interface": "enp86s0", "mac": "", "master": null }
+    "right": { "interface": "enp86s0", "mac": "", "master": null },
+    "hub": { "slave": 0, "left": 1, "right": 2 }
   },
   "joint_defaults": { "pos_limit": [-3.0, 3.0], "vel_limit": 3.0, "tor_limit": 30.0 },
   "joints": [

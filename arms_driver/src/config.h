@@ -53,6 +53,8 @@ typedef struct {
     uint32_t product_code;
     arms_arm_config arm[ARMS_ARM_COUNT];
     bool shared_link;       /* 左右臂配置为同一网口：两臂在同一条 EtherCAT 链上，由链路 0 统一收发 */
+    int hub_slave;          /* 集线器的链上位置，-1 表示未配置（arms.hub） */
+    int hub_out[ARMS_ARM_COUNT]; /* 各臂所接集线器输出口 OUT1..OUT3，0 表示不检查 */
     arms_joint_config joint[ARMS_JOINT_LAST + 1]; /* 按关节号索引 */
 } arms_config;
 

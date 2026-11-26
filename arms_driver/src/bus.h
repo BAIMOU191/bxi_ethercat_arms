@@ -86,6 +86,11 @@ typedef struct {
     int (*monitor_state)(bus_t *bus, int index, int32_t *value);
     /* 取出一条 CoE 紧急报文（8 字节），可在非周期上下文调用；1 取到，0 没有，负值失败 */
     int (*emerg_pop)(bus_t *bus, int index, uint8_t *msg);
+    /*
+     * 拓扑：链上位置 position 的从站，其 ESC 端口 port（0..3）连接的下一个从站的链上位置。
+     * 端口链路断开或没有下一个从站时返回 -1，读取失败返回 -2。在 scan 之后、周期开始之前调用。
+     */
+    int (*port_next)(bus_t *bus, int position, int port);
 } bus_ops;
 
 enum { BUS_REQ_IDLE = 0, BUS_REQ_BUSY, BUS_REQ_DONE, BUS_REQ_ERROR };
