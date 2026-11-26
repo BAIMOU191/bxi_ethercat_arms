@@ -248,7 +248,7 @@ class ArmsNode final : public rclcpp::Node
             const auto &a = b.arm[i];
             if (!a.present)
                 continue;
-            t += format("%-5s %s link %s  OP %d/%d  WKC %u/%u  comm %s  drops %u\n", arms_arm_name(i), a.interface,
+            t += format("%-5s %s link %s  OP %d/%d  WKC %u/%u  comm %s  drops %u\n", arms_link_name(dev.driver, i), a.interface,
                         a.link_up ? "up" : "DOWN", a.slaves_op, a.slaves_expected, a.wkc_last, a.wkc_expected,
                         a.comm_failed ? "FAILED" : "ok", a.comm_drops);
         }
@@ -426,19 +426,19 @@ class ArmsNode final : public rclcpp::Node
         arms_read(dev.driver, states, ARMS_JOINT_COUNT, &n);
         for (size_t k = 0; k < n; ++k) {
             const auto &s = states[k];
-            if (s.mode == ARMS_JS_FAULT || s.error_code) faults[s.arm] |= ARMS_MASK_JOINT(s.joint);
-            if (!std::isnan(s.temperature) && (std::isnan(max_temp[s.arm]) || s.temperature > max_temp[s.arm]))
-                max_temp[s.arm] = s.temperature;
+            if (s.mode == ARMS_JS_FAULT || s.error_code) faults[s.link] |= ARMS_MASK_JOINT(s.joint);
+            if (!std::isnan(s.temperature) && (std::isnan(max_temp[s.link]) || s.temperature > max_temp[s.link]))
+                max_temp[s.link] = s.temperature;
             if (s.drive_frame_loss > 0)
-                drive_loss[s.arm] += s.drive_frame_loss;
+                drive_loss[s.link] += s.drive_frame_loss;
             /* 线路类：无效帧、物理层错误、链路丢失；处理类：转发、处理单元、PDI 错误 */
             for (int e = 0; e < 20; ++e) {
                 if (e == 14 || e == 15)
                     continue;
                 if (e < 8 || e >= 16)
-                    esc_line[s.arm] += s.esc_errors[e];
+                    esc_line[s.link] += s.esc_errors[e];
                 else
-                    esc_proc[s.arm] += s.esc_errors[e];
+                    esc_proc[s.link] += s.esc_errors[e];
             }
         }
         for (int i = 0; i < ARMS_ARM_COUNT; i++) {
@@ -446,7 +446,7 @@ class ArmsNode final : public rclcpp::Node
             if (!a.present)
                 continue;
             diagnostic_msgs::msg::DiagnosticStatus d;
-            d.name = std::string("arms/") + arms_arm_name(i);
+            d.name = std::string("arms/") + arms_link_name(dev.driver, i);
             d.hardware_id = a.interface;
             const bool prot = b.protect.reason != ARMS_PROTECT_NONE;
             d.level = (dev.cut || b.tripped || prot || faults[i] || a.slaves_op != a.slaves_expected || a.comm_failed || !a.link_up ||

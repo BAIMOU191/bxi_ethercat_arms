@@ -117,6 +117,7 @@ typedef struct {
     int joint;              /**< 关节号 */
     const char *name;       /**< 关节名称 */
     int arm;                /**< ARMS_ARM_LEFT / ARMS_ARM_RIGHT */
+    int link;               /**< 所在链路，arms_bus_stats.arm[] 的下标，见 arms_link_name() */
     int slave;              /**< 链上位置，从 0 开始 */
     arms_joint_mode mode;
     uint8_t al_state;       /**< EtherCAT AL 状态 */
@@ -155,9 +156,9 @@ typedef struct {
     double min, mean, max, rms_jitter;
 } arms_interval_stats;
 
-/** 单臂通信统计 */
+/** 单条链路（主站）的通信统计，名称见 arms_link_name() */
 typedef struct {
-    bool present;                    /**< 本次是否打开该臂 */
+    bool present;                    /**< 本次是否打开该链路 */
     char interface[32];
     int master_index;
     int slaves_expected;             /**< 配置使用的从站数 */
@@ -320,6 +321,17 @@ int arms_joint_by_name(const arms_t *arms, const char *name);
 
 /** @brief 臂名称 "left" / "right" */
 const char *arms_arm_name(int arm);
+
+/**
+ * @brief 链路名称，用于 arms_bus_stats.arm[] 的下标
+ *
+ * 每条链路对应一个 EtherCAT 主站。通常链路 0 为左臂、链路 1 为右臂；左右臂配置为同一网口时，
+ * 两臂关节都在链路 0 上，返回 "left+right"，链路 1 不使用。
+ */
+const char *arms_link_name(const arms_t *arms, int link);
+
+/** @brief 左右臂是否配置为同一网口（两臂在同一条链路上） */
+bool arms_shared_link(const arms_t *arms);
 
 /**
  * 关节限位（关节侧）。均依据反馈判断，不截断指令：

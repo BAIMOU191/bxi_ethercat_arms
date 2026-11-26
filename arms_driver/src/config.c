@@ -505,8 +505,12 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
         goto out;
     }
     if (c->arm[0].present && c->arm[1].present && strcmp(c->arm[0].interface, c->arm[1].interface) == 0) {
-        fail(error, size, "左右臂不能使用同一个网口 %s", c->arm[0].interface);
-        goto out;
+        /* 同一网口：两臂经分支器接在同一条链上，链路参数以左臂为准 */
+        if (strcmp(c->arm[0].mac, c->arm[1].mac) != 0 || c->arm[0].master != c->arm[1].master) {
+            fail(error, size, "左右臂共用网口 %s 时 mac、master 必须一致", c->arm[0].interface);
+            goto out;
+        }
+        c->shared_link = true;
     }
     joints = cJSON_GetObjectItemCaseSensitive(root, "joints");
     if (!cJSON_IsArray(joints) || cJSON_GetArraySize(joints) == 0) {
@@ -523,17 +527,25 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
         for (i = 0; i < n; ++i)
             if (!parse_joint(cJSON_GetArrayItem(joints, i), c, i, &base, error, size)) goto out;
     }
+    for (i = ARMS_JOINT_FIRST; i <= ARMS_JOINT_LAST; ++i) {
+        arms_joint_config *j = &c->joint[i];
+        if (!j->present) continue;
+        if (!c->arm[j->arm].present) {
+            fail(error, size, "关节 %d 属于 %s 臂，但 arms 段没有配置该臂", i, j->arm == 0 ? "left" : "right");
+            goto out;
+        }
+        j->link = c->shared_link ? ARMS_ARM_LEFT : j->arm;
+    }
     for (a = 0; a < ARMS_ARM_COUNT; ++a) {
         bool used[ARMS_MAX_SLAVES_PER_ARM] = {false};
         for (i = ARMS_JOINT_FIRST; i <= ARMS_JOINT_LAST; ++i) {
             const arms_joint_config *j = &c->joint[i];
-            if (!j->present || j->arm != a) continue;
-            if (!c->arm[a].present) {
-                fail(error, size, "关节 %d 属于 %s 臂，但 arms 段没有配置该臂", i, a == 0 ? "left" : "right");
-                goto out;
-            }
+            if (!j->present || j->link != a) continue;
             if (used[j->slave]) {
-                fail(error, size, "%s 臂的 slave %d 被多个关节使用", a == 0 ? "left" : "right", j->slave);
+                if (c->shared_link)
+                    fail(error, size, "共用链路上的 slave %d 被多个关节使用", j->slave);
+                else
+                    fail(error, size, "%s 臂的 slave %d 被多个关节使用", a == 0 ? "left" : "right", j->slave);
                 goto out;
             }
             used[j->slave] = true;

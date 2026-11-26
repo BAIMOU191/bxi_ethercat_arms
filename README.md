@@ -2,7 +2,7 @@
 
 BXI 双臂 EtherCAT 驱动（x86 分支）。主控为 ASUS NUC 13 Pro（Intel i7-1360P，Ubuntu 22.04），左右臂共 14 个 KGU 执行器，EtherLab 主站，MIT 模式。
 
-当前只接入左臂：左臂使用网口 `enp86s0`；右臂关节 22–28 由 `safety.ignore_mask = 0x1fc00000` 屏蔽，不打开。资源分配见 `docs/resources.md`。
+左右臂经 EtherCAT 分支器接在同一个网口 `enp86s0` 上（一个主站、一条链）：`arms.left` 与 `arms.right` 配置为同一网口时，两臂关节由同一条链路收发，`bus`、通信事件日志和 ROS 诊断中该链路显示为 `left+right`，提示符显示为 `LR<OP>/<总数>`。链上位置 0 为分支器，左臂 1–7，右臂 8–14。资源分配见 `docs/resources.md`。
 一个实时线程在同一周期内完成两条臂的收发。
 
 | 目录 | 内容 |

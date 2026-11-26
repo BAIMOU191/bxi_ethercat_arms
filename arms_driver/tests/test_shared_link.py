@@ -1,0 +1,52 @@
+"""双臂共用网口：两臂经分支器接在同一条链上（链上位置 0 为分支器），只使用模拟后端。"""
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+exe, original = sys.argv[1:]
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = pathlib.Path(tmp)
+    base = json.loads(pathlib.Path(original).read_text())
+
+    def make(name, edit):
+        data = json.loads(json.dumps(base))
+        data['arms']['right'] = dict(data['arms']['left'])
+        for j in data['joints']:
+            j['slave'] = j['joint'] - 14  # 左臂 1..7，右臂 8..14
+        edit(data)
+        path = tmp / name
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        return path
+
+    def run(config, *commands, ok=True):
+        args = [exe, '--mock', '-c', str(config)]
+        for cmd in commands:
+            args += ['-e', cmd]
+        p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30,
+                           env=dict(os.environ, ARMS_MOCK_SLAVES='15'), stdin=subprocess.DEVNULL)
+        assert (p.returncode == 0) == ok, (args, p.stdout)
+        return p.stdout
+
+    shared = make('shared.json', lambda d: None)
+    out = run(shared, 'check', 'bus', 'enable 15,22', 'mit 22 0.1 5 0.5', 'status 15,22', 'disable')
+    assert 'left+right 臂: 扫描完成，发现 15 个从站（预期 15）' in out, out
+    assert '已打开的 14 个关节全部在线' in out, out
+    assert 'left+right eth0 主站0' in out and 'right 未打开' not in out, out
+    rows = {f[0]: f for f in (l.split() for l in out.splitlines()) if len(f) > 10 and f[0] in ('15', '22') and '/' in f[2]}
+    assert rows['15'][2] == 'L/1' and rows['22'][2] == 'R/8', rows
+    assert rows['22'][3] == 'enabled' and abs(float(rows['22'][10]) - 0.1) < 1e-9, rows
+
+    # 屏蔽右臂时只打开左臂关节
+    masked = make('masked.json', lambda d: d['safety'].update(ignore_mask='0x1fc00000'))
+    out = run(masked, 'check')
+    assert '已打开的 7 个关节全部在线' in out, out
+
+    # 共用网口时 mac、master 必须一致；同一条链上 slave 不能重复
+    bad_mac = make('bad_mac.json', lambda d: d['arms']['right'].update(mac='00:11:22:33:44:55'))
+    assert 'mac、master 必须一致' in run(bad_mac, 'check', ok=False)
+    dup = make('dup.json', lambda d: d['joints'][7].update(slave=1))
+    assert '共用链路上的 slave 1 被多个关节使用' in run(dup, 'check', ok=False)
+print('OK')

@@ -39,12 +39,16 @@
 
 ## 网口
 
-| 臂 | 网口 | 状态 |
-|---|---|---|
-| 左臂 | `enp86s0`（Intel I226，`igc`） | 使用中，EtherLab 主站 0 |
-| 右臂 | 未定（配置中为占位名 `eth_right`） | 关节 22–28 由 `safety.ignore_mask = 0x1fc00000` 屏蔽，不打开 |
+双臂经 EtherCAT 分支器接在 `enp86s0`（Intel I226，`igc`）上，由 EtherLab 主站 0 统一收发，一个周期一帧。
 
-接入右臂时：在 `arms.right.interface` 填入实际网口，在 `/etc/sysconfig/ethercat` 增加 `MASTER1_DEVICE`，并从 `ignore_mask` 中去掉 22–28。
+| 链上位置 | 设备 |
+|---|---|
+| 0 | 分支器（不配置过程数据） |
+| 1–7 | 左臂关节 15–21 |
+| 8–14 | 右臂关节 22–28 |
+
+`arms.left.interface` 与 `arms.right.interface` 相同即为共用链路；此时 `mac`、`master` 也必须相同，链上位置在两臂之间不能重复。
+WKC 期望值为 42（14 个驱动器 × 3）。通信失败、离线保护按整条链路处理，两臂同时失能。
 
 ## 内存
 

@@ -7,7 +7,7 @@
     "command_timeout_ms": 50,
     "timeout_action": "hold",
     "check_motors": true,
-    "ignore_mask": "0x1fc00000",
+    "ignore_mask": "0x00000000",
     "offline_action": "power_off",
     "overspeed_ms": 500,
     "overtorque_ms": 100,
@@ -16,23 +16,23 @@
   "drive": { "vendor_id": "0x00010203", "product_code": "0x00000402" },
   "arms": {
     "left": { "interface": "enp86s0", "mac": "", "master": null },
-    "right": { "interface": "eth_right", "mac": "", "master": null }
+    "right": { "interface": "enp86s0", "mac": "", "master": null }
   },
   "joint_defaults": { "pos_limit": [-3.0, 3.0], "vel_limit": 3.0, "tor_limit": 30.0 },
   "joints": [
-    { "joint": 15, "name": "l_shoulder_y_joint", "arm": "left", "slave": 0, "direction": 1, "offset_rad": 0.203563 },
-    { "joint": 16, "name": "l_shoulder_x_joint", "arm": "left", "slave": 1, "direction": 1, "offset_rad": 0.254841 },
-    { "joint": 17, "name": "l_shoulder_z_joint", "arm": "left", "slave": 2, "direction": 1, "offset_rad": 0.040636 },
-    { "joint": 18, "name": "l_elbow_y_joint", "arm": "left", "slave": 3, "direction": 1, "offset_rad": 1.022989 },
-    { "joint": 19, "name": "l_wrist_x_joint", "arm": "left", "slave": 4, "direction": 1, "offset_rad": 0.17975 },
-    { "joint": 20, "name": "l_wrist_y_joint", "arm": "left", "slave": 5, "direction": 1, "offset_rad": 0.399717 },
-    { "joint": 21, "name": "l_wrist_z_joint", "arm": "left", "slave": 6, "direction": 1, "offset_rad": -0.006846 },
-    { "joint": 22, "name": "r_shoulder_y_joint", "arm": "right", "slave": 0, "direction": 1, "offset_rad": 0.0 },
-    { "joint": 23, "name": "r_shoulder_x_joint", "arm": "right", "slave": 1, "direction": 1, "offset_rad": 0.0 },
-    { "joint": 24, "name": "r_shoulder_z_joint", "arm": "right", "slave": 2, "direction": 1, "offset_rad": 0.0 },
-    { "joint": 25, "name": "r_elbow_y_joint", "arm": "right", "slave": 3, "direction": 1, "offset_rad": 0.0 },
-    { "joint": 26, "name": "r_wrist_x_joint", "arm": "right", "slave": 4, "direction": 1, "offset_rad": 0.0 },
-    { "joint": 27, "name": "r_wrist_y_joint", "arm": "right", "slave": 5, "direction": 1, "offset_rad": 0.0 },
-    { "joint": 28, "name": "r_wrist_z_joint", "arm": "right", "slave": 6, "direction": 1, "offset_rad": 0.0 }
+    { "joint": 15, "name": "l_shoulder_y_joint", "arm": "left", "slave": 1, "direction": 1, "offset_rad": 0.203563 },
+    { "joint": 16, "name": "l_shoulder_x_joint", "arm": "left", "slave": 2, "direction": 1, "offset_rad": 0.254841 },
+    { "joint": 17, "name": "l_shoulder_z_joint", "arm": "left", "slave": 3, "direction": 1, "offset_rad": 0.040636 },
+    { "joint": 18, "name": "l_elbow_y_joint", "arm": "left", "slave": 4, "direction": 1, "offset_rad": 1.022989 },
+    { "joint": 19, "name": "l_wrist_x_joint", "arm": "left", "slave": 5, "direction": 1, "offset_rad": 0.17975 },
+    { "joint": 20, "name": "l_wrist_y_joint", "arm": "left", "slave": 6, "direction": 1, "offset_rad": 0.399717 },
+    { "joint": 21, "name": "l_wrist_z_joint", "arm": "left", "slave": 7, "direction": 1, "offset_rad": -0.006846 },
+    { "joint": 22, "name": "r_shoulder_y_joint", "arm": "right", "slave": 8, "direction": 1, "offset_rad": 0.0 },
+    { "joint": 23, "name": "r_shoulder_x_joint", "arm": "right", "slave": 9, "direction": 1, "offset_rad": 0.0 },
+    { "joint": 24, "name": "r_shoulder_z_joint", "arm": "right", "slave": 10, "direction": 1, "offset_rad": 0.0 },
+    { "joint": 25, "name": "r_elbow_y_joint", "arm": "right", "slave": 11, "direction": 1, "offset_rad": 0.0 },
+    { "joint": 26, "name": "r_wrist_x_joint", "arm": "right", "slave": 12, "direction": 1, "offset_rad": 0.0 },
+    { "joint": 27, "name": "r_wrist_y_joint", "arm": "right", "slave": 13, "direction": 1, "offset_rad": 0.0 },
+    { "joint": 28, "name": "r_wrist_z_joint", "arm": "right", "slave": 14, "direction": 1, "offset_rad": 0.0 }
   ]
 }

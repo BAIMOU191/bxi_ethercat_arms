@@ -18,7 +18,8 @@ typedef struct {
     int joint;
     char name[ARMS_NAME_LEN];
     int arm;
-    int slave;
+    int link;               /* 所在链路（主站）：通常等于 arm；双臂共用网口时右臂关节也为 ARMS_ARM_LEFT */
+    int slave;              /* 链路上的位置 */
     int direction;          /* +1 / -1 */
     double offset_rad;
     /* 限位均依据反馈判断，不截断指令 */
@@ -51,6 +52,7 @@ typedef struct {
     uint32_t vendor_id;
     uint32_t product_code;
     arms_arm_config arm[ARMS_ARM_COUNT];
+    bool shared_link;       /* 左右臂配置为同一网口：两臂在同一条 EtherCAT 链上，由链路 0 统一收发 */
     arms_joint_config joint[ARMS_JOINT_LAST + 1]; /* 按关节号索引 */
 } arms_config;
 

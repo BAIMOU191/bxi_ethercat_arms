@@ -348,6 +348,17 @@ struct arms {
     atomic_bool esc_clear_all;
 };
 
+const char *arms_link_name(const arms_t *a, int link)
+{
+    if (a && a->cfg.shared_link && link == ARMS_ARM_LEFT) return "left+right";
+    return arms_arm_name(link);
+}
+
+bool arms_shared_link(const arms_t *a)
+{
+    return a && a->cfg.shared_link;
+}
+
 static void post(arms_t *a, arms_mask joints, unsigned int req);
 
 static uint64_t mono_ns(void)
@@ -1504,6 +1515,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     for (j = 0; j <= ARMS_JOINT_LAST; ++j) {
         a->js[j].joint = j;
         a->js[j].arm = -1;
+        a->js[j].link = -1;
         a->js[j].slave = -1;
         a->js[j].mode = ARMS_JS_ABSENT;
         a->js[j].temperature = NAN;
@@ -1513,7 +1525,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         const arms_joint_config *jc = &a->cfg.joint[j];
         arm_rt *r;
         if (!(a->joints & ARMS_MASK_JOINT(j))) continue;
-        r = &a->arm[jc->arm];
+        r = &a->arm[jc->link];
         r->used = true;
         r->ops = a->ops;
         r->slot_joint[r->count] = j;
@@ -1521,6 +1533,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         r->count++;
         a->js[j].name = jc->name;
         a->js[j].arm = jc->arm;
+        a->js[j].link = jc->link;
         a->js[j].slave = jc->slave;
         a->js[j].mode = ARMS_JS_OFFLINE;
     }
@@ -1558,11 +1571,11 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         p.log = bus_log_adapter;
         p.log_user = a;
         if (r->ops->open(&r->bus, &p, err, sizeof(err)) != 0) {
-            set_error("%s 臂: %s", arms_arm_name(i), err);
+            set_error("%s 臂: %s", arms_link_name(a, i), err);
             st = ARMS_E_MASTER;
             goto fail;
         }
-        logf_(a, "%s 臂: 网口 %s, 主站 %d, 等待总线稳定", arms_arm_name(i), ac->interface,
+        logf_(a, "%s 臂: 网口 %s, 主站 %d, 等待总线稳定", arms_link_name(a, i), ac->interface,
               r->ops->master_index(r->bus));
         {
             /* 预期从站数：配置中该臂用到的最大链上位置 + 1 */
@@ -1574,18 +1587,18 @@ arms_status arms_open(const arms_options *options, arms_t **out)
                                    options->scan_timeout_ms ? options->scan_timeout_ms : DEFAULT_SCAN_TIMEOUT_MS, err,
                                    sizeof(err));
             if (scan_rc == 0) {
-                logf_(a, "%s 臂: 扫描完成，发现 %d 个从站（预期 %d），用时 %.2f s", arms_arm_name(i), found, expected,
+                logf_(a, "%s 臂: 扫描完成，发现 %d 个从站（预期 %d），用时 %.2f s", arms_link_name(a, i), found, expected,
                       (double)(mono_ns() - t0) / 1e9);
             } else if (scan_rc == BUS_SCAN_MASTER) {
-                set_error("%s 臂: %s", arms_arm_name(i), err);
+                set_error("%s 臂: %s", arms_link_name(a, i), err);
                 st = ARMS_E_MASTER;
                 goto fail;
             } else if (check || scan_rc != BUS_SCAN_EMPTY) {
-                set_error("%s 臂: %s", arms_arm_name(i), err);
+                set_error("%s 臂: %s", arms_link_name(a, i), err);
                 st = scan_rc == BUS_SCAN_LINK ? ARMS_E_LINK : ARMS_E_TOPOLOGY;
                 goto fail;
             } else {
-                logf_(a, "警告: %s 臂: %s", arms_arm_name(i), err);
+                logf_(a, "警告: %s 臂: %s", arms_link_name(a, i), err);
                 found = 0;
             }
         }
@@ -1613,12 +1626,12 @@ arms_status arms_open(const arms_options *options, arms_t **out)
             }
             if (miss) {
                 if (check) {
-                    set_error("启动检查失败: %s 臂总线上发现 %d 个从站，以下关节不在线: %s", arms_arm_name(i), found,
+                    set_error("启动检查失败: %s 臂总线上发现 %d 个从站，以下关节不在线: %s", arms_link_name(a, i), found,
                               list);
                     st = ARMS_E_TOPOLOGY;
                     goto fail;
                 }
-                logf_(a, "警告: %s 臂以下关节不在线，本次不使用: %s", arms_arm_name(i), list);
+                logf_(a, "警告: %s 臂以下关节不在线，本次不使用: %s", arms_link_name(a, i), list);
                 r->count = n;
                 a->missing |= miss;
                 a->joints &= ~miss;
@@ -1638,9 +1651,9 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         as->slaves_expected = r->count;
         as->master_index = r->ops->master_index(r->bus);
         snprintf(as->interface, sizeof(as->interface), "%s", ac->interface);
-        logf_(a, "%s 臂: 发现 %d 个从站, 使用 %d 个", arms_arm_name(i), found, r->count);
+        logf_(a, "%s 臂: 发现 %d 个从站, 使用 %d 个", arms_link_name(a, i), found, r->count);
         if (r->ops->configure(r->bus, r->slot_slave, r->count, err, sizeof(err)) != 0) {
-            set_error("%s 臂: %s", arms_arm_name(i), err);
+            set_error("%s 臂: %s", arms_link_name(a, i), err);
             st = ARMS_E_MASTER;
             goto fail;
         }
@@ -1655,7 +1668,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         arm_rt *r = &a->arm[i];
         if (!r->used) continue;
         if (r->ops->activate(r->bus, err, sizeof(err)) != 0) {
-            set_error("%s 臂: %s", arms_arm_name(i), err);
+            set_error("%s 臂: %s", arms_link_name(a, i), err);
             st = ARMS_E_MASTER;
             goto fail;
         }
@@ -1725,15 +1738,18 @@ arms_status arms_wait_ready(arms_t *a, unsigned int timeout_ms)
         shared_snapshot s;
         uint64_t now = mono_ns();
         if (now >= deadline || now >= next_log) read_snapshot(a, &s);
-        if (now >= deadline) {
-            set_error("预热超时 (%u ms): OP 从站 左 %d/%d, 右 %d/%d",
-                      timeout_ms ? timeout_ms : a->cfg.op_timeout_ms, s.stats.arm[0].slaves_op, a->arm[0].count,
-                      s.stats.arm[1].slaves_op, a->arm[1].count);
-            return ARMS_E_TIMEOUT;
-        }
-        if (now >= next_log) {
-            logf_(a, "预热中: OP 从站 左 %d/%d, 右 %d/%d", s.stats.arm[0].slaves_op, a->arm[0].count,
-                  s.stats.arm[1].slaves_op, a->arm[1].count);
+        if (now >= deadline || now >= next_log) {
+            char op[96] = "";
+            size_t len = 0;
+            for (int i = 0; i < ARMS_ARM_COUNT; ++i)
+                if (a->arm[i].used && len < sizeof(op))
+                    len += (size_t)snprintf(op + len, sizeof(op) - len, " %s %d/%d", arms_link_name(a, i),
+                                            s.stats.arm[i].slaves_op, a->arm[i].count);
+            if (now >= deadline) {
+                set_error("预热超时 (%u ms): OP 从站%s", timeout_ms ? timeout_ms : a->cfg.op_timeout_ms, op);
+                return ARMS_E_TIMEOUT;
+            }
+            logf_(a, "预热中: OP 从站%s", op);
             next_log = now + 1000000000ull;
         }
         usleep(10000);
@@ -1826,11 +1842,11 @@ static const char *event_name(int kind)
 }
 
 /* 输出各从站的温度、驱动器丢帧次数和非零的 ESC 错误计数 */
-static void write_slave_table(FILE *fp, const event_record *e)
+static void write_slave_table(const arms_t *a, FILE *fp, const event_record *e)
 {
     for (int i = 0; i < ARMS_ARM_COUNT; ++i) {
         if (!e->arm[i].used) continue;
-        fprintf(fp, "  %-5s 温度℃/驱动器丢帧:", arms_arm_name(i));
+        fprintf(fp, "  %-5s 温度℃/驱动器丢帧:", arms_link_name(a, i));
         for (int s = 0; s < e->arm[i].count; ++s) {
             if (isnan(e->arm[i].temp[s])) fprintf(fp, "  -");
             else fprintf(fp, "  %.0f", e->arm[i].temp[s]);
@@ -1926,21 +1942,21 @@ static void write_event(arms_t *a, FILE *fp, const event_record *e)
     format_real(e->real_ns, true, when, sizeof(when));
     format_real(e->real_ns - 2000000000LL, false, since, sizeof(since));
     fprintf(fp, "==== %s  %s", when, event_name(e->kind));
-    if (e->which_arm >= 0) fprintf(fp, "  %s 臂", arms_arm_name(e->which_arm));
+    if (e->which_arm >= 0) fprintf(fp, "  %s 臂", arms_link_name(a, e->which_arm));
     fprintf(fp, "  周期 %llu\n", (unsigned long long)e->cycle);
     if (e->suppressed) fprintf(fp, "  此前 1 秒内另有 %u 次同类事件未单独记录\n", e->suppressed);
     fprintf(fp, "  跳过周期 %llu  迟到周期(>1.5T) %llu  周期 %u Hz\n", (unsigned long long)e->skipped,
             (unsigned long long)e->overruns, a->cycle_hz);
     for (int i = 0; i < ARMS_ARM_COUNT; ++i) {
         if (!e->arm[i].used) continue;
-        fprintf(fp, "  %-5s 链路 %s  通信%s  WKC %u/%u  连续异常 %u  累计异常 %llu  AL", arms_arm_name(i),
+        fprintf(fp, "  %-5s 链路 %s  通信%s  WKC %u/%u  连续异常 %u  累计异常 %llu  AL", arms_link_name(a, i),
                 e->arm[i].link_up ? "UP" : "DOWN", e->arm[i].comm_failed ? "失败" : "正常", e->arm[i].wkc,
                 e->arm[i].wkc_expected, e->arm[i].consecutive, (unsigned long long)e->arm[i].wkc_bad);
         for (int k = 0; k < e->arm[i].count; ++k) fprintf(fp, " %02x", e->arm[i].al[k]);
         fputc('\n', fp);
     }
     write_detail(fp, e);
-    write_slave_table(fp, e);
+    write_slave_table(a, fp, e);
     if (shown) {
         fprintf(fp, "  最近 %u 个周期（旧 → 新；时刻相对本事件）:\n", shown);
         fprintf(fp, "     相对ms        周期    间隔us  唤醒延迟us  发送→接收us   处理us  WKC左 WKC右\n");
@@ -1968,7 +1984,9 @@ static void write_emergency(arms_t *a, FILE *fp, const emergency_msg *m)
     arms_joint_state s;
     clock_gettime(CLOCK_REALTIME, &rt);
     format_real((int64_t)rt.tv_sec * 1000000000LL + rt.tv_nsec, true, when, sizeof(when));
-    fprintf(fp, "==== %s  驱动器紧急报文  %s 臂\n", when, arms_arm_name(m->arm));
+    fprintf(fp, "==== %s  驱动器紧急报文  %s 臂\n", when,
+            m->joint >= ARMS_JOINT_FIRST && m->joint <= ARMS_JOINT_LAST ? arms_arm_name(a->cfg.joint[m->joint].arm)
+                                                                         : arms_link_name(a, m->arm));
     fprintf(fp, "  关节 %d（链上位置 %d）错误码 0x%04x  错误寄存器 0x%02x  厂家数据 %02x %02x %02x %02x %02x\n",
             m->joint, m->slave, (unsigned)(m->msg[0] | (m->msg[1] << 8)), m->msg[2], m->msg[3], m->msg[4], m->msg[5],
             m->msg[6], m->msg[7]);
@@ -2068,7 +2086,7 @@ arms_status arms_check_online(arms_t *a, arms_mask *offline_out)
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         const arms_arm_stats *as;
         if (!(a->joints & ARMS_MASK_JOINT(j))) continue;
-        as = &s.stats.arm[a->cfg.joint[j].arm];
+        as = &s.stats.arm[a->cfg.joint[j].link];
         if ((s.s[j].al_state & 0x0F) != 0x08 || as->comm_failed || as->wkc_last != as->wkc_expected)
             off |= ARMS_MASK_JOINT(j);
     }
@@ -2359,7 +2377,7 @@ arms_status arms_reset(arms_t *a, arms_mask joints, unsigned int timeout_ms)
     int j;
     if (!a) return ARMS_E_ARG;
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j)
-        if ((joints & a->joints & ARMS_MASK_JOINT(j))) atomic_store(&a->clear_comm[a->cfg.joint[j].arm], true);
+        if ((joints & a->joints & ARMS_MASK_JOINT(j))) atomic_store(&a->clear_comm[a->cfg.joint[j].link], true);
     atomic_store(&a->clear_protect, true);
     return request_and_wait(a, joints, REQ_RESET, timeout_ms, "复位");
 }
@@ -2429,7 +2447,7 @@ static arms_status mailbox(arms_t *a, int j, uint16_t idx, uint8_t sub, uint8_t 
         return ARMS_E_ARG;
     }
     const arms_joint_config *jc = &a->cfg.joint[j];
-    arm_rt *r = &a->arm[jc->arm];
+    arm_rt *r = &a->arm[jc->link];
     uint32_t abort = 0;
     if (r->ops->sdo(r->bus, jc->slave, idx, sub, p, n, write, &abort)) {
         set_error("关节 %d SDO %04x:%02x %s失败 (abort=0x%08x)", j, idx, sub, write ? "写" : "读", abort);
@@ -2478,7 +2496,7 @@ static arms_status maintenance_read(arms_t *a, int j, bool confirmed, arms_joint
     *s = snap.s[j];
     apply_brake_mode(a, s);
     *stats = snap.stats;
-    const arms_arm_stats *as = &stats->arm[a->cfg.joint[j].arm];
+    const arms_arm_stats *as = &stats->arm[a->cfg.joint[j].link];
     if (s->al_state != 0x08 || !as->link_up || as->comm_failed || as->wkc_last != as->wkc_expected ||
         !s->sample_ns || mono_ns() - s->sample_ns > 50000000ull) {
         set_error("关节 %d 不在线或反馈过期", j);

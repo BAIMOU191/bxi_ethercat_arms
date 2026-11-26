@@ -188,12 +188,12 @@ static void print_stats(const arms_bus_stats *st)
     for (i = 0; i < ARMS_ARM_COUNT; ++i) {
         const arms_arm_stats *a = &st->arm[i];
         if (!a->present) {
-            printf("%-5s 未打开\n", arms_arm_name(i));
+            if (!(arms_shared_link(g_arms) && i == ARMS_ARM_RIGHT)) printf("%-5s 未打开\n", arms_link_name(g_arms, i));
             continue;
         }
         printf("%-5s %s 主站%d 链路%s  从站 OP %d/%d(总线上 %d)  WKC %u/%u  异常 %llu (最长连续 %u)  发送错误 %llu"
                "  收 %.4f us 发 %.4f us%s\n",
-               arms_arm_name(i), a->interface, a->master_index, a->link_up ? "UP" : "DOWN", a->slaves_op,
+               arms_link_name(g_arms, i), a->interface, a->master_index, a->link_up ? "UP" : "DOWN", a->slaves_op,
                a->slaves_expected, a->slaves_found, a->wkc_last, a->wkc_expected, (unsigned long long)a->wkc_bad,
                a->wkc_bad_consecutive_max, (unsigned long long)a->send_errors, a->recv_us_max, a->send_us_max,
                a->comm_failed ? "  [通信失败]" : "");
@@ -1093,7 +1093,7 @@ static int cmd_service(int argc, char **argv)
             printf("0x%04x\n", s.al_state);
         } else {
             char master[16], slave[16], address[16];
-            snprintf(master, 16, "%d", st.arm[s.arm].master_index);
+            snprintf(master, 16, "%d", st.arm[s.link].master_index);
             snprintf(slave, 16, "%d", s.slave);
             snprintf(address, 16, "%u", a);
             char *args[] = {"ethercat", "reg_read", "-m", master,
@@ -1384,9 +1384,13 @@ static void build_prompt(char *buf, size_t size)
         char state[32] = "";
         if (fault >= 0) snprintf(state, sizeof(state), " FAULT:%d", fault);
         else if (st.protect.reason != ARMS_PROTECT_NONE) snprintf(state, sizeof(state), " PROT:%d", st.protect.joint);
-        snprintf(buf, size, "arms %s L%d/%d R%d/%d E%d%s%s%s> ", hz, st.arm[0].slaves_op, st.arm[0].slaves_expected,
-                 st.arm[1].slaves_op, st.arm[1].slaves_expected, enabled, state,
-                 (st.arm[0].comm_failed || st.arm[1].comm_failed) ? " COMM!" : "", st.tripped ? " TRIP" : "");
+        if (arms_shared_link(g_arms))
+            snprintf(buf, size, "arms %s LR%d/%d E%d%s%s%s> ", hz, st.arm[0].slaves_op, st.arm[0].slaves_expected,
+                     enabled, state, st.arm[0].comm_failed ? " COMM!" : "", st.tripped ? " TRIP" : "");
+        else
+            snprintf(buf, size, "arms %s L%d/%d R%d/%d E%d%s%s%s> ", hz, st.arm[0].slaves_op, st.arm[0].slaves_expected,
+                     st.arm[1].slaves_op, st.arm[1].slaves_expected, enabled, state,
+                     (st.arm[0].comm_failed || st.arm[1].comm_failed) ? " COMM!" : "", st.tripped ? " TRIP" : "");
     }
 }
 
