@@ -1859,7 +1859,8 @@ static void write_slave_table(const arms_t *a, FILE *fp, const event_record *e)
             if (!e->arm[i].esc_valid[s]) continue;
             for (unsigned int b = 0; b < ESC_ERR_BYTES; ++b) {
                 if (!esc_names[b] || !e->arm[i].esc[s][b]) continue;
-                if (!any) fprintf(fp, "    关节 %d（链上位置 %d）ESC 错误计数:", e->arm[i].joint[s], s);
+                if (!any) fprintf(fp, "    关节 %d（链上位置 %d）ESC 错误计数:", e->arm[i].joint[s],
+                              a->cfg.joint[e->arm[i].joint[s]].slave);
                 fprintf(fp, " %s %u", esc_names[b], e->arm[i].esc[s][b]);
                 any = true;
             }
