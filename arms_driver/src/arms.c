@@ -1266,20 +1266,48 @@ static void *rt_main(void *arg)
 /*
  * 主站激活时 EtherLab 创建的内核线程（EtherCAT-OP 等）不受 rt_setup.sh 的线程迁移约束，
  * 其定时器会在实时 CPU 上到期并在实时线程的上下文中处理。激活后将这些线程限制到
- * 实时 CPU 和网口中断 CPU 以外的 CPU；线程随主站释放而退出，无需还原。失败时只记录日志。
+ * 保留 CPU（实时 CPU、网口中断 CPU 及其超线程兄弟）以外的 CPU；线程随主站释放而退出，
+ * 无需还原。失败时只记录日志。
  */
+static void reserve_core(cpu_set_t *reserved, int cpu)
+{
+    char path[96], list[64];
+    FILE *fp;
+    if (cpu < 0 || cpu >= CPU_SETSIZE) return;
+    CPU_SET(cpu, reserved);
+    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+    fp = fopen(path, "r");
+    if (!fp) return;
+    if (fgets(list, sizeof(list), fp)) {
+        char *s = list;
+        while (*s) {
+            char *end;
+            long lo = strtol(s, &end, 10), hi = lo;
+            if (end == s) break;
+            if (*end == '-') hi = strtol(end + 1, &end, 10);
+            for (long c = lo; c <= hi && c < CPU_SETSIZE; ++c) CPU_SET((int)c, reserved);
+            s = *end == ',' ? end + 1 : end;
+            if (*s == '\n') break;
+        }
+    }
+    fclose(fp);
+}
+
 static void confine_master_threads(arms_t *a)
 {
-    cpu_set_t set;
+    cpu_set_t set, reserved;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     int moved = 0, failed = 0, err = 0;
     DIR *dir;
     struct dirent *de;
 
     if (a->rt_cpu < 0 && a->cfg.irq_cpu < 0) return;
+    CPU_ZERO(&reserved);
+    reserve_core(&reserved, a->rt_cpu);
+    reserve_core(&reserved, a->cfg.irq_cpu);
     CPU_ZERO(&set);
     for (long c = 0; c < ncpu && c < CPU_SETSIZE; ++c)
-        if (c != a->rt_cpu && c != a->cfg.irq_cpu) CPU_SET((int)c, &set);
+        if (!CPU_ISSET((int)c, &reserved)) CPU_SET((int)c, &set);
     if (CPU_COUNT(&set) == 0) return;
     dir = opendir("/proc");
     if (!dir) return;
@@ -1300,7 +1328,7 @@ static void confine_master_threads(arms_t *a)
     }
     closedir(dir);
     if (failed) logf_(a, "警告: %d 个 EtherLab 内核线程未能限制 CPU: %s", failed, strerror(err));
-    else if (moved) logf_(a, "EtherLab 内核线程 %d 个，已限制在实时 CPU 和中断 CPU 以外", moved);
+    else if (moved) logf_(a, "EtherLab 内核线程 %d 个，已限制在保留 CPU 以外", moved);
 }
 
 static arms_status start_rt(arms_t *a)
