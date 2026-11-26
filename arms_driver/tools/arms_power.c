@@ -34,12 +34,12 @@ int main(int argc, char **argv)
     }
     /* 非 root 运行时 SDK 会以当前用户创建 /tmp/bxi_pci.lock，之后 root 因 fs.protected_regular 无法打开该文件 */
     if (geteuid() != 0) {
-        fprintf(stderr, "需要 root: sudo %s %s
-", argv[0], op);
+        fprintf(stderr, "需要 root: sudo %s %s\n", argv[0], op);
         return 1;
     }
     if (bxi_pci_init(ignore_can, NULL, -1) == -1) {
-        fprintf(stderr, "bxi_pci_init 失败：需要 root，或 PCI 正被其他程序占用（arms_test、arms_node、motor_console 等）\n");
+        fprintf(stderr, "bxi_pci_init 失败：PCI 正被其他程序占用（arms_test、arms_node、motor_console 等），"
+                        "或 /tmp/bxi_pci.lock 属于其他用户\n");
         return 1;
     }
     if (!strcmp(op, "on")) {
