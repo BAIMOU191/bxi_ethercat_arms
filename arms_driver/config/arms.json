@@ -1,13 +1,13 @@
 {
   "version": 1,
   "cycle_hz": 1000,
-  "realtime": { "mode": "standalone", "rt_cpu": 3, "irq_cpu": 3, "priority": 80, "softirq_priority": 70 },
+  "realtime": { "mode": "standalone", "rt_cpu": 6, "irq_cpu": 4, "priority": 80, "softirq_priority": 70 },
   "safety": {
     "wkc_tolerance": 3,
     "command_timeout_ms": 50,
     "timeout_action": "hold",
     "check_motors": true,
-    "ignore_mask": "0x00000000",
+    "ignore_mask": "0x1fc00000",
     "offline_action": "power_off",
     "overspeed_ms": 500,
     "overtorque_ms": 100,
@@ -15,8 +15,8 @@
   },
   "drive": { "vendor_id": "0x00010203", "product_code": "0x00000402" },
   "arms": {
-    "left": { "interface": "eth0", "mac": "", "master": null },
-    "right": { "interface": "eth1", "mac": "", "master": null }
+    "left": { "interface": "enp86s0", "mac": "", "master": null },
+    "right": { "interface": "eth_right", "mac": "", "master": null }
   },
   "joint_defaults": { "pos_limit": [-3.0, 3.0], "vel_limit": 3.0, "tor_limit": 30.0 },
   "joints": [

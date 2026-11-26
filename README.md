@@ -1,6 +1,8 @@
 # bxi_ethercat_arms
 
-BXI 双臂 EtherCAT 驱动。RK3588 主控，左右臂共 14 个 KGU 执行器，EtherLab 主站，MIT 模式。
+BXI 双臂 EtherCAT 驱动（x86 分支）。主控为 ASUS NUC 13 Pro（Intel i7-1360P，Ubuntu 22.04），左右臂共 14 个 KGU 执行器，EtherLab 主站，MIT 模式。
+
+当前只接入左臂：左臂使用网口 `enp86s0`；右臂关节 22–28 由 `safety.ignore_mask = 0x1fc00000` 屏蔽，不打开。资源分配见 `docs/resources.md`。
 一个实时线程在同一周期内完成两条臂的收发。
 
 | 目录 | 内容 |
@@ -80,7 +82,7 @@ cmake -S . -B build && cmake --build build -j4
 ctest --test-dir build --output-on-failure
 ```
 
-依赖：EtherLab 1.6（`/usr/local/etherlab`）。aarch64 下链接 `third_party/bxi_pci_drv` 用于电机电源控制。
+依赖：EtherLab 1.6（`/usr/local/etherlab`），`third_party/bxi_pci_drv/x86_64` 中的 BXI PCI SDK 用于电机电源控制。单元测试使用 `tests/mock_arms.json`（双臂、模拟后端），不读取 `config/arms.json`。
 
 不要与 `motor_console`、`hw_lib_test_*` 或其他占用同一主站的程序同时运行。
 
