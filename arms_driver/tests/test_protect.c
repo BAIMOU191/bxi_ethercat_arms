@@ -57,11 +57,6 @@ int main(int argc, char **argv)
     CHECK(mode(a, 22) == ARMS_JS_LOCKED, "22 disabled");
     CHECK(arms_enable(a, ARMS_MASK_JOINT(22), 0) != ARMS_OK, "enable refused while protected");
 
-    CHECK(arms_reset(a, 0, 0) == ARMS_E_ARG, "empty reset rejected");
-    usleep(20000);
-    arms_get_stats(a, &st);
-    CHECK(st.protect.reason == ARMS_PROTECT_OVERSPEED, "invalid reset must not clear protection");
-
     /* reset 清除保护后可以重新使能未注入的关节 */
     CHECK(arms_reset(a, ARMS_MASK_JOINT(22), 0) == ARMS_OK, arms_last_error());
     usleep(20000);

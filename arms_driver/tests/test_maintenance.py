@@ -37,27 +37,25 @@ with tempfile.TemporaryDirectory() as tmp:
     out = run('brake 21 release', 'brake left 1', 'status 15', 'brake all normal',
               'brake right hold', 'status 22', 'brake all 0', 'enable 15')
     assert 'released' in out and 'held' in out, out
-    # 非 normal 期间拒绝使能和零力矩拖动
-    run('brake 21 release', 'enable 22', ok=False)
-    run('brake 21 hold', 'free 22', ok=False)
-    # 同批切换不同伺服状态的关节：只改 Pn075，既不使能 20，也不失能 21。
-    modes = [('release', 'released', 1), ('hold', 'held', 2), ('release', 'released', 1), ('normal', 'locked', 0)]
-    cmds = ['enable 21']
-    for mode, _, _ in modes:
-        cmds += [f'brake 20,21 {mode}', 'status 20,21', 'sdo 21 0x2075 0']
-    lines = run(*cmds).splitlines()
-    states = [(p[0], p[3]) for p in (line.split() for line in lines) if len(p) >= 4 and p[2] in ('L/5', 'L/6')]
-    assert states == [row for _, state, _ in modes for row in [('20', state), ('21', 'enabled')]], states
-    assert [l for l in lines if l.startswith('0x2075:00 =')] == [
-        f'0x2075:00 = {v:02x} 00 ({v})' for _, _, v in modes], lines
-    # 零力矩拖动：kp = 0；kd 不超过上限
+    # 强制松闸 / 强制抱闸时，enable 和 free 先自动切回正常控制抱闸（Pn075=0）
+    out = run('brake 21 release', 'enable 21', 'brake 21')
+    assert '自动切为正常控制' in out and 'normal  (Pn075=0' in out, out
+    out = run('brake 21 hold', 'free 21', 'brake 21')
+    assert '自动切为正常控制' in out and 'normal  (Pn075=0' in out, out
+    # 未选中的关节保持原模式
+    out = run('brake 21 release', 'enable 22', 'brake 21')
+    assert out.count('release (Pn075=1') >= 2 and '自动切为正常控制' not in out, out
+    # 使能中的关节拒绝强制松闸
+    run('enable 21', 'brake 21 release', ok=False)
+    # 零力矩拖动：kp = 0；kd 不设上限，只要求非负有限值
     out = run('free 21 0.2', 'status 21')
     row = next(l.split() for l in out.splitlines() if l.startswith('21 ') and 'L/6' in l)
     assert row[3] == 'enabled' and float(row[11]) == 0.0 and abs(float(row[12]) - 0.2) < 1e-9, row
-    run('free 21 99', ok=False)
+    run('free 21 99')
+    run('free 21 -1', ok=False)
     # 参数读写、保存、硬件校零
     out = run('pn 21 Pn075', 'pn 21 028 12', 'pn 21 28', 'sdo 21 0x2028 0',
-              'pn_save all', 'zero 21 --hw')
+              'pn_save all', 'zero 21')
     assert '(12)' in out, out
     assert '(13)' in run('sdo 21 0x2028 0 13', 'pn 21 28')
     run('zero 21 --bad', ok=False)
@@ -71,19 +69,27 @@ with tempfile.TemporaryDirectory() as tmp:
     assert result.count('已发送参数保存脉冲并回读（Pn097）') == 3 and 'hold    (Pn075=2' in result, result
     run('free 21', 'disable 21', 'pn_save 21')
     assert config.read_bytes() == before_save
-    run('brake 21 hold', 'zero 21 --hw', ok=False)
+    run('brake 21 hold', 'zero 21', ok=False)
     # 无失能反馈时不能校零或改文件；正常的硬件校零则按需失能。
     before = config.read_bytes()
-    for cmd in ('zero 21', 'zero 21 --hw', 'pn_save 21'):
+    for cmd in ('zero 21 --soft', 'zero 21', 'pn_save 21'):
         result = run('free 21', cmd, env={'ARMS_MOCK_STUCK_ENABLED': '1'}, ok=False)
         assert '未确认失能并静止' in result and '已发送参数保存脉冲' not in result, result
     assert config.read_bytes() == before
-    result = run('free 21', 'zero 21 --hw', 'status 21')
+    result = run('free 21', 'zero 21', 'status 21')
     assert any(l.startswith('21 ') and 'locked' in l for l in result.splitlines()), result
+    # 硬件校零：offset_rad 写为 0；重新上电前拒绝使能、拖动和软件校零
+    run('zero 21 --soft')
+    assert next(j for j in json.loads(config.read_text())['joints'] if j['joint'] == 21)['offset_rad'] != 0.0
+    for cmd in ('enable 21', 'free 21', 'zero 21 --soft'):
+        result = run('zero 21', cmd, ok=False)
+        assert '重新上电' in result, result
+    assert next(j for j in json.loads(config.read_text())['joints'] if j['joint'] == 21)['offset_rad'] == 0.0
+    run('zero 21', 'enable 22')
     run('sdo 21 0x6040 0 15', ok=False)
     # 软件校零：立即生效，只改动该关节的 offset_rad，保留其余文本
     before = config.read_text()
-    out = run('free 21', 'zero 21', 'status 21')
+    out = run('free 21', 'zero 21 --soft', 'status 21')
     assert any(l.startswith('21 ') and 'locked' in l for l in out.splitlines()), out
     assert abs(pos(out, 21)) < 1e-3, out
     after = config.read_text()
@@ -93,10 +99,10 @@ with tempfile.TemporaryDirectory() as tmp:
     out = run('status 21')
     assert abs(pos(out, 21)) < 1e-3, out
     # 多关节校零
-    mixed = run('free 15,22', 'zero left', 'status 15,22')
+    mixed = run('free 15,22', 'zero left --soft', 'status 15,22')
     assert any(l.startswith('15 ') and 'locked' in l for l in mixed.splitlines()), mixed
     assert any(l.startswith('22 ') and 'enabled' in l for l in mixed.splitlines()), mixed
-    run('free 21', 'disable 21', 'zero 21')
+    run('free 21', 'disable 21', 'zero 21 --soft')
     data = json.loads(config.read_text())
     assert all(j['offset_rad'] != 0.0 for j in data['joints'] if 15 <= j['joint'] <= 21), data
     # 字段顺序不影响校零，也不允许误改嵌套元数据或相邻关节。
@@ -105,13 +111,13 @@ with tempfile.TemporaryDirectory() as tmp:
     joint['metadata'] = {'joint': 21, 'offset_rad': 17.5}
     joint['joint'] = joint.pop('joint')  # joint 位于对象末尾
     config.write_text(json.dumps(data, indent=2))
-    run('zero 21')
+    run('zero 21 --soft')
     joint['offset_rad'] = 0.7
     assert json.loads(config.read_text()) == data
     joint['joint'] = joint.pop('joint')  # offset_rad 在 joint 之前
     joint['offset_rad'] = -0.25
     config.write_text(json.dumps(data, indent=2))
-    run('zero 21')
+    run('zero 21 --soft')
     joint['offset_rad'] = 0.7
     assert json.loads(config.read_text()) == data
     # SIGTERM 不能退回提示符，即便标准输入保持打开、命令只输入一半。
@@ -120,7 +126,7 @@ with tempfile.TemporaryDirectory() as tmp:
         try:
             seen = b''
             deadline = time.monotonic() + 8
-            while '输入 help 查看命令'.encode() not in seen:
+            while '就绪'.encode() not in seen:
                 assert select.select([proc.stdout], [], [], max(0, deadline - time.monotonic()))[0], seen
                 chunk = os.read(proc.stdout.fileno(), 8192)
                 assert chunk, seen
@@ -139,13 +145,28 @@ with tempfile.TemporaryDirectory() as tmp:
         run(cmd, env={'ARMS_MOCK_PN075_UNREADABLE': '1'}, ok=False)
     # 修改副本中的安全字段类型时，启动必须报配置错误，而不能沿用默认值。
     valid = config.read_text()
-    for parent, field in [(data['joints'][0]['limit'], 'vel'), (data['joints'][0], 'offset_rad'),
-                          (data, 'safety'), (data['joints'][0], 'gain_max')]:
+    for parent, field in [(data['joint_defaults'], 'vel_limit'), (data['joints'][0], 'offset_rad'),
+                          (data, 'safety'), (data['joint_defaults'], 'pos_limit')]:
         previous = parent[field]
         parent[field] = 'bad-type'
         config.write_text(json.dumps(data))
         run('check', ok=False)
         parent[field] = previous
+    config.write_text(valid)
+    # 旧格式字段（limit、gain_max、gain_default、home）直接报错，提示用转换脚本
+    for field, value in [('limit', {'vel': 1.0}), ('gain_max', {'kp': 5}), ('gain_default', {'kp': 5}), ('home', 0.0)]:
+        data['joints'][0][field] = value
+        config.write_text(json.dumps(data))
+        out = run('check', ok=False)
+        assert 'migrate_config.py' in out, out
+        del data['joints'][0][field]
+    # 关节可以单独覆盖 joint_defaults 中的保护参数
+    data['joints'][0]['pos_limit'] = [-1.0, 1.0]
+    data['joints'][0]['tor_limit'] = 12.5
+    config.write_text(json.dumps(data))
+    out = run('info 15')
+    assert '[-1.000, 1.000]' in out and 'tor_limit 12.500' in out, out
+    del data['joints'][0]['pos_limit'], data['joints'][0]['tor_limit']
     config.write_text(valid)
     env={'ARMS_MOCK_SLAVES':'5'}
     run('check',env=env,options=('--check',),ok=False)

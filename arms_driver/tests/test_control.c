@@ -1,4 +1,4 @@
-/* 单元测试：使能、MIT 指令、过渡、限幅、超时、故障与复位（模拟后端，独立模式） */
+/* 单元测试：使能零指令、MIT 指令原样下发、软位置限位、超时、故障与复位（模拟后端，独立模式） */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,71 +48,91 @@ int main(int argc, char **argv)
 
     /* 未使能时不接受指令 */
     cmd.position = 0.0; cmd.velocity = 0.0; cmd.torque = 0.0; cmd.kp = 1.0; cmd.kd = 0.1;
-    CHECK(arms_set_command(a, 17, &cmd, 0.0) == ARMS_E_STATE, "command before enable");
+    CHECK(arms_set_command(a, 17, &cmd) == ARMS_E_STATE, "command before enable");
 
-    /* 使能后保持原位 */
+    /* 使能后零指令：kp=kd=0，速度、前馈为 0 */
     s = rd(a, 17);
     CHECK(arms_enable(a, ARMS_MASK_JOINT(17) | ARMS_MASK_JOINT(28), 0) == ARMS_OK, arms_last_error());
     CHECK(rd(a, 17).mode == ARMS_JS_ENABLED, "17 enabled");
     CHECK(rd(a, 28).mode == ARMS_JS_ENABLED, "28 enabled");
-    CHECK(fabs(rd(a, 17).cmd_position - s.position) < 1e-3, "hold position on enable");
+    usleep(20000);
+    s = rd(a, 17);
+    CHECK(s.cmd_kp == 0.0 && s.cmd_kd == 0.0, "zero gains on enable");
+    CHECK(s.cmd_velocity == 0.0 && s.cmd_torque == 0.0, "zero vel/tff on enable");
     CHECK(rd(a, 22).mode == ARMS_JS_LOCKED, "22 untouched");
 
-    /* 原始 C 接口也走抱闸流程；不能靠 CLI 的参数别名掩盖底层的不同实现。 */
-    arms_brake_mode brake = ARMS_BRAKE_UNKNOWN;
-    const uint8_t hold_pn075[2] = {2, 0};
-    CHECK(arms_pn_write(a, 17, 75, 1) == ARMS_OK, arms_last_error());
-    CHECK(arms_get_brake(a, 17, &brake) == ARMS_OK && brake == ARMS_BRAKE_RELEASE, "Pn075 release");
-    CHECK(arms_sdo_write(a, 17, 0x2075, 0, hold_pn075, sizeof(hold_pn075)) == ARMS_OK, arms_last_error());
-    CHECK(arms_get_brake(a, 17, &brake) == ARMS_OK && brake == ARMS_BRAKE_HOLD, "SDO brake hold");
-    CHECK(arms_set_brake(a, 17, ARMS_BRAKE_NORMAL) == ARMS_OK, arms_last_error());
-    CHECK(rd(a, 17).mode == ARMS_JS_ENABLED, "changing Pn075 did not disable servo");
-
-    /* 关节 21 的模拟初始位置 0.7 在限位 0.5 之外：使能后保持原位，不被拉回 */
-    s = rd(a, 21);
-    CHECK(arms_enable(a, ARMS_MASK_JOINT(21), 0) == ARMS_OK, arms_last_error());
-    usleep(20000);
-    CHECK(fabs(rd(a, 21).cmd_position - s.position) < 1e-3, "out-of-range joint holds in place");
-    CHECK(!rd(a, 21).cmd_limited, "out-of-range hold not limited");
-
-    /* 带过渡的位置指令 */
+    /* 位置指令下一周期原样生效，不做插值 */
     CHECK(arms_get_limits(a, 17, &lim) == ARMS_OK, "limits");
-    cmd.position = 0.2;
-    CHECK(arms_set_command(a, 17, &cmd, 0.3) == ARMS_OK, arms_last_error());
-    usleep(100000);
+    CHECK(lim.pos_limit_min < 0.0 && lim.pos_limit_max > 0.0 && lim.vel_limit > 0.0 && lim.tor_limit > 0.0,
+          "limits from joint_defaults");
+    cmd.position = 0.2; cmd.velocity = 0.0; cmd.torque = 0.0; cmd.kp = 1.0; cmd.kd = 0.1;
+    CHECK(arms_set_command(a, 17, &cmd) == ARMS_OK, arms_last_error());
+    usleep(10000);
     s = rd(a, 17);
-    CHECK(s.cmd_moving, "moving");
-    arms_reset_stats(a);
-    usleep(15000);
-    CHECK(rd(a, 17).cmd_moving, "resetting statistics must not finish a move");
-    usleep(400000);
+    CHECK(fabs(s.cmd_position - 0.2) < 1e-6, "target applied immediately");
+    usleep(500000);
     s = rd(a, 17);
-    CHECK(!s.cmd_moving, "move finished");
-    CHECK(fabs(s.cmd_position - 0.2) < 1e-6, "move target");
     CHECK(fabs(s.position - 0.2) < 0.02, "mock follows");
 
-    /* 限幅 */
-    cmd.position = lim.pos_max + 1.0;
-    cmd.kp = lim.kp_max * 10.0;
-    CHECK(arms_set_command(a, 17, &cmd, 0.0) == ARMS_OK, arms_last_error());
-    usleep(20000);
+    /* 不截断：超出软限位的目标和很大的增益原样下发 */
+    cmd.position = lim.pos_limit_max + 1.0;
+    cmd.kp = 500.0;
+    cmd.kd = 0.5;
+    CHECK(arms_set_command(a, 17, &cmd) == ARMS_OK, arms_last_error());
+    usleep(10000);
     s = rd(a, 17);
-    CHECK(s.cmd_limited, "limited flag");
-    CHECK(fabs(s.cmd_position - lim.pos_max) < 1e-6, "pos clamped");
-    CHECK(fabs(s.cmd_kp - lim.kp_max) < 1e-6, "kp clamped");
+    CHECK(fabs(s.cmd_position - cmd.position) < 1e-6, "pos not clamped");
+    CHECK(fabs(s.cmd_kp - 500.0) < 1e-6, "kp not clamped");
 
-    /* 无效指令 */
-    cmd.position = NAN;
-    CHECK(arms_set_command(a, 17, &cmd, 0.0) == ARMS_E_ARG, "nan rejected");
-    cmd.position = 0.0;
+    /* kp、kd 为负或 NaN 时按 0 下发 */
+    cmd.position = 0.2;
     cmd.kp = -1.0;
-    CHECK(arms_set_command(a, 17, &cmd, 0.0) == ARMS_E_ARG, "negative kp rejected");
+    cmd.kd = NAN;
+    CHECK(arms_set_command(a, 17, &cmd) == ARMS_OK, "negative kp / nan kd accepted");
+    usleep(10000);
+    s = rd(a, 17);
+    CHECK(s.cmd_kp == 0.0 && s.cmd_kd == 0.0, "negative / nan gains sent as 0");
 
-    /* 超时：速度与前馈清零 */
-    cmd.kp = 1.0;
+    /* 位置、速度、前馈必须为有限值 */
+    cmd.position = NAN;
+    CHECK(arms_set_command(a, 17, &cmd) == ARMS_E_ARG, "nan position rejected");
+    cmd.position = 0.0;
+    cmd.torque = INFINITY;
+    CHECK(arms_set_command(a, 17, &cmd) == ARMS_E_ARG, "inf torque rejected");
+    cmd.torque = 0.0;
+
+    /* 软位置限位：越过上限后屏蔽正向速度和前馈，反向不受影响 */
+    cmd.position = lim.pos_limit_max + 0.5;
     cmd.velocity = 0.1;
     cmd.torque = 0.2;
-    CHECK(arms_set_command(a, 17, &cmd, 0.0) == ARMS_OK, arms_last_error());
+    cmd.kp = 5.0;
+    cmd.kd = 0.1;
+    for (j = 0; j < 300 && rd(a, 17).position <= lim.pos_limit_max + 0.05; ++j) {
+        arms_set_command(a, 17, &cmd);
+        usleep(10000);
+    }
+    arms_set_command(a, 17, &cmd);
+    usleep(10000);
+    s = rd(a, 17);
+    CHECK(s.position > lim.pos_limit_max, "moved past soft limit");
+    CHECK(s.cmd_pos_blocked, "blocked flag");
+    CHECK(s.cmd_velocity == 0.0 && s.cmd_torque == 0.0, "outward vel/tff blocked");
+    CHECK(fabs(s.cmd_position - cmd.position) < 1e-6, "position still passed through");
+    cmd.velocity = -0.1;
+    cmd.torque = -0.2;
+    arms_set_command(a, 17, &cmd);
+    usleep(10000);
+    s = rd(a, 17);
+    CHECK(!s.cmd_pos_blocked, "inward command not blocked");
+    CHECK(fabs(s.cmd_velocity + 0.1) < 1e-6 && fabs(s.cmd_torque + 0.2) < 1e-6, "inward vel/tff passed");
+
+    /* 超时：速度与前馈清零 */
+    cmd.position = 0.2;
+    cmd.kp = 1.0;
+    cmd.kd = 0.1;
+    cmd.velocity = 0.1;
+    cmd.torque = 0.2;
+    CHECK(arms_set_command(a, 17, &cmd) == ARMS_OK, arms_last_error());
     usleep(10000);
     CHECK(fabs(rd(a, 17).cmd_velocity - 0.1) < 1e-6, "velocity applied");
     usleep(200000);
@@ -133,8 +153,6 @@ int main(int argc, char **argv)
     CHECK(s.mode == ARMS_JS_FAULT, "fault detected");
     CHECK(s.fault_count == 1, "fault counted");
     CHECK(s.error_code != 0, "error code");
-    CHECK(arms_set_brake(a, 15, ARMS_BRAKE_RELEASE) == ARMS_E_STATE, "forced release refused while faulted");
-    CHECK(arms_set_brake(a, 15, ARMS_BRAKE_HOLD) == ARMS_E_STATE, "forced hold refused while faulted");
     CHECK(arms_enable(a, ARMS_MASK_JOINT(15), 0) == ARMS_E_STATE, "enable refused while faulted");
     CHECK(arms_reset(a, ARMS_MASK_JOINT(15), 0) == ARMS_OK, arms_last_error());
     CHECK(rd(a, 15).mode == ARMS_JS_LOCKED, "locked after reset");

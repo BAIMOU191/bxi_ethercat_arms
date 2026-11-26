@@ -51,7 +51,15 @@ struct bus {
     unsigned int out_off[BUS_MAX_SLAVES];
     unsigned int in_off[BUS_MAX_SLAVES];
     ec_domain_state_t domain_state;
+    /* 异步请求：ESC 错误计数寄存器、监控量选择（Pn002）和读取（0x3000） */
+    ec_reg_request_t *esc_req[BUS_MAX_SLAVES];
+    bool esc_reading[BUS_MAX_SLAVES];
+    ec_sdo_request_t *mon_sel[BUS_MAX_SLAVES], *mon_val[BUS_MAX_SLAVES];
+    bool mon_reading[BUS_MAX_SLAVES];
 };
+
+#define MONITOR_SDO_TIMEOUT_MS 500u
+#define EMERGENCY_RING 8u
 
 static uint64_t mono_ns(void)
 {
@@ -93,7 +101,7 @@ static int resolve_master(const bus_open_params *p, char *err, size_t err_size)
         return -1;
     }
     if (!read_line("/sys/module/ec_master/parameters/main_devices", devices, sizeof(devices))) {
-        snprintf(err, err_size, "EtherLab 主站模块未加载（/sys/module/ec_master 不存在）；请先启动 ethercat 服务");
+        snprintf(err, err_size, "EtherLab 主站模块未加载（/sys/module/ec_master 不存在）");
         return -1;
     }
     for (tok = strtok_r(devices, ", \t", &save); tok; tok = strtok_r(NULL, ", \t", &save), ++index)
@@ -251,6 +259,13 @@ static int el_configure(bus_t *b, const int *positions, int n, char *err, size_t
             snprintf(err, err_size, "slave %d DC Sync0 配置失败: %s", positions[i], strerror(-ret));
             return -1;
         }
+        /* 诊断用的异步请求和紧急报文缓冲；创建失败时仅停用诊断 */
+        b->esc_req[i] = ecrt_slave_config_create_reg_request(b->sc[i], ESC_ERR_BYTES);
+        b->mon_sel[i] = ecrt_slave_config_create_sdo_request(b->sc[i], KGU_OBJ_MONITOR_SELECT, 0, 2);
+        b->mon_val[i] = ecrt_slave_config_create_sdo_request(b->sc[i], KGU_OBJ_MONITOR_VALUE, 0, 4);
+        if (b->mon_sel[i]) ecrt_sdo_request_timeout(b->mon_sel[i], MONITOR_SDO_TIMEOUT_MS);
+        if (b->mon_val[i]) ecrt_sdo_request_timeout(b->mon_val[i], MONITOR_SDO_TIMEOUT_MS);
+        ecrt_slave_config_emerg_size(b->sc[i], EMERGENCY_RING);
         if (ref < 0 || positions[i] < positions[ref]) ref = i;
     }
     ret = ecrt_master_select_reference_clock(b->master, b->sc[ref]);
@@ -306,8 +321,8 @@ static void el_update_states(bus_t *b, uint8_t *al, bool *link_up)
     for (i = 0; i < b->count; ++i) {
         ec_slave_config_state_t st;
         memset(&st, 0, sizeof(st));
-        /* 查询失败时不能把上次的 OP 当成本次在线反馈。 */
-        al[i] = ecrt_slave_config_state(b->sc[i], &st) == 0 && st.online ? (uint8_t)st.al_state : 0;
+        if (ecrt_slave_config_state(b->sc[i], &st) == 0)
+            al[i] = st.online ? (uint8_t)st.al_state : 0;
     }
     memset(&ms, 0, sizeof(ms));
     ecrt_master_state(b->master, &ms);
@@ -333,7 +348,79 @@ static int el_sdo(bus_t *b, int slave, uint16_t index, uint8_t sub, uint8_t *dat
     return ecrt_master_sdo_upload(b->master, slave, index, sub, data, cap, n, abort);
 }
 
+static int req_state(ec_request_state_t s)
+{
+    switch (s) {
+    case EC_REQUEST_BUSY: return BUS_REQ_BUSY;
+    case EC_REQUEST_SUCCESS: return BUS_REQ_DONE;
+    case EC_REQUEST_ERROR: return BUS_REQ_ERROR;
+    default: return BUS_REQ_IDLE;
+    }
+}
+
+static int el_esc_read(bus_t *b, int i)
+{
+    if (!b->esc_req[i] || ecrt_reg_request_state(b->esc_req[i]) == EC_REQUEST_BUSY) return -1;
+    b->esc_reading[i] = true;
+    return ecrt_reg_request_read(b->esc_req[i], ESC_ERR_ADDR, ESC_ERR_BYTES);
+}
+
+static int el_esc_clear(bus_t *b, int i)
+{
+    if (!b->esc_req[i] || ecrt_reg_request_state(b->esc_req[i]) == EC_REQUEST_BUSY) return -1;
+    memset(ecrt_reg_request_data(b->esc_req[i]), 0, ESC_ERR_BYTES);
+    b->esc_reading[i] = false;
+    return ecrt_reg_request_write(b->esc_req[i], ESC_ERR_ADDR, ESC_ERR_BYTES);
+}
+
+static int el_esc_state(bus_t *b, int i, uint8_t *out)
+{
+    int s;
+    if (!b->esc_req[i]) return BUS_REQ_ERROR;
+    s = req_state(ecrt_reg_request_state(b->esc_req[i]));
+    if (s == BUS_REQ_DONE && b->esc_reading[i] && out) memcpy(out, ecrt_reg_request_data(b->esc_req[i]), ESC_ERR_BYTES);
+    return s;
+}
+
+static int el_monitor_select(bus_t *b, int i, uint16_t code)
+{
+    if (!b->mon_sel[i] || ecrt_sdo_request_state(b->mon_sel[i]) == EC_REQUEST_BUSY) return -1;
+    kgu_put_u16(ecrt_sdo_request_data(b->mon_sel[i]), 0, code);
+    b->mon_reading[i] = false;
+    return ecrt_sdo_request_write(b->mon_sel[i]);
+}
+
+static int el_monitor_read(bus_t *b, int i)
+{
+    if (!b->mon_val[i] || ecrt_sdo_request_state(b->mon_val[i]) == EC_REQUEST_BUSY) return -1;
+    b->mon_reading[i] = true;
+    return ecrt_sdo_request_read(b->mon_val[i]);
+}
+
+static int el_monitor_state(bus_t *b, int i, int32_t *value)
+{
+    ec_sdo_request_t *r = b->mon_reading[i] ? b->mon_val[i] : b->mon_sel[i];
+    int s;
+    if (!r) return BUS_REQ_ERROR;
+    s = req_state(ecrt_sdo_request_state(r));
+    if (s == BUS_REQ_DONE && b->mon_reading[i] && value) {
+        const uint8_t *d = ecrt_sdo_request_data(r);
+        if (ecrt_sdo_request_data_size(r) < 4) return BUS_REQ_ERROR;
+        *value = (int32_t)((uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24));
+    }
+    return s;
+}
+
+static int el_emerg_pop(bus_t *b, int i, uint8_t *msg)
+{
+    int ret = ecrt_slave_config_emerg_pop(b->sc[i], msg);
+    if (ret == 0) return 1;
+    return ret == -ENOENT ? 0 : ret;
+}
+
 const bus_ops bus_etherlab_ops = {
-    "etherlab", el_open,    el_scan,          el_configure,    el_activate,     el_receive, el_send,
-    el_inputs,  el_outputs, el_update_states, el_expected_wkc, el_master_index, el_close,   el_sdo,
+    "etherlab",       el_open,         el_scan,          el_configure,     el_activate,        el_receive,
+    el_send,          el_inputs,       el_outputs,       el_update_states, el_expected_wkc,    el_master_index,
+    el_close,         el_sdo,          el_esc_read,      el_esc_clear,     el_esc_state,       el_monitor_select,
+    el_monitor_read,  el_monitor_state, el_emerg_pop,
 };

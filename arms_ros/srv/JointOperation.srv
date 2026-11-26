@@ -1,7 +1,9 @@
 # Mask of opened joints (bits 15..28). selftest ignores this field.
 # brake_* and zero process each selected joint; a failure does not undo earlier joints.
 uint32 joints
-bool hardware_zero
+bool confirm
+# zero: false = hardware zero (Pn101, default), true = software zero (offset_rad)
+bool soft_zero
 ---
 bool success
 string message

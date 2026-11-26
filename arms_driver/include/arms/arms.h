@@ -90,6 +90,7 @@ typedef struct {
     int64_t ignore_mask;          /**< 屏蔽掩码，第 n 位对应关节 n，屏蔽的关节不打开、不检查；-1 取配置 */
     arms_log_fn log;              /**< 启动过程日志 */
     void *log_user;
+    const char *event_log;        /**< 通信事件日志文件；NULL 表示配置目录旁的 logs/comm_events.log */
 } arms_options;
 
 /** @brief 填充 arms_options 默认值 */
@@ -102,10 +103,10 @@ typedef enum {
     ARMS_JS_PREOP,
     ARMS_JS_SAFEOP,
     ARMS_JS_LOCKED,     /**< OP，伺服失能 */
-    ARMS_JS_RELEASED,   /**< OP，伺服失能，抱闸强制松开 */
+    ARMS_JS_RELEASED,   /**< OP，伺服失能，强制松闸（Pn075=1） */
     ARMS_JS_ENABLED,    /**< OP，伺服使能 */
     ARMS_JS_FAULT,      /**< 驱动器故障或 AL 错误 */
-    ARMS_JS_HELD,       /**< OP，伺服失能，抱闸强制锁闸（Pn075=2） */
+    ARMS_JS_HELD,       /**< OP，伺服失能，强制抱闸（Pn075=2） */
 } arms_joint_mode;
 
 /** @brief 关节状态名称 */
@@ -127,16 +128,26 @@ typedef struct {
     double torque;          /**< 输出端力矩 [N.m] */
     uint64_t sample_ns;     /**< 采样时刻，CLOCK_MONOTONIC */
 
-    /* 本周期实际下发的指令（关节侧，已限幅） */
+    /* 本周期实际下发的指令（关节侧） */
     double cmd_position;    /**< [rad] */
     double cmd_velocity;    /**< [rad/s] */
     double cmd_torque;      /**< 前馈力矩 [N.m] */
     double cmd_kp;
     double cmd_kd;
-    bool cmd_moving;        /**< 正在执行带过渡时间的指令 */
-    bool cmd_limited;       /**< 本周期指令被限幅 */
+    bool cmd_pos_blocked;   /**< 实际位置超出软位置限位，本周期朝外的速度和前馈已清零 */
     bool cmd_timeout;       /**< 指令超时，已按 safety.timeout_action 处理 */
     uint32_t fault_count;   /**< 打开以来进入故障的次数 */
+
+    /* 驱动器监控（safety.drive_monitor），由周期上下文用异步请求轮流读取，每个关节约每秒更新一次 */
+    double temperature;     /**< 执行器温度 [℃]（Pn002=77 的监控量），NaN 表示尚未读到 */
+    int32_t drive_frame_loss; /**< 驱动器自报的 EtherCAT 丢帧次数（Pn002=63，上电清零），-1 表示尚未读到 */
+    bool esc_valid;         /**< esc_errors 已读到 */
+    /**
+     * ESC 错误计数寄存器 0x0300..0x0313 的最近读数，自上次清零起累计，达到 255 后不再增加：
+     * [0]/[2] 端口 0/1 无效帧，[1]/[3] 端口 0/1 物理层错误，[8]/[9] 端口 0/1 转发错误，
+     * [12] 处理单元错误，[13] PDI 错误，[16]/[17] 端口 0/1 链路丢失（端口 0 接主站一侧，端口 1 接下一个从站）
+     */
+    uint8_t esc_errors[20];
 } arms_joint_state;
 
 /** 周期间隔统计 [us] */
@@ -159,7 +170,7 @@ typedef struct {
     uint64_t wkc_bad;                /**< WKC 不符的周期数 */
     uint32_t wkc_bad_consecutive_max;
     uint64_t send_errors;
-    bool comm_failed;                /**< 连续异常达到 safety.wkc_tolerance，恢复稳定后自动清除 */
+    bool comm_failed;                /**< 连续异常超过 safety.wkc_tolerance，恢复稳定后自动清除 */
     uint32_t comm_drops;             /**< 通信失败次数 */
     uint32_t comm_recoveries;        /**< 自动恢复次数 */
     double recv_us_max;
@@ -169,18 +180,19 @@ typedef struct {
 /** 保护原因 */
 typedef enum {
     ARMS_PROTECT_NONE = 0,
-    ARMS_PROTECT_OVERSPEED,  /**< 反馈速度超过 limit.vel_fault 累计 safety.overspeed_ms */
-    ARMS_PROTECT_OVERTORQUE, /**< 反馈力矩超过 limit.torque_fault 累计 safety.overtorque_ms */
+    ARMS_PROTECT_OVERSPEED,  /**< 反馈速度超过 vel_limit 累计 safety.overspeed_ms */
+    ARMS_PROTECT_OVERTORQUE, /**< 反馈力矩超过 tor_limit 累计 safety.overtorque_ms */
+    ARMS_PROTECT_OVERTEMP,   /**< 执行器温度达到 safety.temp_max_c */
 } arms_protect_reason;
 
 /**
- * 超速/超力矩保护：任一使能关节触发后，全部关节失能并锁定，
- * 拒绝使能，直到 arms_reset() 清除。
+ * 超速/超力矩/过温保护：任一关节触发后，全部关节失能并锁定，
+ * 拒绝使能，直到 arms_reset() 清除（过温时若温度仍不低于阈值会再次触发）。
  */
 typedef struct {
     arms_protect_reason reason;
     int joint;        /**< 触发关节，无则 -1 */
-    double value;     /**< 触发时的反馈速度 [rad/s] 或力矩 [N.m] */
+    double value;     /**< 触发时的反馈速度 [rad/s]、力矩 [N.m] 或温度 [℃] */
     double limit;     /**< 对应阈值 */
 } arms_protect;
 
@@ -253,6 +265,26 @@ arms_status arms_get_stats(arms_t *arms, arms_bus_stats *stats);
 /** @brief 清零通信统计（下一周期生效） */
 void arms_reset_stats(arms_t *arms);
 
+/**
+ * @brief 把周期上下文记录的通信事件追加到日志文件
+ *
+ * 在非实时线程中周期调用（周期 100 ms 量级），退出前再调用一次。记录的事件：
+ * WKC 异常（每臂每秒最多一条，其余计入下一条的“限速期间另有”）、通信失败、通信恢复、
+ * 周期延迟（两次周期开始间隔超过 1.5 个周期，每秒最多一条）、离线保护触发、
+ * ESC 错误计数增加和驱动器自报丢帧增加（每臂每秒最多一条）、温度告警、过温保护，
+ * 以及驱动器发出的 CoE 紧急报文（本函数调用时取出）。
+ * 通信类事件附带此前最近 64 个周期的时序（周期间隔、唤醒延迟、发送结束到接收的间隔、
+ * 处理耗时、两臂 WKC），以及两臂链路、WKC 计数、各从站 AL 状态、错误计数、温度和驱动器丢帧次数。
+ * @return 本次写入的事件数；无法写入时返回 -1，arms_last_error() 说明原因
+ */
+int arms_log_events(arms_t *arms);
+
+/** @brief 请求清零全部从站的 ESC 错误计数，由周期上下文在下一轮轮询时写入 */
+void arms_clear_esc_counters(arms_t *arms);
+
+/** @brief 通信事件日志文件路径（无法写入原路径时会改用 /tmp/arms_comm_events.log） */
+const char *arms_event_log_path(const arms_t *arms);
+
 unsigned int arms_cycle_hz(const arms_t *arms);
 arms_run_mode arms_mode(const arms_t *arms);
 int arms_rt_cpu(const arms_t *arms);
@@ -289,16 +321,15 @@ int arms_joint_by_name(const arms_t *arms, const char *name);
 /** @brief 臂名称 "left" / "right" */
 const char *arms_arm_name(int arm);
 
-/** 关节限位与默认增益（关节侧） */
+/**
+ * 关节限位（关节侧）。均依据反馈判断，不截断指令：
+ * 实际位置超出 pos_limit 时，朝越界方向的速度和前馈置 0（软位置限位）；
+ * 实际速度、力矩持续超过 vel_limit、tor_limit 时触发超速、超力矩保护。
+ */
 typedef struct {
-    double pos_min, pos_max;  /**< [rad] */
-    double vel_max;           /**< [rad/s] */
-    double tff_max;           /**< [N.m] */
-    double kp_max, kd_max;
-    double kp_default, kd_default;
-    double home;              /**< 回零位置 [rad] */
-    double vel_fault;         /**< 反馈速度保护阈值 [rad/s] */
-    double torque_fault;      /**< 反馈力矩保护阈值 [N.m] */
+    double pos_limit_min, pos_limit_max; /**< [rad] */
+    double vel_limit;                    /**< [rad/s] */
+    double tor_limit;                    /**< [N.m] */
 } arms_joint_limits;
 
 /** @brief 读取关节限位，关节未打开时返回 ARMS_E_ARG */
@@ -309,8 +340,9 @@ arms_status arms_get_limits(const arms_t *arms, int joint, arms_joint_limits *li
  * @param joints 关节掩码，只作用于已打开的关节
  * @param timeout_ms 等待全部关节进入使能的超时，0 表示 1000 ms
  *
- * 使能时目标位置取当前实际位置，增益为 gain_default，因此关节保持原位。
+ * 使能后指令为零：目标位置取当前实际位置，kp、kd、速度、前馈均为 0。
  * 已使能的关节不受影响。处于故障的关节需先 arms_reset()。
+ * 所选关节的 Pn075 为 1 或 2 时，先写为 0 并回读确认，不保存；写入或回读失败时拒绝使能。
  * 超时或失败时，本次请求中未完成的关节回到失能。
  */
 arms_status arms_enable(arms_t *arms, arms_mask joints, unsigned int timeout_ms);
@@ -336,39 +368,38 @@ typedef struct {
 } arms_command;
 
 /**
- * @brief 写入单个关节的 MIT 指令，下一周期生效
- * @param move_s 过渡时间 [s]。0 表示立即生效；大于 0 时目标位置从当前指令位置
- *               按余弦曲线过渡，期间速度与前馈为 0，增益立即生效
+ * @brief 写入单个关节的 MIT 指令，下一周期原样生效
  *
- * 只对已使能的关节有效。各量在周期内按 limit / gain_max 限幅。
- * 调用方需在 safety.command_timeout_ms 内持续刷新，否则按 safety.timeout_action 处理；
- * 过渡期间不计超时。可在任意非实时线程调用。
+ * 不做轨迹插值和限幅，位置、速度、前馈原样下发；kp、kd 为负或 NaN 时按 0 下发。
+ * 实际位置超出软位置限位时，朝越界方向的速度和前馈置 0。
+ * 位置、速度、前馈必须为有限值，否则返回 ARMS_E_ARG。
+ * 只对已使能的关节有效。调用方需在 safety.command_timeout_ms 内持续刷新，否则按
+ * safety.timeout_action 处理。可在任意非实时线程调用。
  */
-arms_status arms_set_command(arms_t *arms, int joint, const arms_command *command, double move_s);
+arms_status arms_set_command(arms_t *arms, int joint, const arms_command *command);
 
 /** @brief 关节保持当前指令位置：速度与前馈清零，增益不变 */
 arms_status arms_hold(arms_t *arms, arms_mask joints);
 
 /**
  * @brief 零力矩拖动：使能关节（已使能的保持使能），下发 kp = 0、速度 0、前馈 0、阻尼 kd
- * @param kd 阻尼，0 表示完全自由，须不超过 gain_max.kd
+ * @param kd 阻尼，0 表示完全自由，须为非负有限值
  *
- * 关节没有保持力，会受重力下落。先支撑关节再失能；arms_hold() 保留 kp=0，不会恢复位置保持力。
- * 有关节的抱闸不是正常控制模式时拒绝执行。
+ * 抱闸模式处理同 arms_enable()。
  */
 arms_status arms_free(arms_t *arms, arms_mask joints, double kd);
 
 /*
  * 维护接口：只能在同一个非实时管理线程中调用（内部使用阻塞的 SDO 访问）。
- * 写操作要求该关节所在臂通信正常，其余条件见各接口。
+ * 写操作要求该关节所在臂通信正常、confirmed 为 true，其余条件见各接口。
  */
 
-/** 抱闸模式（Pn075） */
+/** 抱闸模式（Pn075），取值与 KGU 模组说明一致 */
 typedef enum {
-    ARMS_BRAKE_UNKNOWN = -1, /**< 未读取或读取失败 */
-    ARMS_BRAKE_NORMAL = 0,   /**< 正常控制：使能时松闸，失能时抱闸 */
-    ARMS_BRAKE_RELEASE = 1,  /**< 强制松闸 */
-    ARMS_BRAKE_HOLD = 2,     /**< 强制抱闸 */
+    ARMS_BRAKE_UNKNOWN = -1, /**< 未读取或读取失败（非 Pn075 取值） */
+    ARMS_BRAKE_NORMAL = 0,   /**< 0：正常控制抱闸，伺服使能时松闸，失能时抱闸 */
+    ARMS_BRAKE_RELEASE = 1,  /**< 1：强制松闸，与伺服状态无关 */
+    ARMS_BRAKE_HOLD = 2,     /**< 2：强制抱闸，与伺服状态无关 */
 } arms_brake_mode;
 
 /** @brief 抱闸模式名称 normal / release / hold / unknown */
@@ -377,12 +408,11 @@ const char *arms_brake_mode_name(arms_brake_mode mode);
 /**
  * @brief 临时设置抱闸模式（写 Pn075 并回读，不保存到驱动器）
  *
- * 三种模式均可在使能或失能时切换，不切换伺服状态，也不撤销运动目标。需在线且反馈新鲜；
- * 故障、保护或伺服过渡态不能写强制模式。切换前停止运动并支撑负载。
- * 任一已打开关节不是 NORMAL 或无法确认模式时，arms_enable() 和 arms_free() 被拒绝。
+ * RELEASE / HOLD 要求该关节失能；NORMAL 不要求失能，但仍要求有效通信和明确确认。
+ * 之后对该关节调用 arms_enable() 或 arms_free() 会自动将其切回 NORMAL。
  * arms_close() 尝试将本次会话改动过的关节恢复为 NORMAL，不保证机械抱闸已闭合。
  */
-arms_status arms_set_brake(arms_t *arms, int joint, arms_brake_mode mode);
+arms_status arms_set_brake(arms_t *arms, int joint, arms_brake_mode mode, bool confirmed);
 
 /** @brief 读取单个关节的 Pn075 并更新内部记录 */
 arms_status arms_get_brake(arms_t *arms, int joint, arms_brake_mode *mode);
@@ -399,13 +429,15 @@ arms_status arms_brake_scan(arms_t *arms, arms_mask *released, arms_mask *held, 
 
 /** 维护操作 */
 typedef enum {
-    ARMS_ZERO_SOFT, /**< 以当前位置为零点：写入配置 offset_rad 并立即生效；要求关节失能、静止 */
-    ARMS_ZERO_HW,   /**< Pn101 清零脉冲，驱动器重新上电后生效；要求关节失能、静止、抱闸为正常模式 */
+    ARMS_ZERO_SOFT, /**< 软件校零：以当前位置为零点写入配置 offset_rad 并立即生效；要求关节失能、静止 */
+    ARMS_ZERO_HW,   /**< 硬件校零：Pn101 清零脉冲，驱动器重新上电后生效；要求关节失能、静止、抱闸为正常模式。
+                         成功后配置中的 offset_rad 立即写为 0；运行中的偏置保持原值，直到该臂通信中断
+                         （驱动器断电）时切换为 0。期间该关节拒绝 enable、free 和软件校零。 */
     ARMS_SAVE,      /**< Pn097 参数保存脉冲；不检查或更改抱闸模式 */
 } arms_service_op;
 
 /** @brief 执行维护操作（单个关节；多个关节由调用方逐个调用）。校零和参数保存均按需失能并等待静止，操作后不重新使能。 */
-arms_status arms_service(arms_t *arms, int joint, arms_service_op op);
+arms_status arms_service(arms_t *arms, int joint, arms_service_op op, bool confirmed);
 
 /** @brief 读取对象字典 */
 arms_status arms_sdo_read(arms_t *arms, int joint, uint16_t index, uint8_t sub, uint8_t *out, size_t cap,
@@ -415,9 +447,9 @@ arms_status arms_sdo_read(arms_t *arms, int joint, uint16_t index, uint8_t sub, 
  * 普通写需在线且失能，不抢写运行中的 PDO；成功指从站接受下载，不代表已回读或掉电保存。
  * Pn075/097/101（子索引 0）沿用专用动作及反馈检查。 */
 arms_status arms_sdo_write(arms_t *arms, int joint, uint16_t index, uint8_t sub, const uint8_t *data,
-                           size_t size);
+                           size_t size, bool confirmed);
 /** @brief Pn000..999 的 INT16 简写，与 arms_sdo_write 的语义相同。 */
-arms_status arms_pn_write(arms_t *arms, int joint, unsigned number, int value);
+arms_status arms_pn_write(arms_t *arms, int joint, unsigned number, int value, bool confirmed);
 
 /** @brief Pn 参数号对应的对象字典索引（Pn075 → 0x2075），无效返回 -1 */
 int arms_pn_index(unsigned number);
@@ -428,16 +460,13 @@ typedef struct {
     double offset_rad; /**< 零位偏置 */
 } arms_joint_info;
 
+/** @brief 已硬件校零、等待驱动器重新上电的关节 */
+arms_mask arms_zero_pending(const arms_t *arms);
+
 /** @brief 读取关节的方向与零位偏置 */
 arms_status arms_get_joint_info(const arms_t *arms, int joint, arms_joint_info *info);
 /** @brief 版本字符串 */
 const char *arms_version(void);
-
-/** @brief 该驱动支持的周期频率。 */
-bool arms_cycle_hz_supported(unsigned int hz);
-
-/** @brief 查找可读配置：环境变量、/etc/bxi、工作目录、可执行文件附近及安装的 share 目录。 */
-bool arms_config_default_path(char *out, size_t size);
 
 #ifdef __cplusplus
 }

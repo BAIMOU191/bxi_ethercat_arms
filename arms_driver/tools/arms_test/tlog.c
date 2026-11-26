@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -22,22 +23,34 @@ static int g_saved_err = -1;
 static int g_pipe_rd = -1;
 static pthread_t g_thread;
 
-/* strftime 生成秒之前的部分；毫秒最多三位，缓冲区不够时不输出半截时间。 */
-static const char *stamp(char *buf, size_t size, const char *format)
+static void now_tm(struct tm *tm, long *ms)
 {
-    struct timespec ts;
+    struct timeval tv;
+    time_t t;
+    gettimeofday(&tv, NULL);
+    t = tv.tv_sec;
+    localtime_r(&t, tm);
+    *ms = tv.tv_usec / 1000;
+}
+
+const char *tlog_time(char *buf, size_t size)
+{
     struct tm tm;
-    if (!size) return buf;
-    size_t n = 0;
-    if (clock_gettime(CLOCK_REALTIME, &ts) == 0 && localtime_r(&ts.tv_sec, &tm))
-        n = strftime(buf, size, format, &tm);
-    if (!n || size - n < 5) buf[0] = '\0';
-    else snprintf(buf + n, size - n, ".%03u", (unsigned)(ts.tv_nsec / 1000000) % 1000u);
+    long ms;
+    now_tm(&tm, &ms);
+    snprintf(buf, size, "%02d:%02d:%02d.%03ld", tm.tm_hour, tm.tm_min, tm.tm_sec, ms);
     return buf;
 }
 
-const char *tlog_time(char *buf, size_t size) { return stamp(buf, size, "%H:%M:%S"); }
-const char *tlog_datetime(char *buf, size_t size) { return stamp(buf, size, "%Y-%m-%d %H:%M:%S"); }
+const char *tlog_datetime(char *buf, size_t size)
+{
+    struct tm tm;
+    long ms;
+    now_tm(&tm, &ms);
+    snprintf(buf, size, "%04d-%02d-%02d %02d:%02d:%02d.%03ld", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec, ms);
+    return buf;
+}
 
 static void vline(FILE *stream, const char *fmt, va_list ap)
 {

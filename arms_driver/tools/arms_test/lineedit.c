@@ -60,11 +60,8 @@ static void refresh(const char *prompt, const char *buf, size_t len, size_t pos)
     out_cstr(prompt);
     out_str(buf, len);
     out_cstr("\x1b[0K\r");
-    size_t col = width(prompt, strlen(prompt)) + width(buf, pos);
-    if (col) {
-        snprintf(seq, sizeof(seq), "\x1b[%zuC", col);
-        out_cstr(seq);
-    }
+    snprintf(seq, sizeof(seq), "\x1b[%zuC", width(prompt, strlen(prompt)) + width(buf, pos));
+    if (width(prompt, strlen(prompt)) + width(buf, pos) > 0) out_cstr(seq);
 }
 
 void le_history_add(const char *line)
@@ -94,7 +91,7 @@ static int read_byte(unsigned char *c, int stop_fd)
 static int plain_readline(const char *prompt, char *buf, size_t size, int stop_fd)
 {
     size_t n = 0;
-    bool invalid = false;
+    bool too_long = false;
     fputs(prompt, stdout);
     fflush(stdout);
     for (;;) {
@@ -103,11 +100,11 @@ static int plain_readline(const char *prompt, char *buf, size_t size, int stop_f
         if (rc == LE_INTERRUPTED) return rc;
         if (rc == LE_EOF && !n) return LE_EOF;
         if (rc == LE_EOF || c == '\n') break;
-        if (!c || n + 1 >= size) invalid = true;
-        else buf[n++] = (char)c;
+        if (n + 1 < size) buf[n++] = (char)c;
+        else too_long = true;
     }
-    if (invalid) {
-        fputs("输入行过长或含空字节，命令未执行。\n", stderr);
+    if (too_long) {
+        fputs("输入行过长，命令未执行。\n", stderr);
         n = 0;
     }
     if (n && buf[n - 1] == '\r') --n;
@@ -195,7 +192,6 @@ int le_readline(const char *prompt, char *buf, size_t size, int stop_fd, le_comp
     size_t len = 0, pos = 0;
     int hist = g_history_len, rc = LE_OK;
     char saved[1024] = "";
-    bool overflow = false;
 
     if (size < 2) return LE_EOF;
     if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &orig) != 0) return plain_readline(prompt, buf, size, stop_fd);
@@ -222,7 +218,6 @@ int le_readline(const char *prompt, char *buf, size_t size, int stop_fd, le_comp
             break;
         }
         if (c == '\r' || c == '\n') break;
-        if (overflow) continue;  /* 整行作废，绝不执行被截断的前缀。 */
         if (c == '\t') {
             tab_complete(buf, size, &len, &pos, complete);
         } else if (c == 4) { /* Ctrl+D */
@@ -294,12 +289,7 @@ int le_readline(const char *prompt, char *buf, size_t size, int stop_fd, le_comp
                     len = pos = strlen(buf);
                 }
             }
-        } else if (c >= 32) {
-            if (len + 1 >= size) {
-                overflow = true;
-                out_cstr("\a");
-                continue;
-            }
+        } else if (c >= 32 && len + 1 < size) {
             memmove(buf + pos + 1, buf + pos, len - pos + 1);
             buf[pos++] = (char)c;
             len++;
@@ -308,7 +298,6 @@ int le_readline(const char *prompt, char *buf, size_t size, int stop_fd, le_comp
     }
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
     out_cstr("\r\n");
-    if (overflow && rc == LE_OK) out_cstr("输入行过长，命令未执行。\r\n");
-    if (overflow || rc != LE_OK) buf[0] = '\0';
+    if (rc != LE_OK) buf[0] = '\0';
     return rc;
 }

@@ -19,7 +19,6 @@
 #define REFRESH_NS UINT64_C(10000000)
 #define SWING_NS UINT64_C(5000000)
 #define TAU 6.28318530717958647693
-#define MOVE_MAX_S 60.0
 
 static arms_t *bus;
 static volatile sig_atomic_t *interrupted;
@@ -49,7 +48,7 @@ void motion_set_trip_handler(void (*fn)(void)) { trip_handler = fn; }
 static bool protect_seen;
 static int take_snapshot(snapshot *s);
 
-/* 超速/超力矩保护：驱动已失能全部关节，这里停止指令刷新并打印诊断快照 */
+/* 超速/超力矩/过温保护：驱动已使全部关节失能，此处停止指令刷新并打印诊断快照 */
 static void check_protect(const arms_bus_stats *st)
 {
     size_t i;
@@ -65,8 +64,10 @@ static void check_protect(const arms_bus_stats *st)
     pthread_mutex_unlock(&lock);
     tlog_err("超限保护触发: 关节 %d(%s) %s %.4f 超过阈值 %.4f；全部关节已失能，执行 reset 清除",
              st->protect.joint, arms_joint_name(bus, st->protect.joint),
-             st->protect.reason == ARMS_PROTECT_OVERSPEED ? "速度(rad/s)" : "力矩(N.m)", st->protect.value,
-             st->protect.limit);
+             st->protect.reason == ARMS_PROTECT_OVERSPEED    ? "速度(rad/s)"
+             : st->protect.reason == ARMS_PROTECT_OVERTORQUE ? "力矩(N.m)"
+                                                              : "温度(℃)",
+             st->protect.value, st->protect.limit);
     if (!take_snapshot(&s)) return;
     for (i = 0; i < s.count; ++i) {
         const arms_joint_state *j = &s.joints[i];
@@ -76,7 +77,7 @@ static void check_protect(const arms_bus_stats *st)
     }
 }
 
-/* 离线保护：驱动在周期内已失能全部关节，这里打印触发关节并调用下电处理 */
+/* 离线保护：驱动已使全部关节失能，此处打印触发关节并调用下电处理 */
 static void check_trip(void)
 {
     arms_bus_stats st;
@@ -176,10 +177,24 @@ static int take_snapshot(snapshot *s)
            arms_get_stats(bus, &s->stats) == ARMS_OK;
 }
 
+/* 把驱动记录的通信事件写入日志文件；写入失败只提示一次 */
+static void flush_events(void)
+{
+    static bool warned;
+    int n = arms_log_events(bus);
+    if (n > 0) {
+        tlog("已记录 %d 条通信事件: %s", n, arms_event_log_path(bus));
+    } else if (n < 0 && !warned) {
+        tlog_err("通信事件日志写入失败: %s", arms_last_error());
+        warned = true;
+    }
+}
+
 static void monitor_faults(void)
 {
     snapshot s;
     bool report[ARMS_ARM_COUNT] = {false};
+    flush_events();
     if (!take_snapshot(&s)) return;
     /* 同一会话中，arms_read 始终按相同顺序返回全部已打开关节。 */
     for (size_t i = 0; i < s.count; ++i) {
@@ -235,7 +250,7 @@ static void *refresh_main(void *arg)
         for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
             arms_mask bit = ARMS_MASK_JOINT(j);
             /* 驱动在每次写入时检查使能状态。检查和发送均在取消刷新的互斥区内。 */
-            if ((refreshing & bit) && arms_set_command(bus, j, &latest[j], 0.0) != ARMS_OK) {
+            if ((refreshing & bit) && arms_set_command(bus, j, &latest[j]) != ARMS_OK) {
                 refreshing &= ~bit;
                 tlog_err("关节 %d 停止刷新: %s", j, arms_last_error());
             }
@@ -260,7 +275,7 @@ int motion_start(arms_t *arms, volatile sig_atomic_t *flag, bool batch)
     stopping = false;
     bus = arms;
     interrupted = flag;
-    /* 交互终端与 -e 会话接受回车。重定向的命令脚本不能被运动命令提前读取。 */
+    /* 交互终端与 -e 会话可用回车中止；标准输入为重定向脚本时不读取 */
     poll_input = batch || isatty(STDIN_FILENO);
     if (!take_snapshot(&previous)) {
         tlog_err("无法读取故障监视的初始总线快照");
@@ -306,7 +321,7 @@ int motion_hold(arms_mask mask)
             tlog_err("保持失败: %s", arms_last_error());
             return -1;
         }
-        /* 请求与最后一条刷新可能在同一总线周期被取走；确认新反馈后才允许下一条控制命令。 */
+        /* 请求与最后一次刷新可能在同一周期生效；确认新反馈后再执行下一条控制命令 */
         sleep_until(now_ns() + arms_period_ns(bus));
         if (arms_read(bus, states, ARMS_JOINT_COUNT, &n) != ARMS_OK) {
             tlog_err("无法读取保持反馈");
@@ -315,7 +330,7 @@ int motion_hold(arms_mask mask)
         for (size_t i = 0; i < n; ++i) {
             const arms_joint_state *s = &states[i];
             if ((mask & ARMS_MASK_JOINT(s->joint)) && s->mode == ARMS_JS_ENABLED &&
-                (s->sample_ns <= sent || s->cmd_moving || s->cmd_velocity != 0.0 || s->cmd_torque != 0.0)) held = false;
+                (s->sample_ns <= sent || s->cmd_velocity != 0.0 || s->cmd_torque != 0.0)) held = false;
         }
         if (held) break;
         if (now_ns() >= deadline) {
@@ -328,8 +343,7 @@ int motion_hold(arms_mask mask)
 
 typedef struct {
     int joint;
-    double center, move;
-    arms_joint_limits limits;
+    double center;
     arms_command cmd;
 } target;
 
@@ -356,40 +370,15 @@ static int prepare(trajectory *p, arms_mask mask, arms_command cmd)
         target *t = &p->items[p->count++];
         t->joint = s->joint;
         t->center = s->cmd_position;
-        if (arms_get_limits(bus, t->joint, &t->limits) != ARMS_OK) {
-            tlog_err("无法读取关节 %d 的限位", t->joint);
-            return -1;
-        }
         t->cmd = cmd;
-        if (isnan(cmd.kp)) t->cmd.kp = t->limits.kp_default;
-        if (isnan(cmd.kd)) t->cmd.kd = t->limits.kd_default;
     }
     if (!p->count) tlog_err("没有可执行运动的已使能关节");
     return p->count ? 0 : -1;
 }
 
-static int in_range(int joint, const char *name, double value, double min, double max)
+static int send_target(const target *t)
 {
-    if (isfinite(value) && value >= min && value <= max) return 1;
-    tlog_err("关节 %d: %s %.4f 超出范围 [%.4f, %.4f]；未下发指令", joint, name, value, min, max);
-    return 0;
-}
-
-static int validate(const target *t, double amplitude, double speed)
-{
-    const arms_joint_limits *l = &t->limits;
-    const arms_command *c = &t->cmd;
-    return in_range(t->joint, "位置(rad)", c->position - amplitude, l->pos_min, l->pos_max) &&
-           in_range(t->joint, "位置(rad)", c->position + amplitude, l->pos_min, l->pos_max) &&
-           in_range(t->joint, "kp", c->kp, 0.0, l->kp_max) && in_range(t->joint, "kd", c->kd, 0.0, l->kd_max) &&
-           in_range(t->joint, "速度(rad/s)", speed, -l->vel_max, l->vel_max) &&
-           in_range(t->joint, "前馈(N.m)", c->torque, -l->tff_max, l->tff_max) &&
-           in_range(t->joint, "过渡时间(s)", t->move, 0.0, MOVE_MAX_S);
-}
-
-static int send_target(const target *t, double move)
-{
-    if (arms_set_command(bus, t->joint, &t->cmd, move) == ARMS_OK) return 0;
+    if (arms_set_command(bus, t->joint, &t->cmd) == ARMS_OK) return 0;
     tlog_err("关节 %d 指令失败: %s", t->joint, arms_last_error());
     return -1;
 }
@@ -399,7 +388,7 @@ static int submit(trajectory *p, bool refresh)
     motion_cancel_refresh(p->mask);
     for (size_t i = 0; i < p->count; ++i) {
         const target *t = &p->items[i];
-        if (send_target(t, t->move)) {
+        if (send_target(t)) {
             motion_hold(p->mask);
             return -1;
         }
@@ -413,34 +402,21 @@ static int submit(trajectory *p, bool refresh)
     return 0;
 }
 
-static double transition(const target *t, double minimum)
-{
-    double distance = fabs(t->cmd.position - t->center);
-    if (distance == 0.0) return minimum;
-    if (t->limits.vel_max <= 0.0) return INFINITY;
-    return fmax(minimum, distance / (0.5 * t->limits.vel_max));
-}
-
-int motion_mit(arms_mask mask, arms_command cmd, double move_s)
+int motion_mit(arms_mask mask, arms_command cmd)
 {
     trajectory p;
     bool dynamic = cmd.velocity != 0.0 || cmd.torque != 0.0;
     if (prepare(&p, mask, cmd)) return -1;
-    for (size_t i = 0; i < p.count; ++i) {
-        target *t = &p.items[i];
-        t->move = dynamic ? 0.0 : (move_s < 0.0 ? transition(t, 0.5) : move_s);
-        if (!validate(t, 0.0, cmd.velocity)) return -1;
-    }
     if (submit(&p, dynamic)) return -1;
     /* 等待两个周期，使随后的 status 显示新指令 */
     sleep_until(now_ns() + 2 * arms_period_ns(bus) + 1000000);
     return 0;
 }
 
-/* 等到下发后的反馈确实到达目标，避免将上一周期的 cmd_moving=false 当作结束。 */
-static int await_targets(const trajectory *p, double move, bool allow_abort, bool report)
+/* 确认驱动已在新的反馈周期中采用目标指令 */
+static int await_targets(const trajectory *p)
 {
-    uint64_t sent = now_ns(), deadline = sent + (uint64_t)((move + 2.0) * NS_PER_S);
+    uint64_t sent = now_ns(), deadline = sent + 2 * NS_PER_S;
     arms_joint_state state[ARMS_JOINT_COUNT];
     for (;;) {
         bool done = true;
@@ -452,7 +428,7 @@ static int await_targets(const trajectory *p, double move, bool allow_abort, boo
                 motion_hold(p->mask);
                 return -1;
             }
-            if (s->sample_ns <= sent || s->cmd_moving || s->cmd_position != t->cmd.position) done = false;
+            if (s->sample_ns <= sent || s->cmd_position != t->cmd.position) done = false;
         }
         if (done) break;
         if (now_ns() >= deadline) {
@@ -460,39 +436,9 @@ static int await_targets(const trajectory *p, double move, bool allow_abort, boo
             motion_hold(p->mask);
             return -1;
         }
-        if (!allow_abort) sleep_until(now_ns() + REFRESH_NS);
-        else if (motion_wait_or_enter(10)) {
-            tlog("运动已中止，保持当前指令位置");
-            return motion_hold(p->mask);
-        }
-    }
-    if (report) {
-        for (size_t i = 0; i < p->count; ++i) {
-            double goal = p->items[i].cmd.position, actual = state[i].position;
-            tlog("关节 %d 目标 %.4f 实际 %.4f 误差(目标-实际) %+.4f rad", p->items[i].joint, goal, actual, goal - actual);
-        }
+        sleep_until(now_ns() + REFRESH_NS);
     }
     return 0;
-}
-
-int motion_home(arms_mask mask, double move_s)
-{
-    arms_command cmd = {.kp = NAN, .kd = NAN};
-    trajectory p;
-    double common = move_s < 0.0 ? 1.0 : move_s;
-    if (prepare(&p, mask, cmd)) return -1;
-    for (size_t i = 0; i < p.count; ++i) {
-        target *t = &p.items[i];
-        t->cmd.position = t->limits.home;
-        if (move_s < 0.0) common = fmax(common, transition(t, 1.0));
-    }
-    for (size_t i = 0; i < p.count; ++i) {
-        p.items[i].move = common;
-        if (!validate(&p.items[i], 0.0, 0.0)) return -1;
-    }
-    tlog("回零: 过渡 %.4f s；回车或 Ctrl+C 中止", common);
-    if (submit(&p, false)) return -1;
-    return await_targets(&p, common, true, true);
 }
 
 int motion_swing(arms_mask mask, double amplitude, double period, long count, double kp, double kd)
@@ -506,12 +452,7 @@ int motion_swing(arms_mask mask, double amplitude, double period, long count, do
         return -1;
     }
     if (prepare(&p, mask, cmd)) return -1;
-    for (size_t i = 0; i < p.count; ++i) {
-        target *t = &p.items[i];
-        t->cmd.position = t->center;
-        t->move = 0.0;
-        if (!validate(t, amplitude, peak)) return -1;
-    }
+    for (size_t i = 0; i < p.count; ++i) p.items[i].cmd.position = p.items[i].center;
     motion_cancel_refresh(mask);
     tlog("正弦摆动: 幅值 %.4f rad 周期 %.4f s，共 %ld 次；回车或 Ctrl+C 中止", amplitude, period, count);
     uint64_t start = now_ns(), tick = start;
@@ -535,7 +476,7 @@ int motion_swing(arms_mask mask, double amplitude, double period, long count, do
             arms_joint_state s;
             t->cmd.position = t->center + offset;
             t->cmd.velocity = velocity;
-            if (send_target(t, 0.0) || arms_read_joint(bus, t->joint, &s) != ARMS_OK) {
+            if (send_target(t) || arms_read_joint(bus, t->joint, &s) != ARMS_OK) {
                 motion_hold(mask);
                 return -1;
             }
@@ -547,13 +488,14 @@ int motion_swing(arms_mask mask, double amplitude, double period, long count, do
             break;
         }
     }
-    double move = aborted ? 1.0 : 0.0;
-    if (aborted) tlog("摆动已中止，以 1.0000 s 过渡返回中心");
+    if (aborted) {
+        tlog("摆动已中止，保持当前指令位置");
+        return motion_hold(mask);
+    }
     for (size_t i = 0; i < p.count; ++i) {
         p.items[i].cmd.position = p.items[i].center;
         p.items[i].cmd.velocity = 0.0;
-        p.items[i].move = move;
     }
     if (submit(&p, false)) return -1;
-    return await_targets(&p, move, false, false);
+    return await_targets(&p);
 }

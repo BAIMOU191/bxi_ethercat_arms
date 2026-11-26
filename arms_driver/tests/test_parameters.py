@@ -1,4 +1,5 @@
 """Round-trip and interlock tests against an isolated mock, never the hardware backend."""
+import json
 import os
 import pathlib
 import re
@@ -58,9 +59,13 @@ with tempfile.TemporaryDirectory() as work:
         run(cmd, fail=True)
     assert '未确认失能' in run('enable 15', 'pn 15 199 7', fail=True)
     assert '未确认失能' in run('enable 15', 'sdo 15 0x5ffe 2 u8:1', fail=True)
-    assert '拒绝' in run('sdo 15 0x2075 0 1', 'enable 16', fail=True)
+    out = run('sdo 15 0x2075 0 1', 'enable 15', 'sdo 15 0x2075 0')
+    assert '自动切为正常控制' in out and '0x2075:00 = 00 00 (0)' in out, out
     assert '抱闸' in run('pn 15 75 2', 'sdo 15 0x2101 0 1', fail=True)
     out = run('free 15', 'pn 15 097 1', 'sdo 15 0x2097 0', 'sdo 15 0x2101 0 1', 'pn 15 101')
     for word in ('已发送参数保存脉冲', '0x2097:00 = 00 00 (0)', '硬件清零脉冲', '0x2101:00 = 00 00 (0)'):
         assert word in out, out
-    assert config.read_bytes() == before
+    # Pn101 写 1 即硬件校零：只把 15 号关节的 offset_rad 写为 0，其余配置不变
+    expected = json.loads(before)
+    next(j for j in expected['joints'] if j['joint'] == 15)['offset_rad'] = 0.0
+    assert json.loads(config.read_bytes()) == expected

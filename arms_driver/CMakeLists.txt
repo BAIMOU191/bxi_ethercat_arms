@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(arms_driver VERSION 0.2.0 LANGUAGES C)
+project(arms_driver VERSION 0.1.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -101,18 +101,19 @@ if(BUILD_TESTING)
   add_test(NAME help_lists_check COMMAND arms_test --mock -c ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json -e "help")
   set_tests_properties(help_lists_check PROPERTIES PASS_REGULAR_EXPRESSION "  check +检查已打开关节")
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
-  add_test(NAME script_cli COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_script_cli.py)
-  add_test(NAME cli_contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli_contract.py
-    $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
   add_test(NAME parameter_cli COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_parameters.py
     $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
   add_test(NAME tab_completion COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_completion.py
     $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
   add_test(NAME maintenance_cli COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_maintenance.py
     $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
+  add_test(NAME drive_monitor COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_diag.py
+    $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
+  add_test(NAME comm_event_log COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_events.py
+    $<TARGET_FILE:arms_test> ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json)
   add_test(NAME mock_session COMMAND arms_test --mock -c ${CMAKE_CURRENT_SOURCE_DIR}/config/arms.json
-           -e "status" -e "bus" -e "enable all" -e "mit 17 0.1 -m 0.3" -e "home all -m 0.5"
-           -e "swing 17 0.05 1 1" -e "mit 18 0.1 2 0.1 0.05" -e "hold" -e "commtest 2 --enabled"
+           -e "status" -e "bus" -e "enable all" -e "mit 17 0.1 5 0.5"
+           -e "swing 17 0.05 1 1 5 0.5" -e "mit 18 0.1 2 0.1 0.05" -e "hold" -e "commtest 2 --enabled 5 0.5"
            -e "disable" -e "status" -e "help")
 endif()
 

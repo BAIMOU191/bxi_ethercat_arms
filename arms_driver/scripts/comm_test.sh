@@ -4,7 +4,7 @@
 # 用法:
 #   comm_test.sh [-c arms.json] [-j left|right|all] [-t 秒] [-f "1000 2000"] [-r CPU]
 #
-# 时长 1..86400，仅接受整数；频率可选 2000/1000/500/250/200/125，按给定顺序分别测试。
+# 按各频率依次运行 arms_test -e "commtest <秒>"，最后输出结论。
 # 日志: /tmp/arms_comm_<时间>_<随机后缀>.log；任一频率测试失败时返回非零
 set -uo pipefail
 
@@ -26,20 +26,11 @@ while [[ $# -gt 0 ]]; do
     *) echo "未知参数 $1（-h 查看用法）" >&2; exit 2 ;;
   esac
 done
-# -t 会拼入一条交互命令；校验后再提权，禁止把选项带入失能测试。
-if ! [[ $DURATION =~ ^[0-9]{1,5}$ ]] || (( 10#$DURATION < 1 || 10#$DURATION > 86400 )); then
-  echo "-t 需要 1..86400 的整数秒数" >&2; exit 2
-fi
-read -r -a rates <<< "$FREQS"
-(( ${#rates[@]} )) || { echo "-f 需要至少一个频率" >&2; exit 2; }
-for f in "${rates[@]}"; do
-  case $f in 2000|1000|500|250|200|125) ;; *) echo "不支持的频率: $f" >&2; exit 2 ;; esac
-done
 if [[ $EUID -ne 0 ]]; then
   exec sudo "$0" -c "$CONFIG" -j "$JOINTS" -t "$DURATION" -f "$FREQS" ${RT_CPU:+-r "$RT_CPU"}
 fi
 if pgrep -x motor_console >/dev/null || pgrep -f 'hw_lib_test_' >/dev/null || pgrep -x arms_test >/dev/null; then
-  echo "检测到其他 EtherCAT 控制程序正在运行，请先退出" >&2
+  echo "其他 EtherCAT 控制程序正在运行" >&2
   exit 1
 fi
 
@@ -52,7 +43,7 @@ ARGS=(-c "$CONFIG" -j "$JOINTS")
 
 rc=0
 declare -A RESULT
-for f in "${rates[@]}"; do
+for f in $FREQS; do
   echo
   echo "== ${f} Hz"
   if "$ROOT/arms_test" "${ARGS[@]}" -T -f "$f" -e "info" -e "commtest $DURATION" -e "bus"; then
@@ -66,6 +57,6 @@ done
 
 echo
 echo "== 结论"
-for f in "${rates[@]}"; do echo "  ${f} Hz: ${RESULT[$f]}"; done
+for f in $FREQS; do echo "  ${f} Hz: ${RESULT[$f]}"; done
 echo "日志: $LOG"
 exit "$rc"

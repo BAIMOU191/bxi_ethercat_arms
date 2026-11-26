@@ -86,17 +86,8 @@ int arms_parse_joints(const char *text, arms_mask allowed, arms_mask *out, char 
         return -1;
     }
     snprintf(buf, sizeof(buf), "%s", text);
-    for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-        arms_mask item = 0;
-        if (parse_item(tok, &item, err, err_size) != 0) return -1;
-        /* all / left / right 按会话取交集；显式编号、名称或范围不能只执行一部分。 */
-        if (allowed && (item & ~allowed) && strcmp(tok, "all") && strcmp(tok, "left") &&
-            strcmp(tok, "l") && strcmp(tok, "right") && strcmp(tok, "r")) {
-            snprintf(err, err_size, "关节选择 %s 包含本次不可用的关节", tok);
-            return -1;
-        }
-        mask |= item;
-    }
+    for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save))
+        if (parse_item(tok, &mask, err, err_size) != 0) return -1;
     if (allowed) {
         arms_mask outside = mask & ~allowed;
         if (outside == mask) {

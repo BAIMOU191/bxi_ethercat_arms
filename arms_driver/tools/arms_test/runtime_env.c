@@ -16,7 +16,6 @@
 #include <unistd.h>
 
 #include "tlog.h"
-#include "arms/arms.h"
 
 #define MASTER_PARAM "/sys/module/ec_master/parameters/main_devices"
 #define MASTER_INIT "/etc/init.d/ethercat"
@@ -71,7 +70,7 @@ int arms_env_start_master(void)
     }
     tlog("启动 EtherLab 主站");
     if (run(MASTER_INIT " start > /dev/null 2>&1") != 0) {
-        tlog_err("EtherLab 主站启动失败，请检查 /etc/sysconfig/ethercat");
+        tlog_err("EtherLab 主站启动失败（配置文件 /etc/sysconfig/ethercat）");
         return -1;
     }
     for (i = 0; i < 50 && access(MASTER_PARAM, R_OK) != 0; ++i) usleep(100000);
@@ -137,21 +136,16 @@ int arms_env_rt_apply(const char *config, int rt_cpu)
         if (run_rt((char *[]){g_rt_script, "revert", NULL}))
             return -1;
     }
-    char resolved[PATH_MAX];
-    if (!config && !arms_config_default_path(resolved, sizeof(resolved))) {
-        tlog_err("找不到实时配置，请指定 arms.json");
-        return -1;
+    if (config) {
+        args[n++] = "-c";
+        args[n++] = (char *)config;
     }
-    args[n++] = "-c";
-    args[n++] = config ? (char *)config : resolved;
-    if (rt_cpu >= -1) {
+    if (rt_cpu >= 0) {
         snprintf(cpu, sizeof(cpu), "%d", rt_cpu);
         args[n++] = "--rt-cpu";
         args[n++] = cpu;
-        if (rt_cpu >= 0) {
-            args[n++] = "--irq-cpu";
-            args[n++] = cpu;
-        }
+        args[n++] = "--irq-cpu";
+        args[n++] = cpu;
     }
     args[n] = NULL;
     if (run_rt(args) != 0) {
@@ -182,6 +176,6 @@ void arms_env_rt_revert(void)
     if (!g_rt_applied || !g_rt_script[0]) return;
     if (run_rt((char *[]){g_rt_script, "revert", NULL}) == 0)
         tlog("实时环境: 已还原");
-    else tlog_err("实时环境还原失败，请执行 sudo %s revert", g_rt_script);
+    else tlog_err("实时环境还原失败，需执行 sudo %s revert", g_rt_script);
     g_rt_applied = false;
 }

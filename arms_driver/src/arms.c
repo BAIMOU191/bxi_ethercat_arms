@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "arms/arms.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
@@ -10,7 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -28,7 +31,6 @@
 #define DEFAULT_WAIT_MS 1000u          /* 使能、复位的默认等待时间 */
 #define RESET_PULSE_MS 20u             /* 故障复位控制字 0x0080 保持时间 */
 #define RECOVER_STABLE_MS 500u         /* 通信失败后，恢复稳定该时长才清除失败标志 */
-#define MOVE_MAX_S 60.0
 
 /* 非实时线程向周期上下文发出的关节请求 */
 enum { REQ_NONE = 0, REQ_ENABLE, REQ_DISABLE, REQ_RESET, REQ_HOLD };
@@ -138,7 +140,84 @@ typedef struct {
     uint32_t drops, recoveries;
     bool auto_reset;                  /* 恢复后对故障关节执行一次复位 */
     double recv_us_max, send_us_max;
+    /* 驱动器监控轮询（周期上下文）：ESC 错误计数与监控量各自轮流处理一个从站 */
+    int esc_slot, esc_phase;          /* esc_phase: 0 发起，1 等待结果 */
+    bool esc_clearing;
+    bool esc_clear[BUS_MAX_SLAVES];
+    bool esc_valid[BUS_MAX_SLAVES];
+    uint8_t esc[BUS_MAX_SLAVES][ESC_ERR_BYTES];
+    int mon_slot, mon_phase;          /* 见 monitor_step() */
+    unsigned int mon_wait;
+    double temp[BUS_MAX_SLAVES];
+    int32_t drive_loss[BUS_MAX_SLAVES];
+    bool temp_warned[BUS_MAX_SLAVES];
+    /* 处理类错误（只有处理单元/转发错误）按时间窗口汇总：被拒绝的帧数、首个拒绝位置、窗口开始时刻 */
+    uint32_t proc_frames;
+    int proc_origin;
+    uint64_t proc_since;
 } arm_rt;
+
+/* ---- 通信事件记录：周期上下文写入，管理线程读出后写日志文件 ---- */
+#define TRACE_LEN 64u   /* 每条事件附带的最近周期数 */
+#define EMERGENCY_MSG_BYTES 8 /* CoE 紧急报文长度 */
+#define EMERGENCY_BATCH 32    /* 每次写日志最多取出的紧急报文数 */
+#define EVENT_RING 16u  /* 尚未写出的事件最多保留条数 */
+enum {
+    EVT_WKC = 0, EVT_FAIL, EVT_RECOVER, EVT_LATE, EVT_TRIP,
+    EVT_ESC,        /* ESC 错误计数增加 */
+    EVT_DRIVE_LOSS, /* 驱动器自报的 EtherCAT 丢帧次数增加 */
+    EVT_TEMP_WARN,  /* 温度达到告警阈值 */
+    EVT_OVERTEMP,   /* 温度达到保护阈值，已锁定保护 */
+    EVT_ESC_PROC,   /* 处理类错误汇总：从站拒绝的帧，线路类计数未变 */
+    EVT_KINDS
+};
+
+/* 单个从站相关事件的细节 */
+typedef struct {
+    int joint, slave;               /* 关节号、链上位置；无则 -1 */
+    double value, limit;            /* 温度事件：温度与阈值；丢帧事件：新旧计数 */
+    uint8_t before[ESC_ERR_BYTES], after[ESC_ERR_BYTES];
+} event_detail;
+
+typedef struct {
+    uint64_t cycle;
+    uint64_t start_ns;          /* 周期开始时刻（CLOCK_MONOTONIC） */
+    uint32_t period_ns;         /* 与上一周期开始的间隔 */
+    uint32_t late_ns;           /* 唤醒延迟（独立模式） */
+    uint32_t gap_ns;            /* 上一周期发送结束到本周期开始接收的间隔 */
+    uint32_t work_ns;           /* 本周期从接收开始到发送结束的耗时 */
+    uint16_t wkc[ARMS_ARM_COUNT];
+} trace_entry;
+
+typedef struct {
+    int kind, which_arm;        /* which_arm 为 -1 表示与具体臂无关 */
+    uint32_t suppressed;        /* 限速期间未单独记录的同类事件数 */
+    uint64_t cycle, mono_ns;
+    int64_t real_ns;
+    uint64_t skipped, overruns;
+    struct {
+        bool used, link_up, comm_failed;
+        int count;
+        uint32_t wkc, wkc_expected, consecutive;
+        uint64_t wkc_bad;
+        uint8_t al[BUS_MAX_SLAVES];
+        int joint[BUS_MAX_SLAVES];
+        bool esc_valid[BUS_MAX_SLAVES];
+        uint8_t esc[BUS_MAX_SLAVES][ESC_ERR_BYTES];
+        double temp[BUS_MAX_SLAVES];
+        int32_t drive_loss[BUS_MAX_SLAVES];
+    } arm[ARMS_ARM_COUNT];
+    bool has_detail;
+    event_detail detail;
+    unsigned int n;             /* trace 中的有效条数 */
+    trace_entry trace[TRACE_LEN]; /* 旧 → 新 */
+} event_record;
+
+#define WORDS_UP(T) ((sizeof(T) + sizeof(uintptr_t) - 1) / sizeof(uintptr_t))
+typedef union {
+    event_record r;
+    uintptr_t w[WORDS_UP(event_record)];
+} event_buf;
 
 typedef struct {
     arms_joint_state s[ARMS_JOINT_LAST + 1];
@@ -149,7 +228,6 @@ typedef struct {
 #define WORDS_OF(T) (sizeof(T) / sizeof(uintptr_t))
 typedef struct {
     arms_command cmd;
-    double move_s;
 } cmd_payload;
 _Static_assert(sizeof(shared_snapshot) % sizeof(uintptr_t) == 0, "snapshot word alignment");
 _Static_assert(sizeof(cmd_payload) % sizeof(uintptr_t) == 0, "command word alignment");
@@ -186,10 +264,6 @@ typedef struct {
     unsigned int seq_seen;
     uint64_t fresh_cycle;
     arms_command cur;                 /* 当前生效的指令（关节侧，未限幅） */
-    double lim_min, lim_max;          /* 生效的位置限位，使能时若实际位置在限位外则放宽到该位置 */
-    bool moving;
-    double mv_from, mv_to;
-    uint64_t mv_start, mv_len;
     bool timed_out;
     bool was_fault;
     uint32_t fault_count;
@@ -202,6 +276,7 @@ struct arms {
     atomic_uint brake_held;           /* Pn075 = 2 的关节 */
     atomic_uint brake_known;          /* 最近一次 Pn075 回读有效的关节 */
     _Atomic double offset_rad[ARMS_JOINT_LAST + 1]; /* 管理线程更新，周期线程读取 */
+    atomic_uint zero_pending;         /* 已硬件校零、等待驱动器重新上电的关节 */
     arms_mask brake_touched;          /* 本次会话改动过抱闸模式的关节 */
     arms_config cfg;
     arms_options opt;
@@ -253,6 +328,24 @@ struct arms {
     uint64_t stable_cycles, ready_cycles;
     uint64_t open_ns, activated_ns;   /* arms_open 开始、主站激活的时刻 */
     atomic_ullong ready_ns;           /* 预热完成的时刻 */
+
+    /* 通信事件记录。trace 与限速计数仅在周期上下文访问；事件环按 seqlock 方式发布 */
+    trace_entry trace[TRACE_LEN];
+    uint64_t trace_count;
+    uint64_t wake_late_ns, last_tx_end_ns;
+    uint64_t evt_last_ns[EVT_KINDS][ARMS_ARM_COUNT];
+    uint32_t evt_suppressed[EVT_KINDS][ARMS_ARM_COUNT];
+    event_buf evt_scratch;
+    atomic_uintptr_t evt_words[EVENT_RING][WORDS_UP(event_record)];
+    atomic_ullong evt_begin;          /* 正在写入的事件序号 + 1 */
+    atomic_ullong evt_count;          /* 已完整写入的事件数 */
+    uint64_t evt_read;                /* 已写到日志文件的事件数，仅管理线程访问 */
+    bool evt_header_done;
+    char event_log[PATH_MAX];
+
+    /* 驱动器监控轮询节拍（周期上下文）；清零请求由管理线程发出 */
+    unsigned int diag_div, diag_cnt;
+    atomic_bool esc_clear_all;
 };
 
 static void post(arms_t *a, arms_mask joints, unsigned int req);
@@ -264,7 +357,18 @@ static uint64_t mono_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-static void logf_(void *user, const char *fmt, ...)
+static void logf_(arms_t *a, const char *fmt, ...)
+{
+    char line[512];
+    va_list ap;
+    if (!a->opt.log) return;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    a->opt.log(a->opt.log_user, line);
+}
+
+static void bus_log_adapter(void *user, const char *fmt, ...)
 {
     arms_t *a = user;
     char line[512];
@@ -387,8 +491,8 @@ static void check_limits(arms_t *a, int j, const arms_joint_state *s)
         c->over_vel = c->over_tor = 0;
         return;
     }
-    ov = fabs(s->velocity) > jc->vel_fault;
-    ot = fabs(s->torque) > jc->tor_fault;
+    ov = fabs(s->velocity) > jc->vel_limit;
+    ot = fabs(s->torque) > jc->tor_limit;
     c->over_vel = ov ? c->over_vel + 1 : (c->over_vel ? c->over_vel - 1 : 0);
     c->over_tor = ot ? c->over_tor + 1 : (c->over_tor ? c->over_tor - 1 : 0);
     if (a->protect.reason != ARMS_PROTECT_NONE) return;
@@ -396,12 +500,310 @@ static void check_limits(arms_t *a, int j, const arms_joint_state *s)
         a->protect.reason = ARMS_PROTECT_OVERSPEED;
         a->protect.joint = j;
         a->protect.value = s->velocity;
-        a->protect.limit = jc->vel_fault;
+        a->protect.limit = jc->vel_limit;
     } else if (c->over_tor >= a->overtorque_cycles) {
         a->protect.reason = ARMS_PROTECT_OVERTORQUE;
         a->protect.joint = j;
         a->protect.value = s->torque;
-        a->protect.limit = jc->tor_fault;
+        a->protect.limit = jc->tor_limit;
+    }
+}
+
+/*
+ * 记录一条通信事件（周期上下文）：复制最近的周期时序和两臂状态，按 seqlock 方式发布到事件环。
+ * WKC 异常、周期延迟、ESC 错误计数和驱动器丢帧每臂每秒最多记录一条，其余计入下一条的 suppressed。
+ */
+static void record_event(arms_t *a, int kind, int arm, uint64_t now, const event_detail *d)
+{
+    int ai = arm < 0 ? 0 : arm;
+    uint64_t n = atomic_load_explicit(&a->evt_count, memory_order_relaxed);
+    event_record *e = &a->evt_scratch.r;
+    struct timespec rt;
+    unsigned int k;
+    bool limited = kind == EVT_WKC || kind == EVT_LATE || kind == EVT_ESC || kind == EVT_DRIVE_LOSS;
+
+    if (limited && a->evt_last_ns[kind][ai] && now - a->evt_last_ns[kind][ai] < 1000000000ull) {
+        a->evt_suppressed[kind][ai]++;
+        return;
+    }
+    a->evt_last_ns[kind][ai] = now;
+    memset(&a->evt_scratch, 0, sizeof(a->evt_scratch));
+    e->kind = kind;
+    e->which_arm = arm;
+    e->suppressed = a->evt_suppressed[kind][ai];
+    a->evt_suppressed[kind][ai] = 0;
+    e->cycle = a->cycles;
+    e->mono_ns = now;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    e->real_ns = (int64_t)rt.tv_sec * 1000000000LL + rt.tv_nsec;
+    e->skipped = a->skipped;
+    e->overruns = a->overruns;
+    for (int i = 0; i < ARMS_ARM_COUNT; ++i) {
+        const arm_rt *r = &a->arm[i];
+        e->arm[i].used = r->used;
+        if (!r->used) continue;
+        e->arm[i].link_up = r->link_up;
+        e->arm[i].comm_failed = r->comm_failed;
+        e->arm[i].count = r->count;
+        e->arm[i].wkc = r->wkc_last;
+        e->arm[i].wkc_expected = r->wkc_expected;
+        e->arm[i].consecutive = r->consecutive;
+        e->arm[i].wkc_bad = r->wkc_bad;
+        memcpy(e->arm[i].al, r->al, sizeof(e->arm[i].al));
+        for (int s = 0; s < r->count; ++s) {
+            e->arm[i].joint[s] = r->slot_joint[s];
+            e->arm[i].esc_valid[s] = r->esc_valid[s];
+            memcpy(e->arm[i].esc[s], r->esc[s], ESC_ERR_BYTES);
+            e->arm[i].temp[s] = r->temp[s];
+            e->arm[i].drive_loss[s] = r->drive_loss[s];
+        }
+    }
+    if (d) {
+        e->has_detail = true;
+        e->detail = *d;
+    }
+    e->n = a->trace_count < TRACE_LEN ? (unsigned int)a->trace_count : TRACE_LEN;
+    for (k = 0; k < e->n; ++k) e->trace[k] = a->trace[(a->trace_count - e->n + k) % TRACE_LEN];
+
+    atomic_store_explicit(&a->evt_begin, n + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    store_words(a->evt_words[n % EVENT_RING], &a->evt_scratch, WORDS_UP(event_record));
+    atomic_store_explicit(&a->evt_count, n + 1, memory_order_release);
+}
+
+/* 通信事件日志的默认位置：配置文件在 config/ 目录时为同级的 logs/，否则为配置目录下的 logs/ */
+static void resolve_event_log(arms_t *a, const char *path)
+{
+    char dir[PATH_MAX], abs_dir[PATH_MAX];
+    const char *slash, *base;
+    if (path && *path) {
+        snprintf(a->event_log, sizeof(a->event_log), "%s", path);
+        return;
+    }
+    slash = strrchr(a->cfg.path, '/');
+    if (slash) snprintf(dir, sizeof(dir), "%.*s", (int)(slash - a->cfg.path), a->cfg.path);
+    else snprintf(dir, sizeof(dir), ".");
+    if (realpath(dir, abs_dir)) snprintf(dir, sizeof(dir), "%s", abs_dir);
+    base = strrchr(dir, '/');
+    base = base ? base + 1 : dir;
+    snprintf(a->event_log, sizeof(a->event_log), strcmp(base, "config") == 0 ? "%s/../logs/comm_events.log"
+                                                                              : "%s/logs/comm_events.log", dir);
+}
+
+/* ---- 驱动器监控：ESC 错误计数、温度、驱动器丢帧次数（周期上下文，异步请求，不阻塞） ---- */
+
+/* ESC 错误计数寄存器 0x0300 起各字节的含义；NULL 为错误码或保留字节，不参与比较 */
+static const char *const esc_names[ESC_ERR_BYTES] = {
+    "端口0无效帧", "端口0物理层错误", "端口1无效帧", "端口1物理层错误",
+    "端口2无效帧", "端口2物理层错误", "端口3无效帧", "端口3物理层错误",
+    "端口0转发错误", "端口1转发错误", "端口2转发错误", "端口3转发错误",
+    "处理单元错误", "PDI错误", NULL, NULL,
+    "端口0链路丢失", "端口1链路丢失", "端口2链路丢失", "端口3链路丢失",
+};
+
+/*
+ * 线路类计数：各端口无效帧、物理层错误、链路丢失。
+ * 处理类计数：转发错误、处理单元错误、PDI 错误。
+ */
+static bool esc_line_counter(unsigned int b) { return b < 8 || (b >= 16 && b < 20); }
+#define ESC_PU_ERR 12u   /* 处理单元错误 */
+#define ESC_FWD_PORT0 8u /* 端口 0 转发错误 */
+
+/*
+ * 轮流读取（或按请求清零）每个从站的 ESC 错误计数。线路类计数增加时逐条记录；
+ * 只有处理类计数增加时累计被拒绝的帧数，由 diag_tick() 按窗口汇总。
+ * 某从站新拒绝的帧数 = 处理单元错误增量 − 端口 0 转发错误增量（后者是上游已标记的帧）。
+ */
+static void esc_step(arms_t *a, int i, uint64_t now)
+{
+    arm_rt *r = &a->arm[i];
+    int k = r->esc_slot, s;
+    uint8_t v[ESC_ERR_BYTES];
+
+    if (r->esc_phase == 0) {
+        bool clear = r->esc_clear[k];
+        if ((clear ? r->ops->esc_counters_clear(r->bus, k) : r->ops->esc_counters_read(r->bus, k)) == 0) {
+            r->esc_clearing = clear;
+            r->esc_phase = 1;
+        }
+        return;
+    }
+    s = r->ops->esc_counters_state(r->bus, k, v);
+    if (s == BUS_REQ_BUSY) return;
+    if (s == BUS_REQ_DONE) {
+        if (r->esc_clearing) {
+            memset(r->esc[k], 0, ESC_ERR_BYTES);
+            r->esc_clear[k] = false;
+        } else {
+            bool line = false, proc = false;
+            for (unsigned int b = 0; b < ESC_ERR_BYTES; ++b) {
+                if (!esc_names[b] || !r->esc_valid[k] || v[b] <= r->esc[k][b]) continue;
+                if (esc_line_counter(b)) line = true;
+                else proc = true;
+            }
+            if (proc && !line) {
+                int pu = v[ESC_PU_ERR] > r->esc[k][ESC_PU_ERR] ? v[ESC_PU_ERR] - r->esc[k][ESC_PU_ERR] : 0;
+                int fwd = v[ESC_FWD_PORT0] > r->esc[k][ESC_FWD_PORT0] ? v[ESC_FWD_PORT0] - r->esc[k][ESC_FWD_PORT0] : 0;
+                if (pu > fwd) {
+                    if (!r->proc_frames) {
+                        r->proc_since = now;
+                        r->proc_origin = k;
+                    }
+                    r->proc_frames += (uint32_t)(pu - fwd);
+                }
+            }
+            if (line) {
+                event_detail d;
+                memset(&d, 0, sizeof(d));
+                d.joint = r->slot_joint[k];
+                d.slave = r->slot_slave[k];
+                memcpy(d.before, r->esc[k], ESC_ERR_BYTES);
+                memcpy(d.after, v, ESC_ERR_BYTES);
+                memcpy(r->esc[k], v, ESC_ERR_BYTES);
+                record_event(a, EVT_ESC, i, now, &d);
+            } else {
+                memcpy(r->esc[k], v, ESC_ERR_BYTES);
+            }
+        }
+        r->esc_valid[k] = true;
+    }
+    r->esc_phase = 0;
+    r->esc_slot = (k + 1) % r->count;
+}
+
+static void temperature_sample(arms_t *a, int i, int k, double t, uint64_t now)
+{
+    arm_rt *r = &a->arm[i];
+    event_detail d;
+    if (t < -40.0 || t > 200.0) return; /* 超出有效范围的读数不参与保护 */
+    r->temp[k] = t;
+    memset(&d, 0, sizeof(d));
+    d.joint = r->slot_joint[k];
+    d.slave = r->slot_slave[k];
+    d.value = t;
+    if (t >= a->cfg.temp_max_c) {
+        if (a->protect.reason == ARMS_PROTECT_NONE) {
+            a->protect.reason = ARMS_PROTECT_OVERTEMP;
+            a->protect.joint = d.joint;
+            a->protect.value = t;
+            a->protect.limit = a->cfg.temp_max_c;
+            d.limit = a->cfg.temp_max_c;
+            record_event(a, EVT_OVERTEMP, i, now, &d);
+        }
+    } else if (t >= a->cfg.temp_warn_c) {
+        if (!r->temp_warned[k]) {
+            r->temp_warned[k] = true;
+            d.limit = a->cfg.temp_warn_c;
+            record_event(a, EVT_TEMP_WARN, i, now, &d);
+        }
+    } else if (t < a->cfg.temp_warn_c - 5.0) {
+        r->temp_warned[k] = false;
+    }
+}
+
+static void loss_sample(arms_t *a, int i, int k, int32_t v, uint64_t now)
+{
+    arm_rt *r = &a->arm[i];
+    if (r->drive_loss[k] >= 0 && v > r->drive_loss[k]) {
+        event_detail d;
+        memset(&d, 0, sizeof(d));
+        d.joint = r->slot_joint[k];
+        d.slave = r->slot_slave[k];
+        d.limit = r->drive_loss[k];
+        d.value = v;
+        r->drive_loss[k] = v;
+        record_event(a, EVT_DRIVE_LOSS, i, now, &d);
+    } else {
+        r->drive_loss[k] = v;
+    }
+}
+
+/*
+ * 监控量轮询：选择温度 → 等 0x3000 刷新 → 读取 → 选择丢帧次数 → 等待 → 读取 → 下一个从站。
+ * 选择监控量后等待 0x3000 刷新再读取。失败时转到下一个从站。
+ */
+enum {
+    MON_SEL_TEMP, MON_WAIT_SEL_TEMP, MON_SETTLE_TEMP, MON_READ_TEMP, MON_WAIT_TEMP,
+    MON_SEL_LOSS, MON_WAIT_SEL_LOSS, MON_SETTLE_LOSS, MON_READ_LOSS, MON_WAIT_LOSS,
+};
+#define MON_SETTLE_TICKS 10u /* 选择监控量后等待的轮询节拍数（每节拍 10 ms） */
+
+static void monitor_next(arm_rt *r)
+{
+    r->mon_phase = MON_SEL_TEMP;
+    r->mon_wait = 0;
+    r->mon_slot = (r->mon_slot + 1) % r->count;
+}
+
+static void monitor_step(arms_t *a, int i, uint64_t now)
+{
+    arm_rt *r = &a->arm[i];
+    int k = r->mon_slot, s;
+    int32_t v = 0;
+    switch (r->mon_phase) {
+    case MON_SEL_TEMP:
+    case MON_SEL_LOSS:
+        if (r->ops->monitor_select(r->bus, k,
+                                   r->mon_phase == MON_SEL_TEMP ? KGU_MON_TEMPERATURE : KGU_MON_ECAT_LOSS) == 0)
+            r->mon_phase++;
+        return;
+    case MON_SETTLE_TEMP:
+    case MON_SETTLE_LOSS:
+        if (++r->mon_wait >= MON_SETTLE_TICKS) {
+            r->mon_wait = 0;
+            r->mon_phase++;
+        }
+        return;
+    case MON_READ_TEMP:
+    case MON_READ_LOSS:
+        if (r->ops->monitor_read(r->bus, k) == 0) r->mon_phase++;
+        return;
+    default: /* 等待选择或读取的结果 */
+        s = r->ops->monitor_state(r->bus, k, &v);
+        if (s == BUS_REQ_BUSY) return;
+        if (s != BUS_REQ_DONE) {
+            monitor_next(r);
+            return;
+        }
+        if (r->mon_phase == MON_WAIT_TEMP) temperature_sample(a, i, k, (double)v, now);
+        if (r->mon_phase == MON_WAIT_LOSS) {
+            loss_sample(a, i, k, v, now);
+            monitor_next(r);
+            return;
+        }
+        r->mon_phase++;
+    }
+}
+
+/* 每 10 ms 推进一步；通信异常的臂暂停，恢复后继续 */
+static void diag_tick(arms_t *a, uint64_t now)
+{
+    bool clear_all = atomic_exchange_explicit(&a->esc_clear_all, false, memory_order_acq_rel);
+    for (int i = 0; i < ARMS_ARM_COUNT; ++i) {
+        arm_rt *r = &a->arm[i];
+        if (!r->used || r->count <= 0) continue;
+        if (clear_all)
+            for (int k = 0; k < r->count; ++k) r->esc_clear[k] = true;
+        if (r->comm_failed || !r->wkc_ok) continue;
+        esc_step(a, i, now);
+        monitor_step(a, i, now);
+        if (r->proc_frames && now - r->proc_since >= (uint64_t)a->cfg.esc_summary_s * 1000000000ull) {
+            event_detail d;
+            memset(&d, 0, sizeof(d));
+            d.joint = r->slot_joint[r->proc_origin];
+            d.slave = r->slot_slave[r->proc_origin];
+            d.value = r->proc_frames;
+            d.limit = (double)(now - r->proc_since) / 1e9;
+            record_event(a, EVT_ESC_PROC, i, now, &d);
+            r->proc_frames = 0;
+        }
+        for (int k = 0; k < r->count; ++k) {
+            arms_joint_state *s = &a->js[r->slot_joint[k]];
+            s->temperature = r->temp[k];
+            s->drive_frame_loss = r->drive_loss[k];
+            s->esc_valid = r->esc_valid[k];
+            memcpy(s->esc_errors, r->esc[k], ESC_ERR_BYTES);
+        }
     }
 }
 
@@ -410,17 +812,24 @@ static void check_limits(arms_t *a, int j, const arms_joint_state *s)
 static void cycle_rx(arms_t *a, uint64_t now)
 {
     bool ready = atomic_load_explicit(&a->ready, memory_order_relaxed);
-    bool all_good = true;
+    bool all_good = true, trip_now = false, late_cycle = false;
+    bool ev_wkc[ARMS_ARM_COUNT] = {false}, ev_fail[ARMS_ARM_COUNT] = {false}, ev_rec[ARMS_ARM_COUNT] = {false};
+    uint64_t dt = 0, gap = 0, rx_ns;
     int i, k;
 
     if (atomic_exchange_explicit(&a->reset_stats, false, memory_order_acq_rel)) do_reset_stats(a);
     a->cycle_start_ns = now;
     if (a->last_start_ns && now > a->last_start_ns) {
-        uint64_t dt = now - a->last_start_ns;
+        dt = now - a->last_start_ns;
         rs_add(&a->period, (double)dt);
-        if (dt * 2 > a->period_ns * 3) a->overruns++;
+        if (dt * 2 > a->period_ns * 3) {
+            a->overruns++;
+            late_cycle = true;
+        }
     }
     a->last_start_ns = now;
+    rx_ns = mono_ns();
+    if (a->last_tx_end_ns && rx_ns > a->last_tx_end_ns) gap = rx_ns - a->last_tx_end_ns;
 
     for (i = 0; i < ARMS_ARM_COUNT; ++i) {
         arm_rt *r = &a->arm[i];
@@ -443,10 +852,17 @@ static void cycle_rx(arms_t *a, uint64_t now)
                 r->wkc_bad++;
                 r->consecutive++;
                 if (r->consecutive > r->consecutive_max) r->consecutive_max = r->consecutive;
+                if (r->consecutive == 1 && !r->comm_failed) ev_wkc[i] = true;
                 if (r->consecutive >= a->cfg.wkc_tolerance && !r->comm_failed) {
                     r->comm_failed = true;
-                    for (int k = 0; k < r->count; ++k)
-                        atomic_fetch_and(&a->brake_known, ~ARMS_MASK_JOINT(r->slot_joint[k]));
+                    ev_fail[i] = true;
+                    for (int k = 0; k < r->count; ++k) {
+                        arms_mask bit = ARMS_MASK_JOINT(r->slot_joint[k]);
+                        atomic_fetch_and(&a->brake_known, ~bit);
+                        /* 驱动器断电后硬件零点生效，软件偏置同时切换为配置中已写入的 0 */
+                        if (atomic_fetch_and(&a->zero_pending, ~bit) & bit)
+                            atomic_store(&a->offset_rad[r->slot_joint[k]], 0.0);
+                    }
                     r->drops++;
                 }
             }
@@ -485,7 +901,26 @@ static void cycle_rx(arms_t *a, uint64_t now)
             r->consecutive = 0;
             r->recoveries++;
             r->auto_reset = true;
+            ev_rec[i] = true;
+            /* 驱动器可能已重新上电：错误计数从零重新累计，丢帧次数重新建立基准 */
+            for (k = 0; k < r->count; ++k) {
+                r->esc_clear[k] = true;
+                r->drive_loss[k] = -1;
+            }
         }
+    }
+
+    {
+        trace_entry *t = &a->trace[a->trace_count % TRACE_LEN];
+        t->cycle = a->cycles;
+        t->start_ns = now;
+        t->period_ns = dt > UINT32_MAX ? UINT32_MAX : (uint32_t)dt;
+        t->late_ns = a->wake_late_ns > UINT32_MAX ? UINT32_MAX : (uint32_t)a->wake_late_ns;
+        t->gap_ns = gap > UINT32_MAX ? UINT32_MAX : (uint32_t)gap;
+        t->work_ns = 0;
+        for (i = 0; i < ARMS_ARM_COUNT; ++i)
+            t->wkc[i] = a->arm[i].used ? (uint16_t)a->arm[i].wkc_last : 0;
+        a->trace_count++;
     }
 
     if (++a->poll_cnt >= a->poll_div) {
@@ -515,13 +950,31 @@ static void cycle_rx(arms_t *a, uint64_t now)
         }
         if (ready && a->power_off_action && !a->tripped && (offline || failed)) {
             a->tripped = true;
-            a->trip_joints = offline | failed;
+            a->trip_joints = offline ? offline : failed;
+            trip_now = true;
+        }
+    }
+
+    if (ready) {
+        for (i = 0; i < ARMS_ARM_COUNT; ++i) {
+            if (ev_fail[i]) record_event(a, EVT_FAIL, i, now, NULL);
+            else if (ev_wkc[i]) record_event(a, EVT_WKC, i, now, NULL);
+            if (ev_rec[i]) record_event(a, EVT_RECOVER, i, now, NULL);
+        }
+        if (late_cycle) record_event(a, EVT_LATE, -1, now, NULL);
+        if (trip_now) record_event(a, EVT_TRIP, -1, now, NULL);
+        if (a->cfg.drive_monitor && ++a->diag_cnt >= a->diag_div) {
+            a->diag_cnt = 0;
+            diag_tick(a, now);
         }
     }
 
     if (!ready) {
         a->stable_cycles = all_good ? a->stable_cycles + 1 : 0;
         if (a->stable_cycles >= a->ready_cycles) {
+            /* 预热完成：ESC 错误计数从零开始累计，排除上电过程中产生的计数 */
+            for (i = 0; i < ARMS_ARM_COUNT; ++i)
+                for (k = 0; k < a->arm[i].count; ++k) a->arm[i].esc_clear[k] = true;
             do_reset_stats(a);
             atomic_store_explicit(&a->ready_ns, now, memory_order_relaxed);
             atomic_store_explicit(&a->ready, true, memory_order_release);
@@ -529,12 +982,6 @@ static void cycle_rx(arms_t *a, uint64_t now)
     }
 }
 
-static double clampd(double v, double lo, double hi, bool *limited)
-{
-    if (v < lo) { *limited = true; return lo; }
-    if (v > hi) { *limited = true; return hi; }
-    return v;
-}
 
 static void finish(arms_t *a, int j, unsigned int result)
 {
@@ -542,7 +989,7 @@ static void finish(arms_t *a, int j, unsigned int result)
 }
 
 /* 尝试读取指令槽；有新指令时返回 true */
-static bool fetch_command(arms_t *a, int j, arms_command *cmd, double *move_s)
+static bool fetch_command(arms_t *a, int j, arms_command *cmd)
 {
     cmd_slot *sl = &a->slot[j];
     joint_ctl *c = &a->ctl[j];
@@ -557,7 +1004,6 @@ static bool fetch_command(arms_t *a, int j, arms_command *cmd, double *move_s)
     if (s1 != s2) return false;
     c->seq_seen = s1;
     *cmd = data.cmd;
-    *move_s = data.move_s;
     return true;
 }
 
@@ -573,7 +1019,7 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
     bool op = (r->al[k] & 0x0F) == 0x08;
     bool comm_ok = r->wkc_ok && !r->comm_failed;
     unsigned int req = atomic_exchange_explicit(&a->req[j], REQ_NONE, memory_order_acq_rel);
-    bool active, limited = false;
+    bool active, blocked = false;
 
     if (fault && !c->was_fault) c->fault_count++;
     c->was_fault = fault;
@@ -605,14 +1051,12 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
         } else {
             c->phase = CTL_ENABLING;
             c->phase_cycle = a->cycles;
+            /* 使能后指令为零，目标位置取当前位置 */
             c->cur.position = s->position;
             c->cur.velocity = 0.0;
             c->cur.torque = 0.0;
-            c->cur.kp = jc->kp_default;
-            c->cur.kd = jc->kd_default;
-            c->lim_min = s->position < jc->pos_min ? s->position : jc->pos_min;
-            c->lim_max = s->position > jc->pos_max ? s->position : jc->pos_max;
-            c->moving = false;
+            c->cur.kp = 0.0;
+            c->cur.kd = 0.0;
             c->timed_out = false;
             c->seq_seen = atomic_load_explicit(&a->slot[j].seq, memory_order_acquire) & ~1u;
             c->fresh_cycle = a->cycles;
@@ -625,7 +1069,6 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
         break;
     case REQ_HOLD:
         if (c->phase == CTL_ON) {
-            c->moving = false;
             c->cur.velocity = 0.0;
             c->cur.torque = 0.0;
             c->fresh_cycle = a->cycles;
@@ -667,37 +1110,13 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
     }
     case CTL_ON: {
         arms_command cmd;
-        double mv;
         out->controlword = KGU_CW_ENABLE;
-        if (fetch_command(a, j, &cmd, &mv)) {
+        if (fetch_command(a, j, &cmd)) {
             c->fresh_cycle = a->cycles;
             c->timed_out = false;
-            if (mv > 0.0) {
-                c->moving = true;
-                c->mv_from = c->cur.position;
-                c->mv_to = cmd.position;
-                c->mv_start = a->cycles;
-                c->mv_len = (uint64_t)(mv * (double)a->cycle_hz);
-                if (c->mv_len == 0) c->mv_len = 1;
-                c->cur.velocity = 0.0;
-                c->cur.torque = 0.0;
-                c->cur.kp = cmd.kp;
-                c->cur.kd = cmd.kd;
-            } else {
-                c->moving = false;
-                c->cur = cmd;
-            }
+            c->cur = cmd;
         }
-        if (c->moving) {
-            double t = (double)(a->cycles - c->mv_start) / (double)c->mv_len;
-            if (t >= 1.0) {
-                c->cur.position = c->mv_to;
-                c->moving = false;
-                c->fresh_cycle = a->cycles;
-            } else {
-                c->cur.position = c->mv_from + (c->mv_to - c->mv_from) * 0.5 * (1.0 - cos(M_PI * t));
-            }
-        } else if (a->cycles - c->fresh_cycle > a->timeout_cycles && !c->timed_out) {
+        if (a->cycles - c->fresh_cycle > a->timeout_cycles && !c->timed_out) {
             c->timed_out = true;
             if (strcmp(a->cfg.timeout_action, "disable") == 0) {
                 c->phase = CTL_OFF;
@@ -734,12 +1153,23 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
 
     active = c->phase == CTL_ENABLING || c->phase == CTL_ON;
     if (active) {
-        double pos = clampd(c->cur.position, c->lim_min, c->lim_max, &limited);
-        double vel = clampd(c->cur.velocity, -jc->vel_max, jc->vel_max, &limited);
-        double tff = clampd(c->cur.torque, -jc->tff_max, jc->tff_max, &limited);
-        double kp = clampd(c->cur.kp, 0.0, jc->kp_max, &limited);
-        double kd = clampd(c->cur.kd, 0.0, jc->kd_max, &limited);
+        /* 指令原样下发；kp、kd 为负或 NaN 时按 0 */
+        double pos = c->cur.position;
+        double vel = c->cur.velocity;
+        double tff = c->cur.torque;
+        double kp = c->cur.kp > 0.0 ? c->cur.kp : 0.0;
+        double kd = c->cur.kd > 0.0 ? c->cur.kd : 0.0;
         double d = (double)jc->direction;
+        /* 软位置限位：实际位置越界时，朝越界方向的速度和前馈置 0，位置不截断 */
+        if (s->position > jc->pos_limit_max) {
+            if (vel > 0.0 || tff > 0.0) blocked = true;
+            if (vel > 0.0) vel = 0.0;
+            if (tff > 0.0) tff = 0.0;
+        } else if (s->position < jc->pos_limit_min) {
+            if (vel < 0.0 || tff < 0.0) blocked = true;
+            if (vel < 0.0) vel = 0.0;
+            if (tff < 0.0) tff = 0.0;
+        }
         out->pos = (float)(d * (pos + atomic_load_explicit(&a->offset_rad[j], memory_order_relaxed)));
         out->vel = (float)(d * vel);
         out->tff = (float)(d * tff);
@@ -756,8 +1186,7 @@ static void control_joint(arms_t *a, arm_rt *r, int k, bool ready, kgu_command *
         s->cmd_position = s->position;
         s->cmd_velocity = s->cmd_torque = s->cmd_kp = s->cmd_kd = 0.0;
     }
-    s->cmd_moving = active && c->moving;
-    s->cmd_limited = limited;
+    s->cmd_pos_blocked = blocked;
     s->cmd_timeout = c->phase == CTL_ON && c->timed_out;
     s->fault_count = c->fault_count;
 }
@@ -792,6 +1221,11 @@ static void cycle_tx(arms_t *a, uint64_t now)
     end = mono_ns();
     if (end > a->cycle_start_ns && (double)(end - a->cycle_start_ns) > a->work_max)
         a->work_max = (double)(end - a->cycle_start_ns);
+    a->last_tx_end_ns = end;
+    if (a->trace_count && end > a->cycle_start_ns) {
+        uint64_t w = end - a->cycle_start_ns;
+        a->trace[(a->trace_count - 1) % TRACE_LEN].work_ns = w > UINT32_MAX ? UINT32_MAX : (uint32_t)w;
+    }
     publish(a);
 }
 
@@ -810,18 +1244,63 @@ static void *rt_main(void *arg)
         start = mono_ns();
         late = start > next_ns ? start - next_ns : 0;
 
+        a->wake_late_ns = late;
         cycle_rx(a, start);
         if ((double)late > a->wake_late_max) a->wake_late_max = (double)late;
         cycle_tx(a, mono_ns());
 
+        /*
+         * 下一次接收与本次发送至少间隔半个周期，保证本次发出的帧已绕链返回。
+         * 周期迟到后若紧接着接收，帧尚未返回，两臂会同时读到 WKC 为 0。
+         */
         next_ns += a->period_ns;
         start = mono_ns();
-        while (next_ns <= start) {
+        while (next_ns < start + a->period_ns / 2) {
             next_ns += a->period_ns;
             a->skipped++;
         }
     }
     return NULL;
+}
+
+/*
+ * 主站激活时 EtherLab 创建的内核线程（EtherCAT-OP 等）不受 rt_setup.sh 的线程迁移约束，
+ * 其定时器会在实时 CPU 上到期并在实时线程的上下文中处理。激活后将这些线程限制到
+ * 实时 CPU 和网口中断 CPU 以外的 CPU；线程随主站释放而退出，无需还原。失败时只记录日志。
+ */
+static void confine_master_threads(arms_t *a)
+{
+    cpu_set_t set;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    int moved = 0, failed = 0, err = 0;
+    DIR *dir;
+    struct dirent *de;
+
+    if (a->rt_cpu < 0 && a->cfg.irq_cpu < 0) return;
+    CPU_ZERO(&set);
+    for (long c = 0; c < ncpu && c < CPU_SETSIZE; ++c)
+        if (c != a->rt_cpu && c != a->cfg.irq_cpu) CPU_SET((int)c, &set);
+    if (CPU_COUNT(&set) == 0) return;
+    dir = opendir("/proc");
+    if (!dir) return;
+    while ((de = readdir(dir)) != NULL) {
+        char path[64], comm[32] = "";
+        FILE *fp;
+        char *end;
+        long pid = strtol(de->d_name, &end, 10);
+        if (*end || pid <= 0) continue;
+        snprintf(path, sizeof(path), "/proc/%ld/comm", pid);
+        fp = fopen(path, "r");
+        if (!fp) continue;
+        if (!fgets(comm, sizeof(comm), fp)) comm[0] = '\0';
+        fclose(fp);
+        if (strncmp(comm, "EtherCAT-", 9) != 0) continue;
+        if (sched_setaffinity((pid_t)pid, sizeof(set), &set) == 0) moved++;
+        else { failed++; err = errno; }
+    }
+    closedir(dir);
+    if (failed) logf_(a, "警告: %d 个 EtherLab 内核线程未能限制 CPU: %s", failed, strerror(err));
+    else if (moved) logf_(a, "EtherLab 内核线程 %d 个，已限制在实时 CPU 和中断 CPU 以外", moved);
 }
 
 static arms_status start_rt(arms_t *a)
@@ -831,25 +1310,26 @@ static arms_status start_rt(arms_t *a)
     int ret;
     bool realtime = true;
 
-    ret = pthread_attr_init(&attr);
-    if (ret) { set_error("实时线程属性初始化失败: %s", strerror(ret)); return ARMS_E_SYSTEM; }
-    ret = pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
-    if (!ret) ret = pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    pthread_attr_init(&attr);
+    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
     memset(&sp, 0, sizeof(sp));
     sp.sched_priority = a->cfg.rt_priority;
-    if (!ret) ret = pthread_attr_setschedparam(&attr, &sp);
-    if (!ret && a->rt_cpu >= 0) {
+    pthread_attr_setschedparam(&attr, &sp);
+    if (a->rt_cpu >= 0) {
         cpu_set_t set;
         CPU_ZERO(&set);
         CPU_SET(a->rt_cpu, &set);
-        ret = pthread_attr_setaffinity_np(&attr, sizeof(set), &set);
+        pthread_attr_setaffinity_np(&attr, sizeof(set), &set);
     }
-    if (!ret) ret = pthread_create(&a->thread, &attr, rt_main, a);
-    pthread_attr_destroy(&attr);
+    ret = pthread_create(&a->thread, &attr, rt_main, a);
     if (ret == EPERM && a->opt.backend == ARMS_BACKEND_MOCK) {
+        pthread_attr_destroy(&attr);
         realtime = false;
-        ret = pthread_create(&a->thread, NULL, rt_main, a);
+        pthread_attr_init(&attr);
+        ret = pthread_create(&a->thread, &attr, rt_main, a);
     }
+    pthread_attr_destroy(&attr);
     if (ret == EPERM) {
         set_error("无法创建 SCHED_FIFO 实时线程：权限不足，需要 root");
         return ARMS_E_SYSTEM;
@@ -866,7 +1346,7 @@ static arms_status start_rt(arms_t *a)
         else
             logf_(a, "实时线程: SCHED_FIFO %d, 未绑定 CPU, %u Hz", a->cfg.rt_priority, a->cycle_hz);
     } else {
-        logf_(a, "警告: 无实时调度权限，模拟后端使用默认线程属性，时序统计仅供参考");
+        logf_(a, "警告: 非 root 运行，模拟后端以普通线程运行，时序统计不具实时性");
     }
     return ARMS_OK;
 }
@@ -883,7 +1363,7 @@ static void close_buses(arms_t *a)
 static void stop_and_free(arms_t *a)
 {
     if (a->thread_started) {
-        /* 先失能并保持若干周期，让驱动器在通信停止前进入失能 */
+        /* 先失能并保持若干周期，使驱动器在通信停止前进入失能状态 */
         post(a, a->joints, REQ_DISABLE);
         usleep(50000);
         atomic_store(&a->stop, true);
@@ -921,7 +1401,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     if (options->config_path) {
         snprintf(path, sizeof(path), "%s", options->config_path);
     } else if (!arms_config_default_path(path, sizeof(path))) {
-        set_error("找不到配置文件：请用 -c 或 ARMS_CONFIG 指定可读的 arms.json");
+        set_error("找不到配置文件（依次查找 $ARMS_CONFIG、/etc/bxi/arms.json、./config/arms.json）");
         free(a);
         return ARMS_E_CONFIG;
     }
@@ -947,11 +1427,17 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     if (a->overspeed_cycles == 0) a->overspeed_cycles = 1;
     if (a->overtorque_cycles == 0) a->overtorque_cycles = 1;
     a->protect.joint = -1;
+    a->diag_div = a->cycle_hz >= 100u ? a->cycle_hz / 100u : 1u; /* 驱动器监控每 10 ms 推进一步 */
+    for (int i = 0; i < ARMS_ARM_COUNT; ++i)
+        for (int k = 0; k < BUS_MAX_SLAVES; ++k) {
+            a->arm[i].temp[k] = NAN;
+            a->arm[i].drive_loss[k] = -1;
+        }
     atomic_store(&a->enable_timeout_cycles, DEFAULT_WAIT_MS * a->cycle_hz / 1000u);
     a->mode = options->mode != ARMS_MODE_CONFIG ? options->mode : a->cfg.mode;
     a->rt_cpu = options->rt_cpu >= -1 ? options->rt_cpu : a->cfg.rt_cpu;
-    if (a->rt_cpu >= CPU_SETSIZE || a->rt_cpu >= sysconf(_SC_NPROCESSORS_CONF)) {
-        set_error("CPU %d 不存在或超出亲和性掩码容量", a->rt_cpu);
+    if (a->rt_cpu >= sysconf(_SC_NPROCESSORS_CONF)) {
+        set_error("CPU %d 不存在", a->rt_cpu);
         free(a);
         return ARMS_E_ARG;
     }
@@ -974,6 +1460,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     a->ignored = (options->ignore_mask >= 0 ? (arms_mask)options->ignore_mask : a->cfg.ignore_mask) & ARMS_MASK_ALL;
     check = options->check_motors >= 0 ? options->check_motors != 0 : a->cfg.check_motors;
     a->power_off_action = strcmp(a->cfg.offline_action, "power_off") == 0;
+    resolve_event_log(a, options->event_log);
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         atomic_init(&a->offset_rad[j], a->cfg.joint[j].offset_rad);
         if (!a->cfg.joint[j].present) continue;
@@ -991,6 +1478,8 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         a->js[j].arm = -1;
         a->js[j].slave = -1;
         a->js[j].mode = ARMS_JS_ABSENT;
+        a->js[j].temperature = NAN;
+        a->js[j].drive_frame_loss = -1;
     }
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         const arms_joint_config *jc = &a->cfg.joint[j];
@@ -1038,7 +1527,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
         p.sync0_shift_ns = 0;
         p.vendor_id = a->cfg.vendor_id;
         p.product_code = a->cfg.product_code;
-        p.log = logf_;
+        p.log = bus_log_adapter;
         p.log_user = a;
         if (r->ops->open(&r->bus, &p, err, sizeof(err)) != 0) {
             set_error("%s 臂: %s", arms_arm_name(i), err);
@@ -1145,6 +1634,7 @@ arms_status arms_open(const arms_options *options, arms_t **out)
     }
     publish(a); /* 外部周期尚未运行时也能读取已配置的关节、主站和初始状态。 */
     a->activated_ns = mono_ns();
+    if (a->opt.backend != ARMS_BACKEND_MOCK) confine_master_threads(a);
 
     if (a->mode == ARMS_MODE_EXTERNAL) {
         logf_(a, "外部驱动模式: 周期 %u Hz, 等待调用方周期调用 arms_rx/arms_tx", a->cycle_hz);
@@ -1169,8 +1659,8 @@ void arms_close(arms_t *a)
         arms_mask abnormal = atomic_load(&a->brake_released) | atomic_load(&a->brake_held) | ~atomic_load(&a->brake_known);
         for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; j++)
             if (a->brake_touched & abnormal & ARMS_MASK_JOINT(j)) {
-                if (arms_set_brake(a, j, ARMS_BRAKE_NORMAL) != ARMS_OK)
-                    logf_(a, "警告：关节 %d 未能恢复正常抱闸控制，请保持机械支撑", j);
+                if (arms_set_brake(a, j, ARMS_BRAKE_NORMAL, true) != ARMS_OK)
+                    logf_(a, "警告: 关节 %d 未能恢复正常抱闸控制", j);
             }
         stop_and_free(a);
     }
@@ -1288,6 +1778,237 @@ arms_run_mode arms_mode(const arms_t *a) { return a ? a->mode : ARMS_MODE_CONFIG
 int arms_rt_cpu(const arms_t *a) { return a ? a->rt_cpu : -1; }
 const char *arms_backend_name(const arms_t *a) { return a && a->ops ? a->ops->name : "?"; }
 const char *arms_config_path(const arms_t *a) { return a ? a->cfg.path : ""; }
+const char *arms_event_log_path(const arms_t *a) { return a ? a->event_log : ""; }
+
+static const char *event_name(int kind)
+{
+    switch (kind) {
+    case EVT_WKC: return "WKC 异常";
+    case EVT_FAIL: return "通信失败";
+    case EVT_RECOVER: return "通信恢复";
+    case EVT_LATE: return "周期延迟";
+    case EVT_TRIP: return "离线保护触发";
+    case EVT_ESC: return "线路错误计数增加";
+    case EVT_ESC_PROC: return "从站拒绝的帧（汇总）";
+    case EVT_DRIVE_LOSS: return "驱动器丢帧";
+    case EVT_TEMP_WARN: return "温度告警";
+    case EVT_OVERTEMP: return "过温保护";
+    default: return "?";
+    }
+}
+
+/* 输出各从站的温度、驱动器丢帧次数和非零的 ESC 错误计数 */
+static void write_slave_table(FILE *fp, const event_record *e)
+{
+    for (int i = 0; i < ARMS_ARM_COUNT; ++i) {
+        if (!e->arm[i].used) continue;
+        fprintf(fp, "  %-5s 温度℃/驱动器丢帧:", arms_arm_name(i));
+        for (int s = 0; s < e->arm[i].count; ++s) {
+            if (isnan(e->arm[i].temp[s])) fprintf(fp, "  -");
+            else fprintf(fp, "  %.0f", e->arm[i].temp[s]);
+            if (e->arm[i].drive_loss[s] < 0) fprintf(fp, "/-");
+            else fprintf(fp, "/%d", e->arm[i].drive_loss[s]);
+        }
+        fputc('\n', fp);
+        for (int s = 0; s < e->arm[i].count; ++s) {
+            bool any = false;
+            if (!e->arm[i].esc_valid[s]) continue;
+            for (unsigned int b = 0; b < ESC_ERR_BYTES; ++b) {
+                if (!esc_names[b] || !e->arm[i].esc[s][b]) continue;
+                if (!any) fprintf(fp, "    关节 %d（链上位置 %d）ESC 错误计数:", e->arm[i].joint[s], s);
+                fprintf(fp, " %s %u", esc_names[b], e->arm[i].esc[s][b]);
+                any = true;
+            }
+            if (any) fputc('\n', fp);
+        }
+    }
+}
+
+static void write_detail(FILE *fp, const event_record *e)
+{
+    const event_detail *d = &e->detail;
+    if (!e->has_detail) return;
+    switch (e->kind) {
+    case EVT_ESC:
+        fprintf(fp, "  关节 %d（链上位置 %d）计数变化:", d->joint, d->slave);
+        for (unsigned int b = 0; b < ESC_ERR_BYTES; ++b)
+            if (esc_names[b] && d->after[b] != d->before[b])
+                fprintf(fp, " %s %u→%u", esc_names[b], d->before[b], d->after[b]);
+        fputc('\n', fp);
+        break;
+    case EVT_ESC_PROC:
+        fprintf(fp,
+                "  %.0f 秒内被从站处理单元拒绝的帧 %.0f 个，首个拒绝位置为关节 %d（链上位置 %d）；线路类计数未变化\n",
+                d->limit, d->value, d->joint, d->slave);
+        break;
+    case EVT_DRIVE_LOSS:
+        fprintf(fp, "  关节 %d（链上位置 %d）驱动器自报 EtherCAT 丢帧次数 %.0f → %.0f\n", d->joint, d->slave, d->limit,
+                d->value);
+        break;
+    case EVT_TEMP_WARN:
+    case EVT_OVERTEMP:
+        fprintf(fp, "  关节 %d（链上位置 %d）执行器温度 %.0f ℃，阈值 %.0f ℃%s\n", d->joint, d->slave, d->value, d->limit,
+                e->kind == EVT_OVERTEMP ? "；全部关节已失能并锁定，降温后 reset" : "");
+        break;
+    default:
+        break;
+    }
+}
+
+/* 本地时间 YYYY-mm-dd HH:MM:SS，micro 为 true 时附加微秒 */
+static void format_real(int64_t ns, bool micro, char *buf, size_t size)
+{
+    time_t sec = (time_t)(ns / 1000000000LL);
+    struct tm tm;
+    char head[32];
+    localtime_r(&sec, &tm);
+    strftime(head, sizeof(head), "%Y-%m-%d %H:%M:%S", &tm);
+    if (micro) snprintf(buf, size, "%s.%06ld", head, (long)(ns % 1000000000LL / 1000));
+    else snprintf(buf, size, "%s", head);
+}
+
+static FILE *open_event_log(arms_t *a)
+{
+    char dir[PATH_MAX];
+    const char *slash;
+    FILE *fp;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        slash = strrchr(a->event_log, '/');
+        if (slash) {
+            snprintf(dir, sizeof(dir), "%.*s", (int)(slash - a->event_log), a->event_log);
+            (void)mkdir(dir, 0755); /* 已存在或无法创建时由 fopen 报告 */
+        }
+        fp = fopen(a->event_log, "a");
+        if (fp) return fp;
+        if (strcmp(a->event_log, "/tmp/arms_comm_events.log") == 0) break;
+        logf_(a, "通信事件日志无法写入 %s（%s），改写到 /tmp/arms_comm_events.log", a->event_log, strerror(errno));
+        snprintf(a->event_log, sizeof(a->event_log), "/tmp/arms_comm_events.log");
+    }
+    set_error("无法写入通信事件日志 %s: %s", a->event_log, strerror(errno));
+    return NULL;
+}
+
+static void write_event(arms_t *a, FILE *fp, const event_record *e)
+{
+    char when[48], since[48];
+    bool timing = e->kind != EVT_TEMP_WARN && e->kind != EVT_OVERTEMP && e->kind != EVT_ESC_PROC;
+    unsigned int shown = !timing ? 0
+                         : (e->kind == EVT_FAIL || e->kind == EVT_TRIP) ? e->n
+                                                                         : (e->n < 16 ? e->n : 16);
+    format_real(e->real_ns, true, when, sizeof(when));
+    format_real(e->real_ns - 2000000000LL, false, since, sizeof(since));
+    fprintf(fp, "==== %s  %s", when, event_name(e->kind));
+    if (e->which_arm >= 0) fprintf(fp, "  %s 臂", arms_arm_name(e->which_arm));
+    fprintf(fp, "  周期 %llu\n", (unsigned long long)e->cycle);
+    if (e->suppressed) fprintf(fp, "  此前 1 秒内另有 %u 次同类事件未单独记录\n", e->suppressed);
+    fprintf(fp, "  跳过周期 %llu  迟到周期(>1.5T) %llu  周期 %u Hz\n", (unsigned long long)e->skipped,
+            (unsigned long long)e->overruns, a->cycle_hz);
+    for (int i = 0; i < ARMS_ARM_COUNT; ++i) {
+        if (!e->arm[i].used) continue;
+        fprintf(fp, "  %-5s 链路 %s  通信%s  WKC %u/%u  连续异常 %u  累计异常 %llu  AL", arms_arm_name(i),
+                e->arm[i].link_up ? "UP" : "DOWN", e->arm[i].comm_failed ? "失败" : "正常", e->arm[i].wkc,
+                e->arm[i].wkc_expected, e->arm[i].consecutive, (unsigned long long)e->arm[i].wkc_bad);
+        for (int k = 0; k < e->arm[i].count; ++k) fprintf(fp, " %02x", e->arm[i].al[k]);
+        fputc('\n', fp);
+    }
+    write_detail(fp, e);
+    write_slave_table(fp, e);
+    if (shown) {
+        fprintf(fp, "  最近 %u 个周期（旧 → 新；时刻相对本事件）:\n", shown);
+        fprintf(fp, "     相对ms        周期    间隔us  唤醒延迟us  发送→接收us   处理us  WKC左 WKC右\n");
+        for (unsigned int k = e->n - shown; k < e->n; ++k) {
+            const trace_entry *t = &e->trace[k];
+            fprintf(fp, "  %9.3f  %10llu  %8.1f  %10.1f  %11.1f  %7.1f  %5u %5u\n",
+                    ((double)t->start_ns - (double)e->mono_ns) / 1e6, (unsigned long long)t->cycle,
+                    t->period_ns / 1e3, t->late_ns / 1e3, t->gap_ns / 1e3, t->work_ns / 1e3, t->wkc[0], t->wkc[1]);
+        }
+    }
+    if (timing) fprintf(fp, "  对照内核日志: journalctl -k -o short-precise --since \"%s\"\n", since);
+    fputc('\n', fp);
+}
+
+typedef struct {
+    int arm, slave, joint;
+    uint8_t msg[EMERGENCY_MSG_BYTES];
+} emergency_msg;
+
+/* CoE 紧急报文：错误码（2 字节小端）、错误寄存器（1 字节）、厂家数据（5 字节） */
+static void write_emergency(arms_t *a, FILE *fp, const emergency_msg *m)
+{
+    struct timespec rt;
+    char when[48];
+    arms_joint_state s;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    format_real((int64_t)rt.tv_sec * 1000000000LL + rt.tv_nsec, true, when, sizeof(when));
+    fprintf(fp, "==== %s  驱动器紧急报文  %s 臂\n", when, arms_arm_name(m->arm));
+    fprintf(fp, "  关节 %d（链上位置 %d）错误码 0x%04x  错误寄存器 0x%02x  厂家数据 %02x %02x %02x %02x %02x\n",
+            m->joint, m->slave, (unsigned)(m->msg[0] | (m->msg[1] << 8)), m->msg[2], m->msg[3], m->msg[4], m->msg[5],
+            m->msg[6], m->msg[7]);
+    if (arms_read_joint(a, m->joint, &s) == ARMS_OK)
+        fprintf(fp, "  取出时状态 %s  状态字 0x%04x  错误码(0x603F) 0x%04x\n", arms_joint_mode_name(s.mode),
+                s.status_word, s.error_code);
+    fputc('\n', fp);
+}
+
+int arms_log_events(arms_t *a)
+{
+    uint64_t total, i;
+    int written = 0, ne = 0;
+    emergency_msg emcy[EMERGENCY_BATCH];
+    FILE *fp;
+    if (!a) return -1;
+    for (int arm = 0; arm < ARMS_ARM_COUNT; ++arm) {
+        arm_rt *r = &a->arm[arm];
+        if (!r->used || !r->bus) continue;
+        for (int k = 0; k < r->count && ne < EMERGENCY_BATCH; ++k) {
+            while (ne < EMERGENCY_BATCH && r->ops->emerg_pop(r->bus, k, emcy[ne].msg) == 1) {
+                emcy[ne].arm = arm;
+                emcy[ne].slave = r->slot_slave[k];
+                emcy[ne].joint = r->slot_joint[k];
+                ne++;
+            }
+        }
+    }
+    total = atomic_load_explicit(&a->evt_count, memory_order_acquire);
+    if (total == a->evt_read && ne == 0) return 0;
+    fp = open_event_log(a);
+    if (!fp) return -1;
+    if (!a->evt_header_done) {
+        struct timespec rt;
+        char when[48];
+        clock_gettime(CLOCK_REALTIME, &rt);
+        format_real((int64_t)rt.tv_sec * 1000000000LL + rt.tv_nsec, false, when, sizeof(when));
+        fprintf(fp, "#### 会话 %s  arms_driver %s  后端 %s  配置 %s  WKC 容忍 %u 次  离线处理 %s\n\n", when,
+                arms_version(), arms_backend_name(a), a->cfg.path, a->cfg.wkc_tolerance, a->cfg.offline_action);
+        a->evt_header_done = true;
+    }
+    if (total - a->evt_read > EVENT_RING) {
+        fprintf(fp, "==== %llu 条通信事件因产生过快被覆盖，未写入\n\n",
+                (unsigned long long)(total - a->evt_read - EVENT_RING));
+        a->evt_read = total - EVENT_RING;
+    }
+    for (i = a->evt_read; i < total; ++i) {
+        event_buf b;
+        load_words(&b, a->evt_words[i % EVENT_RING], WORDS_UP(event_record));
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&a->evt_begin, memory_order_relaxed) > i + EVENT_RING) {
+            fprintf(fp, "==== 1 条通信事件在读取时被新事件覆盖，未写入\n\n");
+            continue;
+        }
+        write_event(a, fp, &b.r);
+        written++;
+    }
+    a->evt_read = total;
+    for (int m = 0; m < ne; ++m) write_emergency(a, fp, &emcy[m]);
+    written += ne;
+    fclose(fp);
+    return written;
+}
+
+void arms_clear_esc_counters(arms_t *a)
+{
+    if (a) atomic_store_explicit(&a->esc_clear_all, true, memory_order_release);
+}
 arms_mask arms_opened_joints(const arms_t *a) { return a ? a->joints : 0; }
 arms_mask arms_ignored_joints(const arms_t *a) { return a ? a->ignored : 0; }
 arms_mask arms_missing_joints(const arms_t *a) { return a ? a->missing : 0; }
@@ -1320,7 +2041,7 @@ arms_status arms_check_online(arms_t *a, arms_mask *offline_out)
         const arms_arm_stats *as;
         if (!(a->joints & ARMS_MASK_JOINT(j))) continue;
         as = &s.stats.arm[a->cfg.joint[j].arm];
-        if (s.s[j].al_state != 0x08 || !as->link_up || as->comm_failed || as->wkc_last != as->wkc_expected)
+        if ((s.s[j].al_state & 0x0F) != 0x08 || as->comm_failed || as->wkc_last != as->wkc_expected)
             off |= ARMS_MASK_JOINT(j);
     }
     if (offline_out) *offline_out = off;
@@ -1380,17 +2101,10 @@ arms_status arms_get_limits(const arms_t *a, int joint, arms_joint_limits *l)
     if (!a || !l || joint < ARMS_JOINT_FIRST || joint > ARMS_JOINT_LAST || !(a->joints & ARMS_MASK_JOINT(joint)))
         return ARMS_E_ARG;
     jc = &a->cfg.joint[joint];
-    l->pos_min = jc->pos_min;
-    l->pos_max = jc->pos_max;
-    l->vel_max = jc->vel_max;
-    l->tff_max = jc->tff_max;
-    l->kp_max = jc->kp_max;
-    l->kd_max = jc->kd_max;
-    l->kp_default = jc->kp_default;
-    l->kd_default = jc->kd_default;
-    l->home = jc->home;
-    l->vel_fault = jc->vel_fault;
-    l->torque_fault = jc->tor_fault;
+    l->pos_limit_min = jc->pos_limit_min;
+    l->pos_limit_max = jc->pos_limit_max;
+    l->vel_limit = jc->vel_limit;
+    l->tor_limit = jc->tor_limit;
     return ARMS_OK;
 }
 
@@ -1409,21 +2123,13 @@ static const char *result_text(unsigned int r)
     case RES_STATE: return "从站不在 OP 或请求被取消";
     case RES_COMM: return "通信未就绪或已失败";
     case RES_TRIP: return "离线保护已触发，需重新上电并通过在线检查";
-    case RES_PROTECT: return "超速/超力矩保护已触发，需先 reset";
+    case RES_PROTECT: return "超速/超力矩/过温保护已触发，需先 reset";
     case RES_PENDING: return "未响应";
     }
     return "?";
 }
 
 /* 向 mask 中已打开的关节发出请求并等待结果；失败时返回首个失败关节的说明 */
-/* 等待周期上下文发布两次快照，使随后的读取接口看到刚生效的指令或偏置（最长 100 ms） */
-static void wait_snapshot(arms_t *a)
-{
-    unsigned int s0 = atomic_load(&a->seq);
-    uint64_t until = mono_ns() + 100000000ull;
-    while (atomic_load(&a->seq) - s0 < 4u && mono_ns() < until) usleep(500);
-}
-
 static arms_status request_and_wait(arms_t *a, arms_mask mask, unsigned int req, unsigned int timeout_ms,
                                     const char *what)
 {
@@ -1448,7 +2154,7 @@ static arms_status request_and_wait(arms_t *a, arms_mask mask, unsigned int req,
         atomic_store(&a->res[j], RES_PENDING);
         atomic_store(&a->req[j], req);
     }
-    /* 周期上下文自身也按 timeout_ms 结束请求，这里多留余量 */
+    /* 周期上下文按 timeout_ms 结束请求，此处等待时间留有余量 */
     deadline = mono_ns() + ((uint64_t)timeout_ms + 200u) * 1000000ull;
     while (pending && mono_ns() < deadline) {
         pending = false;
@@ -1466,8 +2172,10 @@ static arms_status request_and_wait(arms_t *a, arms_mask mask, unsigned int req,
         }
     }
     if (bad < 0) {
-        /* 等快照包含本次结果后再返回，保证随后的 arms_read()/arms_set_command() 看到新状态 */
-        wait_snapshot(a);
+        /* 快照包含本次结果后返回，随后的 arms_read()/arms_set_command() 可见新状态 */
+        unsigned int s0 = atomic_load(&a->seq);
+        uint64_t until = mono_ns() + 100000000ull;
+        while (atomic_load(&a->seq) - s0 < 4u && mono_ns() < until) usleep(500);
         return ARMS_OK;
     }
     if (req == REQ_ENABLE) {
@@ -1487,13 +2195,20 @@ static arms_status request_and_wait(arms_t *a, arms_mask mask, unsigned int req,
     return ARMS_E_STATE;
 }
 
+/* 等待周期上下文发布两次快照，使随后的读取接口看到刚生效的指令或偏置（最长 100 ms） */
+static void wait_snapshot(arms_t *a)
+{
+    unsigned int s0 = atomic_load(&a->seq);
+    uint64_t until = mono_ns() + 100000000ull;
+    while (atomic_load(&a->seq) - s0 < 4u && mono_ns() < until) usleep(500);
+}
+
 /*
- * 抱闸不是正常控制模式时拒绝使能：强制松闸下失能后抱闸不闭合，关节失去保持；
- * 强制抱闸下电机会顶着抱闸出力。
+ * 检查关节抱闸是否为正常控制模式（Pn075=0），用于要求正常模式的操作。
  */
 static bool brake_abnormal(arms_t *a, arms_mask mask, const char *what)
 {
-    /* 库调用方不必先运行 CLI 自检。只在非实时管理上下文补读未知模式。 */
+    /* 抱闸模式未知时在管理上下文中补读 */
     arms_mask unknown = mask & ~atomic_load(&a->brake_known);
     for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_brake_mode mode;
@@ -1511,10 +2226,63 @@ static bool brake_abnormal(arms_t *a, arms_mask mask, const char *what)
     return true;
 }
 
+/*
+ * 使能前将所选关节的抱闸切回正常控制（Pn075=0）：强制松闸（1）或强制抱闸（2）
+ * 写 0 并回读确认，不保存；模式未知时同样写 0。任一关节失败则拒绝本次操作。
+ */
+static arms_status brake_to_normal(arms_t *a, arms_mask mask, const char *what)
+{
+    mask &= a->joints;
+    for (int j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
+        arms_mask bit = ARMS_MASK_JOINT(j);
+        arms_brake_mode mode = ARMS_BRAKE_UNKNOWN;
+        arms_status st;
+        if (!(mask & bit)) continue;
+        if (atomic_load(&a->brake_known) & bit) {
+            if (atomic_load(&a->brake_released) & bit) mode = ARMS_BRAKE_RELEASE;
+            else if (atomic_load(&a->brake_held) & bit) mode = ARMS_BRAKE_HOLD;
+            else mode = ARMS_BRAKE_NORMAL;
+        } else if (arms_get_brake(a, j, &mode) != ARMS_OK) {
+            mode = ARMS_BRAKE_UNKNOWN;
+        }
+        if (mode == ARMS_BRAKE_NORMAL) continue;
+        st = arms_set_brake(a, j, ARMS_BRAKE_NORMAL, true);
+        if (st != ARMS_OK) {
+            char reason[sizeof(last_error)];
+            snprintf(reason, sizeof(reason), "%s", last_error);
+            set_error("%s被拒绝: 关节 %d 的抱闸无法切回正常控制（Pn075=0）: %s", what, j, reason);
+            return st;
+        }
+        if (mode == ARMS_BRAKE_UNKNOWN)
+            logf_(a, "关节 %d 抱闸模式未知，已写入正常控制抱闸（Pn075=0）并回读确认，未保存", j);
+        else
+            logf_(a, "关节 %d 抱闸由%s（Pn075=%d）自动切为正常控制（Pn075=0），未保存", j,
+                  mode == ARMS_BRAKE_RELEASE ? "强制松闸" : "强制抱闸", (int)mode);
+    }
+    return ARMS_OK;
+}
+
+/* 硬件校零后、驱动器重新上电前，拒绝对该关节执行 what */
+static bool zero_pending(arms_t *a, arms_mask mask, const char *what)
+{
+    arms_mask p = atomic_load(&a->zero_pending) & mask & a->joints;
+    if (!p) return false;
+    set_error("%s被拒绝: 关节 %d 已硬件校零（Pn101），需给该臂驱动器断电并重新上电后零点才生效", what,
+              __builtin_ctz(p));
+    return true;
+}
+
+arms_mask arms_zero_pending(const arms_t *a)
+{
+    return a ? atomic_load(&((arms_t *)a)->zero_pending) : 0;
+}
+
 arms_status arms_enable(arms_t *a, arms_mask joints, unsigned int timeout_ms)
 {
+    arms_status st;
     if (!a) return ARMS_E_ARG;
-    if (brake_abnormal(a, a->joints, "使能")) return ARMS_E_STATE;
+    if (zero_pending(a, joints, "使能")) return ARMS_E_STATE;
+    if ((st = brake_to_normal(a, joints, "使能")) != ARMS_OK) return st;
     return request_and_wait(a, joints, REQ_ENABLE, timeout_ms, "使能");
 }
 
@@ -1533,12 +2301,8 @@ arms_status arms_free(arms_t *a, arms_mask joints, double kd)
         set_error("零力矩拖动: kd 必须是非负数");
         return ARMS_E_ARG;
     }
-    for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j)
-        if ((joints & ARMS_MASK_JOINT(j)) && kd > a->cfg.joint[j].kd_max) {
-            set_error("零力矩拖动: kd %.3f 超过关节 %d 的 gain_max.kd %.3f", kd, j, a->cfg.joint[j].kd_max);
-            return ARMS_E_ARG;
-        }
-    if (brake_abnormal(a, a->joints, "零力矩拖动")) return ARMS_E_STATE;
+    if (zero_pending(a, joints, "零力矩拖动")) return ARMS_E_STATE;
+    if ((st = brake_to_normal(a, joints, "零力矩拖动")) != ARMS_OK) return st;
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j) {
         arms_joint_state s;
         if (!(joints & ARMS_MASK_JOINT(j))) continue;
@@ -1551,12 +2315,12 @@ arms_status arms_free(arms_t *a, arms_mask joints, double kd)
         arms_command c;
         if (!(joints & ARMS_MASK_JOINT(j))) continue;
         arms_read_joint(a, j, &s);
-        c.position = s.cmd_position; /* kp = 0 时不起作用，取当前指令以通过限位 */
+        c.position = s.cmd_position; /* kp = 0 时位置不起作用 */
         c.velocity = 0.0;
         c.torque = 0.0;
         c.kp = 0.0;
         c.kd = kd;
-        if ((st = arms_set_command(a, j, &c, 0.0)) != ARMS_OK) return st;
+        if ((st = arms_set_command(a, j, &c)) != ARMS_OK) return st;
     }
     wait_snapshot(a);
     return ARMS_OK;
@@ -1566,11 +2330,8 @@ arms_status arms_reset(arms_t *a, arms_mask joints, unsigned int timeout_ms)
 {
     int j;
     if (!a) return ARMS_E_ARG;
-    joints &= a->joints;
-    if (!joints) { set_error("复位: 没有选中已打开的关节"); return ARMS_E_ARG; }
-    if (!arms_ready(a)) { set_error("复位: 预热未完成"); return ARMS_E_STATE; }
     for (j = ARMS_JOINT_FIRST; j <= ARMS_JOINT_LAST; ++j)
-        if ((joints & ARMS_MASK_JOINT(j))) atomic_store(&a->clear_comm[a->cfg.joint[j].arm], true);
+        if ((joints & a->joints & ARMS_MASK_JOINT(j))) atomic_store(&a->clear_comm[a->cfg.joint[j].arm], true);
     atomic_store(&a->clear_protect, true);
     return request_and_wait(a, joints, REQ_RESET, timeout_ms, "复位");
 }
@@ -1589,7 +2350,7 @@ arms_status arms_hold(arms_t *a, arms_mask joints)
     return ARMS_OK;
 }
 
-arms_status arms_set_command(arms_t *a, int joint, const arms_command *cmd, double move_s)
+arms_status arms_set_command(arms_t *a, int joint, const arms_command *cmd)
 {
     arms_joint_state s;
     cmd_slot *sl;
@@ -1597,10 +2358,9 @@ arms_status arms_set_command(arms_t *a, int joint, const arms_command *cmd, doub
         set_error("关节 %d 未打开", joint);
         return ARMS_E_ARG;
     }
-    if (!isfinite(cmd->position) || !isfinite(cmd->velocity) || !isfinite(cmd->torque) || !isfinite(cmd->kp) ||
-        !isfinite(cmd->kd) || cmd->kp < 0.0 || cmd->kd < 0.0 || !isfinite(move_s) || move_s < 0.0 ||
-        move_s > MOVE_MAX_S) {
-        set_error("关节 %d 的指令无效（数值非有限、增益为负或过渡时间超出 0..%.0f s）", joint, MOVE_MAX_S);
+    /* kp、kd 不检查，为负或 NaN 时在周期处理中按 0 下发 */
+    if (!isfinite(cmd->position) || !isfinite(cmd->velocity) || !isfinite(cmd->torque)) {
+        set_error("关节 %d 的指令无效（位置、速度或前馈不是有限值）", joint);
         return ARMS_E_ARG;
     }
     arms_read_joint(a, joint, &s);
@@ -1612,14 +2372,14 @@ arms_status arms_set_command(arms_t *a, int joint, const arms_command *cmd, doub
     pthread_mutex_lock(&a->cmd_lock);
     atomic_fetch_add_explicit(&sl->seq, 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
-    cmd_payload data = {*cmd, move_s};
+    cmd_payload data = {*cmd};
     store_words(sl->data, &data, WORDS_OF(cmd_payload));
     atomic_fetch_add_explicit(&sl->seq, 1, memory_order_release);
     pthread_mutex_unlock(&a->cmd_lock);
     return ARMS_OK;
 }
 
-/* Blocking mailbox operations belong to the non-real-time management thread. */
+/* 阻塞的邮箱访问只在非实时管理线程中执行 */
 arms_status arms_get_joint_info(const arms_t *a, int j, arms_joint_info *out)
 {
     if (!a || !out || j < 15 || j > 28 || !a->cfg.joint[j].present)
@@ -1675,11 +2435,11 @@ static arms_status verified(arms_t *a, int j, unsigned n, uint16_t value)
     return ARMS_OK;
 }
 /* 从同一周期的快照取得状态与通信统计，不把失能请求当作驱动器反馈。 */
-static arms_status maintenance_read(arms_t *a, int j, arms_joint_state *s, arms_bus_stats *stats)
+static arms_status maintenance_read(arms_t *a, int j, bool confirmed, arms_joint_state *s, arms_bus_stats *stats)
 {
-    if (!a) {
-        set_error("驱动句柄为空");
-        return ARMS_E_ARG;
+    if (!a || !confirmed) {
+        set_error("维护接口需要调用方明确授权");
+        return ARMS_E_STATE;
     }
     if (j < ARMS_JOINT_FIRST || j > ARMS_JOINT_LAST || !(a->joints & ARMS_MASK_JOINT(j))) {
         set_error("关节 %d 未打开", j);
@@ -1705,8 +2465,19 @@ static bool drive_disabled(const arms_joint_state *s)
            (s->status_word & 0x006f) == 0x0040;
 }
 
-/* 运行中的 MIT 主站拥有这些周期输出及其映射，不允许两个生产者同时写同一状态。
- * 与 Pn 手册目录无关；其余 SDO 由从站按自己的对象字典和访问属性应答。 */
+static arms_status maintenance_ready_ex(arms_t *a, int j, bool confirmed, arms_joint_state *s, bool need_disabled)
+{
+    arms_bus_stats stats;
+    arms_status st = maintenance_read(a, j, confirmed, s, &stats);
+    if (st != ARMS_OK) return st;
+    if (need_disabled && !drive_disabled(s)) {
+        set_error("关节 %d 未失能（当前 %s），先执行 disable", j, arms_joint_mode_name(s->mode));
+        return ARMS_E_STATE;
+    }
+    return ARMS_OK;
+}
+
+/* 由过程数据周期写入的对象，禁止通过 SDO 写入；其余对象由从站按对象字典的访问属性应答。 */
 static bool owned_by_cycle(uint16_t index, uint8_t sub)
 {
     if (index == 0x1601 || index == 0x1a01 || index == 0x1c12 || index == 0x1c13) return true;
@@ -1714,19 +2485,19 @@ static bool owned_by_cycle(uint16_t index, uint8_t sub)
 }
 
 arms_status arms_sdo_write(arms_t *a, int j, uint16_t idx, uint8_t sub, const uint8_t *data,
-                           size_t len)
+                           size_t len, bool confirmed)
 {
     if (!data || !len) { set_error("SDO 写入需要非空数据"); return ARMS_E_ARG; }
     if (!sub && (idx == 0x2075 || idx == 0x2097 || idx == 0x2101)) {
         if (len != 2) { set_error("抱闸/保存/清零动作需要 2 字节"); return ARMS_E_ARG; }
         unsigned v = kgu_get_u16(data, 0);
-        if (idx == 0x2075) return arms_set_brake(a, j, (arms_brake_mode)v);
+        if (idx == 0x2075) return arms_set_brake(a, j, (arms_brake_mode)v, confirmed);
         if (v != 1) { set_error("保存/清零只接受写 1 触发，复位由程序完成"); return ARMS_E_ARG; }
-        return arms_service(a, j, idx == 0x2097 ? ARMS_SAVE : ARMS_ZERO_HW);
+        return arms_service(a, j, idx == 0x2097 ? ARMS_SAVE : ARMS_ZERO_HW, confirmed);
     }
     arms_joint_state s;
     arms_bus_stats stats;
-    arms_status st = maintenance_read(a, j, &s, &stats);
+    arms_status st = maintenance_read(a, j, confirmed, &s, &stats);
     if (st != ARMS_OK) return st;
     if (stats.tripped || stats.protect.reason != ARMS_PROTECT_NONE || s.error_code || !drive_disabled(&s)) {
         set_error("关节 %d 未确认失能或有故障/保护，未写 %04x:%02x", j, idx, sub);
@@ -1740,7 +2511,7 @@ arms_status arms_sdo_write(arms_t *a, int j, uint16_t idx, uint8_t sub, const ui
     return mailbox(a, j, idx, sub, (uint8_t *)data, &len, true);
 }
 
-arms_status arms_pn_write(arms_t *a, int j, unsigned n, int v)
+arms_status arms_pn_write(arms_t *a, int j, unsigned n, int v, bool confirmed)
 {
     int index = arms_pn_index(n);
     if (index < 0 || v < INT16_MIN || v > INT16_MAX) {
@@ -1748,7 +2519,7 @@ arms_status arms_pn_write(arms_t *a, int j, unsigned n, int v)
     }
     uint8_t data[2];
     kgu_put_u16(data, 0, (uint16_t)v);
-    return arms_sdo_write(a, j, (uint16_t)index, 0, data, sizeof(data));
+    return arms_sdo_write(a, j, (uint16_t)index, 0, data, sizeof(data), confirmed);
 }
 
 const char *arms_brake_mode_name(arms_brake_mode m)
@@ -1814,35 +2585,24 @@ arms_status arms_brake_scan(arms_t *a, arms_mask *released, arms_mask *held, arm
     return ARMS_OK;
 }
 
-arms_status arms_set_brake(arms_t *a, int j, arms_brake_mode mode)
+arms_status arms_set_brake(arms_t *a, int j, arms_brake_mode mode, bool confirmed)
 {
     arms_joint_state s;
-    arms_bus_stats stats;
     arms_status st;
     if (!a) return ARMS_E_ARG;
     if (mode != ARMS_BRAKE_NORMAL && mode != ARMS_BRAKE_RELEASE && mode != ARMS_BRAKE_HOLD) {
         set_error("无效的抱闸模式");
         return ARMS_E_ARG;
     }
-    /* Pn075 是在线参数，不发送使能/失能请求，也不改写当前运动目标。 */
-    st = maintenance_read(a, j, &s, &stats);
+    /* 恢复正常控制不要求失能；强制松闸/抱闸要求失能 */
+    st = maintenance_ready_ex(a, j, confirmed, &s, mode != ARMS_BRAKE_NORMAL);
     if (st != ARMS_OK) return st;
-    if (mode != ARMS_BRAKE_NORMAL) {
-        if (stats.tripped || stats.protect.reason != ARMS_PROTECT_NONE || s.error_code || s.mode == ARMS_JS_FAULT) {
-            set_error("关节 %d 故障或保护已触发，未写强制抱闸模式", j);
-            return ARMS_E_STATE;
-        }
-        if (s.mode != ARMS_JS_ENABLED && !drive_disabled(&s)) {
-            set_error("关节 %d 状态字 0x%04x 不在稳定的使能或失能态，未写 Pn075", j, s.status_word);
-            return ARMS_E_STATE;
-        }
-    }
     a->brake_touched |= ARMS_MASK_JOINT(j);
     st = verified(a, j, 75, (uint16_t)mode);
     if (st == ARMS_OK) {
         record_brake(a, j, mode);
     } else {
-        /* 写入结果不确定时重新读取，以驱动器实际值为准；读取失败则按未知模式联锁 */
+        /* 写入结果不确定时重新读取驱动器的值；读取失败时按未知模式处理 */
         arms_brake_mode now;
         char saved[sizeof(last_error)];
         snprintf(saved, sizeof(saved), "%s", last_error);
@@ -1858,14 +2618,14 @@ static double zero_value(const arms_t *a, int j, const arms_joint_state *s)
 }
 
 /* 校零与保存共用：仅在需要时请求目标关节失能，以新 PDO 反馈验证静止，不重新使能。 */
-static arms_status prepare_stationary(arms_t *a, int j, arms_joint_state *s, const char *operation)
+static arms_status prepare_stationary(arms_t *a, int j, bool confirmed, arms_joint_state *s, const char *operation)
 {
     const uint64_t deadline = mono_ns() + 1000000000ull;
     uint64_t quiet_since = 0;
     bool requested = false;
     do {
         arms_bus_stats stats;
-        arms_status st = maintenance_read(a, j, s, &stats);
+        arms_status st = maintenance_read(a, j, confirmed, s, &stats);
         if (st != ARMS_OK) return st;
         if (stats.tripped || stats.protect.reason != ARMS_PROTECT_NONE || s->error_code ||
             s->mode == ARMS_JS_FAULT || !isfinite(s->position) || !isfinite(s->velocity)) {
@@ -1896,11 +2656,13 @@ static arms_status prepare_stationary(arms_t *a, int j, arms_joint_state *s, con
     return ARMS_E_TIMEOUT;
 }
 
-arms_status arms_service(arms_t *a, int j, arms_service_op op)
+arms_status arms_service(arms_t *a, int j, arms_service_op op, bool confirmed)
 {
     arms_joint_state s;
     if (op != ARMS_ZERO_SOFT && op != ARMS_ZERO_HW && op != ARMS_SAVE) return ARMS_E_ARG;
-    arms_status st = prepare_stationary(a, j, &s, op == ARMS_SAVE ? "保存参数" : "校零");
+    if (j < ARMS_JOINT_FIRST || j > ARMS_JOINT_LAST) return ARMS_E_ARG;
+    if (op == ARMS_ZERO_SOFT && zero_pending(a, ARMS_MASK_JOINT(j), "软件校零")) return ARMS_E_STATE;
+    arms_status st = prepare_stationary(a, j, confirmed, &s, op == ARMS_SAVE ? "保存参数" : "校零");
     if (st != ARMS_OK)
         return st;
     uint8_t data[2];
@@ -1931,7 +2693,15 @@ arms_status arms_service(arms_t *a, int j, arms_service_op op)
         st = verified(a, j, pn, 1);
         usleep(100000);
         arms_status reset = verified(a, j, pn, 0);
-        return reset != ARMS_OK ? reset : st;
+        if (reset != ARMS_OK) return reset;
+        if (st != ARMS_OK || op != ARMS_ZERO_HW) return st;
+        /* 硬件零点取代软件偏置：配置立即写 0，运行中的偏置在驱动器断电时切换 */
+        atomic_fetch_or(&a->zero_pending, ARMS_MASK_JOINT(j));
+        if (!arms_store_offset(a->cfg.path, j, 0.0)) {
+            set_error("关节 %d 已发出硬件清零脉冲，但 %s 中的 offset_rad 未能写为 0", j, a->cfg.path);
+            return ARMS_E_SYSTEM;
+        }
+        return ARMS_OK;
     }
     default:
         return ARMS_E_ARG;

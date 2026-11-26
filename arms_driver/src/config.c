@@ -25,7 +25,7 @@ const char *const arms_standard_joint_names[31] = {
 
 bool arms_cycle_hz_supported(unsigned int hz)
 {
-    /* KGU manual (Er301): 0.5, 1, 2, 4, 5, 8 ms */
+    /* KGU 手册（Er301）支持的周期: 0.5、1、2、4、5、8 ms */
     return hz == 2000u || hz == 1000u || hz == 500u || hz == 250u || hz == 200u || hz == 125u;
 }
 
@@ -141,6 +141,10 @@ static void set_defaults(arms_config *c)
     c->overspeed_ms = 500;
     c->overtorque_ms = 100;
     c->op_timeout_ms = 30000;
+    c->drive_monitor = true;
+    c->temp_warn_c = 75;
+    c->temp_max_c = 90;
+    c->esc_summary_s = 60;
     c->vendor_id = KGU_VENDOR_ID;
     c->product_code = KGU_PRODUCT_CODE;
 }
@@ -149,7 +153,7 @@ static bool parse_arm(const cJSON *node, arms_arm_config *arm, const char *label
 {
     long master = -1;
     const cJSON *m;
-    if (!node) return true; /* arm absent */
+    if (!node) return true; /* 未配置该臂 */
     arm->present = true;
     arm->master = -1;
     if (!get_str(node, "interface", arm->interface, sizeof(arm->interface)) || arm->interface[0] == '\0') {
@@ -171,7 +175,7 @@ static bool parse_arm(const cJSON *node, arms_arm_config *arm, const char *label
     return true;
 }
 
-/* 允许省略使用默认值，但不把已填写的错误类型静默当作未配置。 */
+/* 字段可省略并使用默认值；已填写但类型错误时报错。 */
 static bool optional_number(const cJSON *object, const char *key, double *out)
 {
     return !cJSON_GetObjectItemCaseSensitive(object, key) || get_num(object, key, out);
@@ -189,12 +193,49 @@ static bool parse_pair(const cJSON *arr, double *a, double *b)
     return isfinite(*a) && isfinite(*b) && *a < *b;
 }
 
-static bool parse_joint(const cJSON *node, arms_config *c, int idx, char *error, size_t size)
+/* 关节限位：未写的项沿用 base（joint_defaults 或内置默认值） */
+typedef struct {
+    double pos_min, pos_max, vel, tor;
+} joint_limits;
+
+static bool parse_limits(const cJSON *node, joint_limits *l, const char *label, char *error, size_t size)
+{
+    const cJSON *pos = cJSON_GetObjectItemCaseSensitive(node, "pos_limit");
+    if (pos && !parse_pair(pos, &l->pos_min, &l->pos_max)) {
+        fail(error, size, "%s 的 pos_limit 必须是 [min, max] 且 min<max", label);
+        return false;
+    }
+    if (!optional_number(node, "vel_limit", &l->vel) || !optional_number(node, "tor_limit", &l->tor) ||
+        l->vel <= 0 || l->tor <= 0) {
+        fail(error, size, "%s 的 vel_limit / tor_limit 必须是大于 0 的数值", label);
+        return false;
+    }
+    return true;
+}
+
+/* 已删除或改名的关节字段，给出明确的迁移提示 */
+static bool reject_old_fields(const cJSON *node, long joint, char *error, size_t size)
+{
+    static const char *const removed[] = {"limit", "gain_max", "gain_default", "home"};
+    for (size_t k = 0; k < sizeof(removed) / sizeof(removed[0]); ++k) {
+        if (!cJSON_GetObjectItemCaseSensitive(node, removed[k])) continue;
+        fail(error, size,
+             "关节 %ld 使用了已删除的字段 %s：limit.pos 改为 pos_limit，limit.vel_fault 改为 vel_limit，"
+             "limit.torque_fault 改为 tor_limit；limit.vel、limit.tff、gain_max、gain_default、home 已删除。"
+             "可用 arms_driver/scripts/migrate_config.py 转换",
+             joint, removed[k]);
+        return false;
+    }
+    return true;
+}
+
+static bool parse_joint(const cJSON *node, arms_config *c, int idx, const joint_limits *base, char *error,
+                        size_t size)
 {
     long joint, slave, direction;
-    char arm_name[16], name[ARMS_NAME_LEN];
+    char arm_name[16], name[ARMS_NAME_LEN], label[32];
     arms_joint_config *j;
-    const cJSON *limit, *gmax, *gdef;
+    joint_limits lim = *base;
 
     if (!cJSON_IsObject(node)) {
         fail(error, size, "joints[%d] 不是对象", idx);
@@ -247,61 +288,17 @@ static bool parse_joint(const cJSON *node, arms_config *c, int idx, char *error,
     snprintf(j->name, sizeof(j->name), "%s", name);
     j->slave = (int)slave;
     j->direction = (int)direction;
-    if (!optional_number(node, "offset_rad", &j->offset_rad) || !optional_number(node, "home", &j->home)) {
-        fail(error, size, "关节 %ld 的 offset_rad 和 home 必须是有限数值", joint);
+    if (!optional_number(node, "offset_rad", &j->offset_rad)) {
+        fail(error, size, "关节 %ld 的 offset_rad 必须是有限数值", joint);
         return false;
     }
-
-    j->pos_min = -0.5; j->pos_max = 0.5; j->vel_max = 0.5; j->tff_max = 1.0;
-    j->vel_fault = 3.0; j->tor_fault = 30.0;
-    j->kp_max = 5; j->kd_max = 1; j->kp_default = 5; j->kd_default = 0;
-    limit = cJSON_GetObjectItemCaseSensitive(node, "limit");
-    if (limit) {
-        const cJSON *pos = cJSON_GetObjectItemCaseSensitive(limit, "pos");
-        if (pos && !parse_pair(pos, &j->pos_min, &j->pos_max)) {
-            fail(error, size, "关节 %ld 的 limit.pos 必须是 [min, max] 且 min<max", joint);
-            return false;
-        }
-        if (!cJSON_IsObject(limit) ||
-            !optional_number(limit, "vel", &j->vel_max) ||
-            !optional_number(limit, "tff", &j->tff_max) ||
-            !optional_number(limit, "vel_fault", &j->vel_fault) ||
-            !optional_number(limit, "torque_fault", &j->tor_fault)) {
-            fail(error, size, "关节 %ld 的 limit 必须是对象，数值必须有限", joint);
-            return false;
-        }
-    }
-    if (j->vel_fault <= 0 || j->tor_fault <= 0) {
-        fail(error, size, "关节 %ld 的 limit.vel_fault / limit.torque_fault 必须大于 0", joint);
-        return false;
-    }
-    gmax = cJSON_GetObjectItemCaseSensitive(node, "gain_max");
-    if (gmax) {
-        if (!cJSON_IsObject(gmax) ||
-            !optional_number(gmax, "kp", &j->kp_max) ||
-            !optional_number(gmax, "kd", &j->kd_max)) {
-            fail(error, size, "关节 %ld 的 gain_max 必须是对象，数值必须有限", joint);
-            return false;
-        }
-    }
-    gdef = cJSON_GetObjectItemCaseSensitive(node, "gain_default");
-    if (gdef) {
-        if (!cJSON_IsObject(gdef) ||
-            !optional_number(gdef, "kp", &j->kp_default) ||
-            !optional_number(gdef, "kd", &j->kd_default)) {
-            fail(error, size, "关节 %ld 的 gain_default 必须是对象，数值必须有限", joint);
-            return false;
-        }
-    }
-    if (j->vel_max < 0 || j->tff_max < 0 || j->kp_max < 0 || j->kd_max < 0 ||
-        j->kp_default < 0 || j->kd_default < 0 || j->kp_default > j->kp_max || j->kd_default > j->kd_max) {
-        fail(error, size, "关节 %ld 的限位/增益无效（不能为负，默认值不能超过上限）", joint);
-        return false;
-    }
-    if (j->home < j->pos_min || j->home > j->pos_max) {
-        fail(error, size, "关节 %ld 的 home %.3f 超出 limit.pos [%.3f, %.3f]", joint, j->home, j->pos_min, j->pos_max);
-        return false;
-    }
+    if (!reject_old_fields(node, joint, error, size)) return false;
+    snprintf(label, sizeof(label), "关节 %ld", joint);
+    if (!parse_limits(node, &lim, label, error, size)) return false;
+    j->pos_limit_min = lim.pos_min;
+    j->pos_limit_max = lim.pos_max;
+    j->vel_limit = lim.vel;
+    j->tor_limit = lim.tor;
     return true;
 }
 
@@ -310,7 +307,7 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
     char *text;
     cJSON *root;
     const cJSON *rt, *safety, *arms, *joints, *drive;
-    long v;
+    long v = 0;
     int i, a, n;
     bool ok = false;
 
@@ -424,6 +421,39 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
             }
             c->overtorque_ms = (unsigned int)v;
         }
+        {
+            const cJSON *dm = cJSON_GetObjectItemCaseSensitive(safety, "drive_monitor");
+            if (dm && !cJSON_IsBool(dm)) {
+                fail(error, size, "safety.drive_monitor 必须是 true/false");
+                goto out;
+            }
+            if (dm) c->drive_monitor = cJSON_IsTrue(dm);
+        }
+        if (cJSON_GetObjectItemCaseSensitive(safety, "temp_warn_c")) {
+            if (!get_int(safety, "temp_warn_c", 20, 150, &v)) {
+                fail(error, size, "safety.temp_warn_c 必须是 20..150");
+                goto out;
+            }
+            c->temp_warn_c = v;
+        }
+        if (cJSON_GetObjectItemCaseSensitive(safety, "temp_max_c")) {
+            if (!get_int(safety, "temp_max_c", 20, 150, &v)) {
+                fail(error, size, "safety.temp_max_c 必须是 20..150");
+                goto out;
+            }
+            c->temp_max_c = v;
+        }
+        if (cJSON_GetObjectItemCaseSensitive(safety, "esc_summary_s")) {
+            if (!get_int(safety, "esc_summary_s", 1, 3600, &v)) {
+                fail(error, size, "safety.esc_summary_s 必须是 1..3600");
+                goto out;
+            }
+            c->esc_summary_s = (unsigned int)v;
+        }
+        if (c->temp_warn_c > c->temp_max_c) {
+            fail(error, size, "safety.temp_warn_c 不能大于 safety.temp_max_c");
+            goto out;
+        }
         if (cJSON_GetObjectItemCaseSensitive(safety, "timeout_action") &&
             (!get_str(safety, "timeout_action", c->timeout_action, sizeof(c->timeout_action)) ||
              (strcmp(c->timeout_action, "hold") != 0 && strcmp(c->timeout_action, "disable") != 0))) {
@@ -483,9 +513,16 @@ bool arms_config_load(const char *path, arms_config *c, char *error, size_t size
         fail(error, size, "缺少 joints 数组");
         goto out;
     }
-    n = cJSON_GetArraySize(joints);
-    for (i = 0; i < n; ++i)
-        if (!parse_joint(cJSON_GetArrayItem(joints, i), c, i, error, size)) goto out;
+    {
+        /* 内置默认值: pos_limit ±3 rad，vel_limit 3 rad/s，tor_limit 30 N·m */
+        joint_limits base = {-3.0, 3.0, 3.0, 30.0};
+        const cJSON *defaults = cJSON_GetObjectItemCaseSensitive(root, "joint_defaults");
+        if (defaults && (!cJSON_IsObject(defaults) || !parse_limits(defaults, &base, "joint_defaults", error, size)))
+            goto out;
+        n = cJSON_GetArraySize(joints);
+        for (i = 0; i < n; ++i)
+            if (!parse_joint(cJSON_GetArrayItem(joints, i), c, i, &base, error, size)) goto out;
+    }
     for (a = 0; a < ARMS_ARM_COUNT; ++a) {
         bool used[ARMS_MAX_SLAVES_PER_ARM] = {false};
         for (i = ARMS_JOINT_FIRST; i <= ARMS_JOINT_LAST; ++i) {
@@ -519,15 +556,17 @@ bool arms_config_default_path(char *out, size_t size)
     const char *env = getenv("ARMS_CONFIG");
     char exe[PATH_MAX];
     ssize_t len;
-    if (!out || !size) return false;
-    const char *candidates[] = {env, "/etc/bxi/arms.json", "config/arms.json"};
-    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
-        const char *p = candidates[i];
-        if (p && *p && access(p, R_OK) == 0) {
-            if (strlen(p) >= size) return false;
-            strcpy(out, p);
-            return true;
-        }
+    if (env && env[0] && access(env, R_OK) == 0) {
+        snprintf(out, size, "%s", env);
+        return true;
+    }
+    if (access("/etc/bxi/arms.json", R_OK) == 0) {
+        snprintf(out, size, "/etc/bxi/arms.json");
+        return true;
+    }
+    if (access("config/arms.json", R_OK) == 0) {
+        snprintf(out, size, "config/arms.json");
+        return true;
     }
     len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
     if (len > 0) {
@@ -536,12 +575,10 @@ bool arms_config_default_path(char *out, size_t size)
         slash = strrchr(exe, '/');
         if (slash) {
             *slash = '\0';
-            const char *paths[] = {"../config/arms.json", "config/arms.json", "../share/arms_driver/config/arms.json",
-                                   "../../share/arms_ros/config/arms.json"};
-            for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
-                int n = snprintf(out, size, "%s/%s", exe, paths[i]);
-                if (n >= 0 && (size_t)n < size && access(out, R_OK) == 0) return true;
-            }
+            snprintf(out, size, "%s/../config/arms.json", exe);
+            if (access(out, R_OK) == 0) return true;
+            snprintf(out, size, "%s/config/arms.json", exe);
+            if (access(out, R_OK) == 0) return true;
         }
     }
     return false;

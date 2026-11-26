@@ -18,19 +18,29 @@
 
 #define KGU_MODE_MIT 10
 
+/* 监控量：Pn002 选择要显示的量，对象 0x3000（INT32，只读）给出该量的当前值 */
+#define KGU_OBJ_MONITOR_SELECT 0x2002u
+#define KGU_OBJ_MONITOR_VALUE 0x3000u
+#define KGU_MON_TEMPERATURE 77 /* 执行器温度 [℃] */
+#define KGU_MON_ECAT_LOSS 63   /* EtherCAT 通信丢帧次数，上电清零 */
+
+/* ESC 错误计数寄存器 0x0300..0x0313：各端口无效帧/物理层错误、转发错误、处理单元错误、链路丢失 */
+#define ESC_ERR_ADDR 0x0300u
+#define ESC_ERR_BYTES 20u
+
 #define KGU_OUT_BYTES 23
 #define KGU_IN_BYTES 16
 
-/* RxPDO 0x1601 (master -> drive) */
+/* RxPDO 0x1601（主站 → 驱动器） */
 #define KGU_OUT_CONTROLWORD 0  /* 0x6040 u16 */
-#define KGU_OUT_TARGET_POS 2   /* 0x4010 f32 rad (output side) */
+#define KGU_OUT_TARGET_POS 2   /* 0x4010 f32 rad（输出端） */
 #define KGU_OUT_TARGET_VEL 6   /* 0x4011 f32 rad/s */
 #define KGU_OUT_TARGET_TFF 10  /* 0x4012 f32 N.m */
 #define KGU_OUT_KP 14          /* 0x4013 f32 */
 #define KGU_OUT_KD 18          /* 0x4014 f32 */
 #define KGU_OUT_MODE 22        /* 0x6060 i8 */
 
-/* TxPDO 0x1A01 (drive -> master) */
+/* TxPDO 0x1A01（驱动器 → 主站） */
 #define KGU_IN_STATUSWORD 0    /* 0x6041 u16 */
 #define KGU_IN_POS 2           /* 0x4000 f32 rad */
 #define KGU_IN_VEL 6           /* 0x4001 f32 rad/s */
